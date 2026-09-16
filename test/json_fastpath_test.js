@@ -4,6 +4,7 @@
 const native = require('../src/native');
 const __native = native;
 const { TurboKV } = require('../src/turbokv');
+const { callArgCounts } = require('../src/fastpath');
 const fs = require('fs');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
@@ -51,7 +52,7 @@ for (const file of walk(root)) {
     const text = stripComments(raw);
     scanned++;
     for (const name of ['JSON.stringify', 'JSON.parse']) {
-        for (const call of TurboKV.callArgCounts(text, name)) {
+        for (const call of callArgCounts(text, name)) {
             if (call.args > 1) {
                 offenders++;
                 console.log(`  FAIL: ${path.relative(root, file)} -> ${call.text.slice(0, 70)}`);

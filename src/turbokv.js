@@ -9,6 +9,7 @@ const native = require('./native');
 const fs = require('fs');
 const v8 = require('v8');
 const v8ser = require('v8');
+const { callArgCounts } = require('./fastpath');
 
 // An unpaired surrogate encodes to U+FFFD in UTF-8, so '\uD800', '\uDC00' and
 // '\uFFFD' all became ONE key in the arena and returned each other's values --
@@ -121,7 +122,7 @@ function gcOnFinalizer() {
 }
 
 function gcNotify(used, limit) {
-    for (const c of gcSubscribers) c._onGc(used, limit);
+    for (const c of gcSubscribers) c.__internalOnGc(used, limit);
 }
 
 function gcSubscribe(inst, minIntervalMs) {
@@ -395,27 +396,6 @@ class TurboKV {
     // identical to canonical JSON.stringify, it is on a slow path. Codecs that
     // are not JSON at all (msgpack, protobuf) do not emit a leading '{' and are
     // left alone. Opt out with allowSlowCodec: true.
-    // Counts top-level arguments of each `name(...)` call in `src`, using
-    // balanced-paren scanning so nested calls and object literals do not
-    // confuse it the way a regex would.
-    static callArgCounts(src, name) {
-        const out = [];
-        let i = 0;
-        while ((i = src.indexOf(name + '(', i)) !== -1) {
-            let d = 0, args = 1, j = i + name.length, empty = true;
-            for (; j < src.length; j++) {
-                const c = src[j];
-                if (c === '(' || c === '[' || c === '{') d++;
-                else if (c === ')' || c === ']' || c === '}') { d--; if (d === 0) break; }
-                else if (c === ',' && d === 1) args++;
-                else if (d === 1 && !/\s/.test(c)) empty = false;
-            }
-            out.push({ index: i, args: empty ? 0 : args, text: src.slice(i, j + 1) });
-            i = j + 1;
-        }
-        return out;
-    }
-
     static assertFastCodec(codec) {
         // An identity replacer - JSON.stringify(v, (k, x) => x) - produces
         // byte-identical output, so probing cannot see it, yet it still costs
@@ -426,7 +406,7 @@ class TurboKV {
             try { src = Function.prototype.toString.call(fn); } catch { continue; }
             if (src.includes('[native code]')) continue;
             const name = which === 'encode' ? 'JSON.stringify' : 'JSON.parse';
-            for (const call of TurboKV.callArgCounts(src, name)) {
+            for (const call of callArgCounts(src, name)) {
                 if (call.args > 1) {
                     throw new Error(
                         `codec.${which} is not on V8's JSON fast path: ${call.text.slice(0, 60)} ` +
@@ -542,7 +522,7 @@ class TurboKV {
             const c = new TurboKV({ ...opts, workerId: id });
             // A second cache opened in a worker used to skip the ring entirely and
             // silently run on the slower IPC transport.
-            if (cluster.isWorker && submitReady && opts.transport !== 'ipc') c.useSubmissionRing(submitReady);
+            if (cluster.isWorker && submitReady && opts.transport !== 'ipc') c.#useSubmissionRing(submitReady);
             return c;
         }
         const auto = TurboKV.autoSize();
@@ -726,16 +706,20 @@ class TurboKV {
             for (let i = 0; i < n; i++) {
                 if (r.hashes[i] === 'ffffffffffffffff') { for (const c of instances) c.clearLocal(); continue; }
                 if (r.writers[i] === 0) continue;  // our own write
-                for (const c of instances) c._dropByHash(r.hashes[i]);
+                for (const c of instances) c.#dropByHash(r.hashes[i]);
             }
             TurboKV.#primaryCursor = r.head;
             if (n < 1024) return;                  // caught up
         }
     }
 
-    _onGc(used, limit) { this.#onGc(used, limit); }
+    // Reachable by design, and the only member that is. gcNotify() is a
+    // module-scope function declared above the class, so it cannot call a
+    // #private -- this is the bridge. Prefixed to say plainly that it is not
+    // API, matching the addon's __unsafe* hooks.
+    __internalOnGc(used, limit) { this.#onGc(used, limit); }
 
-    _dropByHash(hash) {
+    #dropByHash(hash) {
         const k = this.#byHash.get(hash);
         if (k !== undefined) { this.#l1Drop(k); this.#byHash.delete(hash); this.stats.invalidated++; }
     }
@@ -765,7 +749,7 @@ class TurboKV {
         if (TurboKV.#degraded || isPrimaryProcess) return;
         TurboKV.#degraded = true;
         for (const c of instances) {
-            c._setDead(true, `primary heartbeat is ${age === -2 ? 'dated in the future' : age + 'ms old'}; serving L1 only`);
+            c.#setDead(true, `primary heartbeat is ${age === -2 ? 'dated in the future' : age + 'ms old'}; serving L1 only`);
         }
         // Give the ring slot back before unmapping, or it stays owned by this pid
         // in a segment nobody will reclaim.
@@ -803,19 +787,19 @@ class TurboKV {
         const id = native.arenaId();
         const sameArena = TurboKV.#arenaId !== null && id === TurboKV.#arenaId;
         TurboKV.#arenaId = id;
-        for (const c of instances) c._recovered(sameArena);
+        for (const c of instances) c.#recovered(sameArena);
     }
 
     // Half the staleness budget, so "alive" is a stricter test than "dead" was.
     // The asymmetry is what stops a primary that stalls periodically from
     // flapping every worker's L1 back and forth.
     static #staleMsFor() {
-        for (const c of instances) return c._staleMs() / 2;
+        for (const c of instances) return c.#ownStaleMs() / 2;
         return 2500;
     }
     static #arenaId = null;
 
-    _setDead(dead, msg) {
+    #setDead(dead, msg) {
         this.#primaryDead = dead;
         // Drop the ring index with it. Without this a degraded set() still went
         // to submitSet, failed, and overwrote lastError with "submission ring
@@ -828,16 +812,16 @@ class TurboKV {
 
     /** Whether this handle has lost its primary and is serving L1 only. */
     get primaryDead() { return this.#primaryDead; }
-    _staleMs() { return this.#staleMs; }
-    _usesRing() { return this.#ringIdx >= 0; }
-    _recovered(sameArena) {
+    #ownStaleMs() { return this.#staleMs; }
+    #usesRing() { return this.#ringIdx >= 0; }
+    #recovered(sameArena) {
         // Everything this worker believed about the arena is now suspect: it
         // missed every invalidation while detached, and an unapplied delete is a
         // lost write rather than a pending one.
         this.clearLocal();
         this.#cursor = native.ringHead();      // not 0: replaying a ring we already flushed for is waste
         this.#ringIdx = -1;
-        if (this.#transportOpt !== 'ipc' && attachedName) this.useSubmissionRing(attachedName + '_sub');
+        if (this.#transportOpt !== 'ipc' && attachedName) this.#useSubmissionRing(attachedName + '_sub');
         this.#primaryDead = false;
         this.lastError = null;
         this.stats.recoveries = (this.stats.recoveries || 0) + 1;
@@ -882,7 +866,7 @@ class TurboKV {
             submitName = name + '_sub';
         }
         const c = new TurboKV({ ...opts, workerId: 0 });
-        c._startMaintenance(opts);
+        c.#startMaintenance(opts);
         return c;
     }
     static attachWorker(name, workerId, opts = {}) {
@@ -903,7 +887,7 @@ class TurboKV {
         storeReady = true;
         attachedName = name;
         const c = new TurboKV({ ...opts, workerId: wid });
-        if (opts.transport !== 'ipc') c.useSubmissionRing(name + '_sub');
+        if (opts.transport !== 'ipc') c.#useSubmissionRing(name + '_sub');
         return c;
     }
 
@@ -1081,7 +1065,7 @@ class TurboKV {
     // Opt into the shared-memory write path. Falls back silently to IPC when the
     // segment is absent (a primary from before this existed) or when every ring
     // is already claimed -- the cache still works, just on the slower transport.
-    useSubmissionRing(segName) {
+    #useSubmissionRing(segName) {
         try {
             if (!native.submitOpen(segName)) return false;
             const idx = native.submitClaim();
@@ -1497,7 +1481,7 @@ class TurboKV {
     // Expiry was lazy only, so an expired entry held its index slot and arena
     // bytes until the tail reached it; and heartbeatNs was never written, so a
     // worker could not tell a live arena from one whose primary had died.
-    _startMaintenance(opts = {}) {
+    #startMaintenance(opts = {}) {
         if (this.#id !== 0 || opts.maintenance === false) return;
         const everyMs = opts.maintenanceMs || 500;
         // Size the slice so a full pass over the index completes in a bounded
@@ -1538,7 +1522,7 @@ class TurboKV {
         // returned true -- silent, permanent write loss for the rest of the
         // process's life.
         let stillUsingRing = false;
-        for (const c of instances) if (c._usesRing()) { stillUsingRing = true; break; }
+        for (const c of instances) if (c.#usesRing()) { stillUsingRing = true; break; }
         if (!stillUsingRing) {
             try { native.submitRelease(); } catch { /* transport not in use */ }
             submitReady = null;
@@ -1659,8 +1643,8 @@ class TurboKV {
         }
     }
 
-    static #localDrop(fullKey) { for (const c of instances) c._dropExact(fullKey); }
-    _dropExact(fullKey) { this.#l1Drop(fullKey); }
+    static #localDrop(fullKey) { for (const c of instances) c.#dropExact(fullKey); }
+    #dropExact(fullKey) { this.#l1Drop(fullKey); }
     static isCacheMessage(m) { return m && m.t === MSG; }
     // `native()` used to hand the raw addon to any caller of the public class,
     // which put poke(), suppressRefBit(), backwardShift(), clearHints() and

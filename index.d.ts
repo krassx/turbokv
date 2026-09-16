@@ -213,6 +213,20 @@ export declare class TurboKV<T = unknown> {
     /** Wire the primary to apply worker batches. Idempotent. */
     static install(cluster: unknown): void;
 
+    /** Whether `m` is one of turbokv's own cluster messages.
+     *
+     *  `install()` is the easy path and takes over the primary's `message`
+     *  handling. If your application already routes cluster messages itself,
+     *  use this to pick turbokv's out of your own handler and pass them to
+     *  {@link applyBatch}. The two are a pair: identifying a message is only
+     *  useful if you can also apply it. */
+    static isCacheMessage(m: unknown): boolean;
+
+    /** Apply a worker's batch to L2, from your own `message` handler.
+     *  Only call this for messages {@link isCacheMessage} accepted, and only on
+     *  the primary. `install()` does exactly this for you. */
+    static applyBatch(m: unknown): void;
+
     /** Undefined when no arena is attached (before open, or after close). */
     static arenaStats(): ArenaStats | undefined;
     static namespaceStats(): NamespaceStat[] | undefined;
@@ -272,6 +286,10 @@ export declare class TurboKV<T = unknown> {
     /** Release the ring slot, stop the heap guard, deregister, and on the
      *  primary destroy the arena. */
     close(): void;
+
+    /** Entries currently held in this process's L1. `size` counts what the
+     *  cache can serve; this counts only what is resident locally. */
+    readonly l1Size: number;
 
     readonly stats: CacheStats;
     /** Why the last operation failed, or null. Mutable: the library overwrites

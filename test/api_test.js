@@ -1,4 +1,5 @@
 const { TurboKV } = require('../src/turbokv');
+const __native = require('../src/native');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
 const c = TurboKV.open({ storage: 'bytes', namespace: 'app' });
@@ -64,28 +65,85 @@ ok([...c.keys({ limit: 2 })].length === 2, 'keys() honours limit');
 // lifecycle
 ok(typeof c.close === 'function', 'close() exists');
 c.close();
-console.log(fail ? `  ${fail} FAILURES` : '  all passed');
-process.exit(fail ? 1 : 0);
 
-// --- a failed create explains itself -------------------------------------
+// --- a failed create explains itself --------------------------------------
 //
-// The arena is sized from l2Bytes and the failure a user actually hits is a
-// container whose /dev/shm is smaller than that -- which is precisely what the
-// suite itself hit in Docker. The message has to name the constraint, not just
-// say "failed", or the next person spends an afternoon on it.
+// The failure a user actually hits is a container whose /dev/shm is smaller
+// than the arena -- exactly what the musl release job hit. The message has to
+// name the constraint, not just say "failed".
+//
+// Whether an oversized arena fails at all is platform-dependent, and asserting
+// otherwise is how this test spent its first day passing vacuously: Linux
+// reserves the space (posix_fallocate) and fails, while macOS allocates shm
+// lazily and happily hands back a 1TB arena nobody has touched.
 {
-    let msg = null;
+    const name = '/tcfail' + process.pid;
+    let msg = null, created = false;
     try {
-        // Far larger than any /dev/shm; create must fail rather than succeed.
-        TurboKV.createPrimary('/tcfail' + process.pid, 1024 * (1 << 30), 1 << 16, {});
+        TurboKV.createPrimary(name, 1024 * (1 << 30), 1 << 16, {});
+        created = true;
     } catch (e) { msg = e.message; }
-    ok(msg !== null, 'an impossible arena size fails loudly instead of silently');
-    ok(/arena create failed/.test(msg || ''),
-       `the failure names what failed (got ${JSON.stringify(msg)})`);
+
     if (process.platform === 'linux') {
+        ok(!created, 'linux reserves shared memory, so an impossible arena fails');
+        ok(/arena create failed/.test(msg || ''),
+           `the failure names what failed (got ${JSON.stringify(msg)})`);
         ok(/\/dev\/shm holds .*free.*arena needs/.test(msg || ''),
-           `on Linux it names the /dev/shm constraint and the shortfall (got ${JSON.stringify(msg)})`);
-        ok(/--shm-size=/.test(msg || ''),
-           'and tells the reader the Docker flag that fixes it');
+           `it names the /dev/shm constraint and the shortfall (got ${JSON.stringify(msg)})`);
+        ok(/--shm-size=/.test(msg || ''), 'and the Docker flag that fixes it');
+    } else {
+        ok(created && msg === null,
+           'this platform allocates shared memory lazily, so an oversized arena succeeds');
+        __native.destroy();          // do not leave a 1TB name behind
     }
 }
+
+// --- the public surface is exactly what index.d.ts declares ----------------
+//
+// Undeclared-but-reachable is an API you support whether you meant to or not --
+// the same problem TurboKV.native() had (decision 45). This pins the surface so
+// a new helper cannot drift onto it unnoticed.
+{
+    const DECLARED_STATICS = [
+        'createPrimary', 'attachWorker', 'open', 'install', 'isCacheMessage', 'applyBatch',
+        'arenaStats', 'namespaceStats', 'submitStats', 'primaryAgeMs', 'autoSize',
+        'defaultName', 'hasCompression', 'deepFreeze', 'assertFastCodec',
+        'JSON_CODEC', 'V8_CODEC', 'drainSubmissions', 'heapGuardPace',
+    ];
+    const DECLARED_INSTANCE = [
+        'get', 'set', 'has', 'delete', 'incr', 'cas', 'clearLocal', 'clearAll',
+        'clearNamespace', 'keys', 'flush', 'close', 'stopGuard',
+        'stats', 'lastError', 'liveHeapFraction', 'primaryDead', 'storage',
+        'transport', 'size', 'l1Size',
+    ];
+
+    const statics = Object.getOwnPropertyNames(TurboKV)
+        .filter(n => !['length', 'name', 'prototype'].includes(n));
+    const extraStatic = statics.filter(n => !DECLARED_STATICS.includes(n));
+    const missingStatic = DECLARED_STATICS.filter(n => !statics.includes(n));
+    ok(extraStatic.length === 0, `no undeclared statics (found: ${extraStatic.join(', ')})`);
+    ok(missingStatic.length === 0, `every declared static exists (missing: ${missingStatic.join(', ')})`);
+
+    // Both: methods and getters live on the prototype, while stats, lastError,
+    // storage and liveHeapFraction are assigned in the constructor and are own
+    // properties of the instance. Checking only the prototype reported four
+    // declared members as missing.
+    const probe = TurboKV.createPrimary('/tcsurf' + process.pid, 8 << 20, 1 << 13, {});
+    const proto = [
+        ...Object.getOwnPropertyNames(TurboKV.prototype).filter(n => n !== 'constructor'),
+        ...Object.keys(probe),
+    ];
+    __native.destroy();
+    // __internalOnGc is reachable by necessity: gcNotify() is a module-scope
+    // function declared above the class, so it cannot reach a #private.
+    const extraInst = proto.filter(n => !DECLARED_INSTANCE.includes(n) && !n.startsWith('__internal'));
+    const missingInst = DECLARED_INSTANCE.filter(n => !proto.includes(n));
+    ok(extraInst.length === 0, `no undeclared instance members (found: ${extraInst.join(', ')})`);
+    ok(missingInst.length === 0, `every declared instance member exists (missing: ${missingInst.join(', ')})`);
+}
+
+// The summary and exit MUST be last. They were at line 68 of 126, so every
+// block appended after them -- the create-failure diagnostic and the public
+// surface pin -- was dead code that never ran and could never fail.
+console.log(fail ? `  ${fail} FAILURES` : '  all passed');
+process.exit(fail ? 1 : 0);
