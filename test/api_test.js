@@ -108,7 +108,7 @@ c.close();
         'createPrimary', 'attachWorker', 'open', 'install', 'isCacheMessage', 'applyBatch',
         'arenaStats', 'namespaceStats', 'submitStats', 'primaryAgeMs', 'autoSize',
         'defaultName', 'hasCompression', 'deepFreeze', 'assertFastCodec',
-        'JSON_CODEC', 'V8_CODEC', 'drainSubmissions', 'heapGuardPace',
+        'JSON_CODEC', 'V8_CODEC', 'drainSubmissions', 'heapGuardPace', 'L1', 'L2', 'L3',
     ];
     const DECLARED_INSTANCE = [
         'get', 'set', 'has', 'delete', 'incr', 'cas', 'clearLocal', 'clearAll',

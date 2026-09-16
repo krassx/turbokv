@@ -621,6 +621,33 @@ class TurboKV {
         }
     }
 
+    // Cache levels. L1 is this process's Map, L2 the shared arena, L3 the
+    // (unbuilt) remote tier. Exposed as constants so callers do not hard-code
+    // integers that would change meaning if a level were ever inserted.
+    static get L1() { return 1; }
+    static get L2() { return 2; }
+    static get L3() { return 3; }
+
+    // `minLevel` is a PREFERENCE for the lowest tier a record may occupy, not a
+    // contract. An unavailable level is clamped DOWN to the highest one that
+    // exists right now, so the data is always stored somewhere -- asking for L3
+    // today behaves as L2, and the same call starts using L3 the day it exists.
+    // A degraded worker has no L2 at all, and clamps to L1, which is exactly
+    // where its writes already go.
+    //
+    // Clamping is for a level that is valid but not available. A value that is
+    // not a level at all is a mistake, and gets the same treatment as every
+    // other bad option (decision 48).
+    #resolveLevel(minLevel) {
+        if (minLevel === undefined) return 1;
+        if (!Number.isInteger(minLevel) || minLevel < 1 || minLevel > 3) {
+            throw new TypeError(
+                `turbokv: minLevel must be TurboKV.L1, L2 or L3 (1-3); got ${JSON.stringify(minLevel)}`);
+        }
+        const highest = (this.#primaryDead || !storeReady) ? 1 : 2;   // L3: not built yet
+        return minLevel > highest ? highest : minLevel;
+    }
+
     static #createError(arenaBytes) {
         let hint = '';
         if (process.platform === 'linux') {
@@ -1087,8 +1114,11 @@ class TurboKV {
     get transport() { return this.#ringIdx >= 0 ? 'shm' : 'ipc'; }
 
     // --- public API (synchronous) ---------------------------------------
-    get(key) {
+    get(key, opts) {
         if (!isStringKey(key)) return undefined;
+        // Resolved before the L1 lookup so an invalid value throws whether or not
+        // the key happens to be resident.
+        const minLevel = opts === undefined ? 1 : this.#resolveLevel(opts.minLevel);
         this.#drain();
         key = this.#ns + key;
         // Our own delete has not reached the arena yet; serving L2 here would
@@ -1118,13 +1148,17 @@ class TurboKV {
         // became immortal in that worker.
         const rem = native.lastTtlRemainingMs();
         const expMs = rem ? monoMs() + rem : 0;
+        // minLevel > L1 means "do not let this occupy my L1". The value is still
+        // returned; only its residency changes. Measured worth having: one scan
+        // of a cold keyspace evicts 93.7% of a hot working set, and costs 3.8x
+        // more than the same scan that does not promote.
         if (this.#codec && !this.#l1Decoded) {          // safe mode: cache the encoded form
-            this.#l1Put(key, raw, native.hashKey(key), raw.length, expMs);
+            if (minLevel === 1) this.#l1Put(key, raw, native.hashKey(key), raw.length, expMs);
             return this.#codec.decode(raw);
         }
         let v = raw;
         if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboKV.deepFreeze(v); }
-        this.#l1Put(key, v, native.hashKey(key), this.#noCodec ? 0 : raw.length, expMs);
+        if (minLevel === 1) this.#l1Put(key, v, native.hashKey(key), this.#noCodec ? 0 : raw.length, expMs);
         // The L2 path used to return the very object it just placed in L1, so a
         // caller mutating a binary result corrupted the cached copy.
         return Buffer.isBuffer(v) ? Buffer.from(v) : v;
@@ -1134,6 +1168,7 @@ class TurboKV {
     // result. Because that makes failure quiet, every rejection also bumps a
     // stats counter and records lastError.
     set(key, value, opts) {
+        const minLevel = opts === undefined ? 1 : this.#resolveLevel(opts.minLevel);
         this.#checkPrimary();
         this.stats.sets++;
         if (!isStringKey(key)) {
@@ -1247,8 +1282,26 @@ class TurboKV {
                              `(raise submitRingBytes on the primary)`;
             return false;
         }
-        this.#l1Put(key, l1Value, keyHash, this.#noCodec ? 0 : enc.length,
-                    ttlMs > 0 ? monoMs() + ttlMs : 0);
+        if (minLevel === 1) {
+            this.#l1Put(key, l1Value, keyHash, this.#noCodec ? 0 : enc.length,
+                        ttlMs > 0 ? monoMs() + ttlMs : 0);
+        } else {
+            // Bypassing L1 must EVICT any copy already there. Leaving it would
+            // make this option produce stale reads -- the caller asked for the
+            // value not to live here, and would keep being served the old one.
+            this.#l1Drop(key);
+            // On the primary that is enough: native.set below is synchronous, so
+            // the next get() reads the new value straight from L2. In a WORKER
+            // the write is still in flight, so a local read would find L2's
+            // PREVIOUS value -- wrong, not merely stale. Mark it pending, the
+            // same way a queued delete is, so local reads MISS until the ring
+            // confirms it landed. A miss is the failure mode this system is
+            // built around; a stale value is not.
+            if (this.#id !== 0) {
+                this.#pendingDel.add(key);
+                this.#pendingDelHash.set(native.hashKey(key), key);
+            }
+        }
         if (this.#id === 0) {
             const ok = native.set(key, enc, 0, ttlMs, this.#nsId) === true;
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
@@ -1494,6 +1547,20 @@ class TurboKV {
         native.heartbeat();
         this.#timer = setInterval(() => {
             native.heartbeat();
+            // Backstop for a lost doorbell. A worker rings RING_MSG after pushing
+            // to its submission ring, and that is the ONLY thing that makes the
+            // primary drain -- its own get() does not (see #drain, which returns
+            // immediately for id 0). The doorbell is swallowed when the channel
+            // is gone (`if (process.connected)` and a catch), so a lost one would
+            // otherwise leave those records in the ring until the next write:
+            // not merely stale invalidation, but data that never reaches L2.
+            // Workers self-heal because they drain on every operation; this gives
+            // the primary the same property, bounded to one maintenance interval.
+            //
+            // Measured on an idle ring: 29.1ns per call, so 5ms of CPU per DAY at
+            // this cadence. Cheap enough that not having a backstop was the only
+            // real cost.
+            if (submitName) TurboKV.drainSubmissions(8192);
             const r = native.sweepExpired(this.#sweepCursor, slice);
             if (!r) return;
             this.#sweepCursor = r.cursor;

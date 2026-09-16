@@ -136,7 +136,31 @@ export interface OpenOptions<T = unknown> extends PrimaryOptions<T> {
     indexSlots?: number;
 }
 
-export interface SetOptions {
+/** Cache levels. L1 is the calling process's own map, L2 the shared arena, L3
+ *  the remote tier (not built yet). */
+export type Level = 1 | 2 | 3;
+
+export interface LevelOption {
+    /** The lowest level this record may occupy, as a PREFERENCE rather than a
+     *  contract.
+     *
+     *  On `set`, the value is written from this level upwards and not stored
+     *  locally. On `get`, the value is looked up normally (L1, then L2, then L3)
+     *  but only filled back down to this level — so a large or one-off read can
+     *  be served without evicting the caller's working set.
+     *
+     *  A level that does not currently exist is clamped DOWN to the highest one
+     *  that does, so the data is always stored: `L3` behaves as `L2` today and
+     *  starts using L3 when that tier lands, and a worker that has lost its
+     *  primary clamps to `L1`. A value that is not a level at all throws.
+     *
+     *  This only ever changes where a record lives and how fast it is reached —
+     *  never which value is observed. Nothing is recorded with the entry, so one
+     *  caller's preference never constrains another's. */
+    minLevel?: Level;
+}
+
+export interface SetOptions extends LevelOption {
     /** Time to live. Clamped to ~24.8 days; longer values are capped, never
      *  wrapped into "no expiry". */
     ttlMs?: number;
@@ -211,6 +235,13 @@ export declare class TurboKV<T = unknown> {
     static open<V = unknown>(options?: OpenOptions<V>): TurboKV<V>;
 
     /** Wire the primary to apply worker batches. Idempotent. */
+    /** @see LevelOption */
+    static readonly L1: 1;
+    /** @see LevelOption */
+    static readonly L2: 2;
+    /** @see LevelOption */
+    static readonly L3: 3;
+
     static install(cluster: unknown): void;
 
     /** Whether `m` is one of turbokv's own cluster messages.
@@ -251,7 +282,7 @@ export declare class TurboKV<T = unknown> {
      *  the debounce, and the interval currently in force. */
     static heapGuardPace(): { evaluations: number; debounced: number; minIntervalMs: number };
 
-    get(key: string): T | undefined;
+    get(key: string, options?: LevelOption): T | undefined;
     set(key: string, value: T, options?: SetOptions): boolean;
     has(key: string): boolean;
     /** Returns whether the key was present at call time. */
