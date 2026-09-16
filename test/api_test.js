@@ -68,33 +68,35 @@ c.close();
 
 // --- a failed create explains itself --------------------------------------
 //
-// The failure a user actually hits is a container whose /dev/shm is smaller
-// than the arena -- exactly what the musl release job hit. The message has to
-// name the constraint, not just say "failed".
-//
-// Whether an oversized arena fails at all is platform-dependent, and asserting
-// otherwise is how this test spent its first day passing vacuously: Linux
-// reserves the space (posix_fallocate) and fails, while macOS allocates shm
-// lazily and happily hands back a 1TB arena nobody has touched.
+// The failure a user actually hits is a container whose /dev/shm is smaller than
+// the arena -- exactly what the musl release job hit, and the reason the message
+// carries a hint rather than just saying "failed".
 {
-    const name = '/tcfail' + process.pid;
+    // A deterministic failure, available on every platform: an index that cannot
+    // fit the arena is refused by the geometry check regardless of how the OS
+    // backs shared memory. Sizing the arena to fail instead was platform
+    // -dependent and got this test wrong twice -- Linux reserves with
+    // posix_fallocate and Windows commits the section against the pagefile, so
+    // both fail, while macOS maps lazily and happily returns a 1TB arena.
     let msg = null, created = false;
     try {
-        TurboKV.createPrimary(name, 1024 * (1 << 30), 1 << 16, {});
+        TurboKV.createPrimary('/tcfail' + process.pid, 1 << 20, 1 << 16, {});
         created = true;
     } catch (e) { msg = e.message; }
+    ok(!created, 'an index that cannot fit the arena is refused on every platform');
+    ok(/arena create failed/.test(msg || ''),
+       `and the failure names what failed (got ${JSON.stringify(msg)})`);
 
+    // The /dev/shm hint is Linux-only -- it is the one platform that can report
+    // how much shared memory is left, and the hint is what made the musl CI
+    // failure diagnosable at a glance.
     if (process.platform === 'linux') {
-        ok(!created, 'linux reserves shared memory, so an impossible arena fails');
-        ok(/arena create failed/.test(msg || ''),
-           `the failure names what failed (got ${JSON.stringify(msg)})`);
-        ok(/\/dev\/shm holds .*free.*arena needs/.test(msg || ''),
-           `it names the /dev/shm constraint and the shortfall (got ${JSON.stringify(msg)})`);
-        ok(/--shm-size=/.test(msg || ''), 'and the Docker flag that fixes it');
-    } else {
-        ok(created && msg === null,
-           'this platform allocates shared memory lazily, so an oversized arena succeeds');
-        __native.destroy();          // do not leave a 1TB name behind
+        let hint = null;
+        try { TurboKV.createPrimary('/tcshm' + process.pid, 1024 * (1 << 30), 1 << 16, {}); }
+        catch (e) { hint = e.message; }
+        ok(/\/dev\/shm holds .*free.*arena needs/.test(hint || ''),
+           `an arena larger than /dev/shm names the constraint and the shortfall (got ${JSON.stringify(hint)})`);
+        ok(/--shm-size=/.test(hint || ''), 'and the Docker flag that fixes it');
     }
 }
 
