@@ -1397,7 +1397,16 @@ class TurboKV {
     // cluster-wide side effect and the name should say so.
     clearAll() {
         this.clearLocal();
-        if (this.#id === 0) { native.clearAll(0); return; }
+        if (this.#id === 0) {
+            native.clearAll(0);
+            // The flush marker on the invalidation ring reaches other in-process
+            // instances too, but only whenever #primaryInvalidate next runs after
+            // a drain -- so between this call and that drain a sibling instance
+            // keeps serving values that no longer exist. Same bug as set/delete,
+            // same family, no key to pass this time.
+            TurboKV.#clearOthers(this);
+            return;
+        }
         this.#outbox.push('c', '', null, 0);
         this.#schedule(48);
     }
@@ -1617,6 +1626,13 @@ class TurboKV {
     static #dropOthers(fullKey, self) {
         if (instances.size < 2) return;
         for (const c of instances) if (c !== self) c.#l1Drop(fullKey);
+    }
+
+    // Same reasoning as #dropOthers, for the no-key case: clearAll() has
+    // nothing to drop by key, so every other instance's L1 is reset wholesale.
+    static #clearOthers(self) {
+        if (instances.size < 2) return;
+        for (const c of instances) if (c !== self) c.clearLocal();
     }
     static isCacheMessage(m) { return m && m.t === MSG; }
     // `native()` used to hand the raw addon to any caller of the public class,

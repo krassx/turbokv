@@ -26,5 +26,23 @@ two.set('theirs', 'also kept');
 ok(one.get('mine') === 'kept' && two.get('theirs') === 'also kept',
    'unrelated keys are untouched');
 
+// clearAll() is a write too, and the same bug applies: the primary's own
+// branch cleared itself and the shared arena, but never the L1 of any other
+// in-process instance. A key the other instance had CACHED (an L1 hit,
+// served without ever touching the now-empty arena) is the path that was
+// broken.
+one.set('cached-elsewhere', 'was-here');
+ok(one.get('cached-elsewhere') === 'was-here', 'sanity: cached in the first instance\'s L1 before the clear');
+two.clearAll();
+ok(two.get('cached-elsewhere') === undefined, 'the clearing instance sees its own clear');
+ok(one.get('cached-elsewhere') === undefined,
+   'clearAll from another instance drops a key the first instance had cached in L1');
+
+// A key the first instance never cached (only reachable through the shared
+// arena) is NOT covered by a separate assertion here: native.clearAll()
+// empties the arena unconditionally, on both sides of this fix, so an L1
+// miss falling through to it was never broken and no assertion here can
+// distinguish the two -- verified by fault injection, see task-5-report.md.
+
 console.log(fail ? `  ${fail} failed` : '  [instances] all passed');
 process.exit(fail ? 1 : 0);
