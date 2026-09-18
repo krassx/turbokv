@@ -195,6 +195,53 @@ int main() {
     ok(refused == (int)(sizeof(cases) / sizeof(cases[0])), "every corrupted geometry is refused");
   }
 
+  // The TC_LAYOUT gate in attachReadOnly. DESIGN.md decision 63 claimed this
+  // was "exercised by guard_test.js against the header check in
+  // attachReadOnly" -- it was not: guard_test.js is the heap-guard suite and
+  // never attaches an arena, and geometryOk (tested above) never reads
+  // `layout` either, since that check is a separate line in attachReadOnly.
+  // Nothing in the tree bent `layout` before this case. The gate is the
+  // entire cross-version safety argument for a Header that just shrank 904
+  // bytes removing the namespace table (decision 63): without it, a process
+  // built before that change attaches to an arena built after it and
+  // misreads every record.
+  {
+    const char* NM4 = "/tclayouttest";
+    shmUnlink(NM4);
+    Store w;
+    ok(w.create(NM4, 8u << 20, 1u << 12, MODE_LOG2), "layout test: arena created");
+    ok(w.h->layout == TC_LAYOUT, "layout test: create() published the current TC_LAYOUT");
+
+    // The realistic threat is a build made BEFORE a layout bump attaching to
+    // an arena a newer primary just created, so the value below the current
+    // one is the one that matters most -- but bend it above too, since the
+    // check is a plain inequality and both directions are cheap to cover.
+    w.h->layout = TC_LAYOUT - 1;
+    {
+      Store older;
+      ok(!older.attachReadOnly(NM4), "an arena one layout version behind is refused");
+    }
+
+    w.h->layout = TC_LAYOUT + 1;
+    {
+      Store newer;
+      ok(!newer.attachReadOnly(NM4), "an arena one layout version ahead is refused");
+    }
+
+    // Restore the real layout and confirm a matching build still attaches --
+    // a gate that refuses everything would pass the two cases above for the
+    // wrong reason.
+    w.h->layout = TC_LAYOUT;
+    {
+      Store good;
+      ok(good.attachReadOnly(NM4), "the same layout version still attaches");
+      good.destroy();
+    }
+
+    w.destroy();
+    shmUnlink(NM4);
+  }
+
   // The expiry sweep must use the wrap-aware comparison too. It was the fifth
   // comparison site and the one left behind: a plain `exp > now` deletes every
   // entry whose expiry crosses the uint32 wrap while it is still live, once per
