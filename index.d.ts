@@ -53,16 +53,20 @@ export interface L3GetOptions {
 export interface L3SetOptions {
     /** Time to live in milliseconds. 0 (or absent) means no expiry. */
     ttlMs?: number;
-    /** Which worker originated the write, when known. */
-    originId?: number;
+    /** @see L3DeleteOptions.originId */
+    originId?: string;
     /** @see L3GetOptions.willCache */
     willCache?: boolean;
 }
 
 /** Options passed to an {@link L3Adapter}'s `delete`. */
 export interface L3DeleteOptions {
-    /** Which worker originated the delete, when known. */
-    originId?: number;
+    /** Which arena originated the operation: the hex arena id, stable for the
+     *  life of an arena and identical in the primary and every worker mapping
+     *  it. A primary restart changes it, which is correct — a restarted primary
+     *  has an empty cache. Use it to suppress a subscription's echo of this
+     *  box's own writes. `undefined` only on a handle with no arena mapped. */
+    originId?: string;
 }
 
 /** What an L3 `get` resolves with for a key it holds. */
@@ -88,8 +92,16 @@ export interface L3Adapter<T = unknown> {
     /** Optional: `EXISTS`-shaped check. Falls back to `get` when absent. */
     has?(key: string): Promise<boolean>;
     /** Optional: push invalidations for cross-machine staleness. Without it,
-     *  staleness relies on TTL alone. */
-    subscribe?(onInvalidate: (key: string) => void): void;
+     *  staleness relies on TTL alone. Called only by the primary, and resolves
+     *  with the function that unsubscribes.
+     *
+     *  `onRemoteChange` carries a key another box changed. `onResync` means
+     *  *invalidations were lost*, not "I reconnected": a provider that can
+     *  replay calls it only when entries it never read were trimmed; one that
+     *  cannot calls it on every disconnection, because it genuinely cannot
+     *  tell. */
+    subscribe?(onRemoteChange: (key: string) => void,
+               onResync: () => void): Promise<() => void>;
     /** Optional: release any resources the adapter holds. */
     close?(): Promise<void> | void;
 }
@@ -251,6 +263,33 @@ export interface CacheStats {
     /** Times this worker re-attached after losing its primary. */
     recoveries?: number;
     lastRecovery?: { sameArena: boolean; at: number } | null;
+
+    // The L3 counters are declared EXPLICITLY, not left to the index signature
+    // below: an index signature of `unknown` types every one of them as
+    // `unknown`, so `stats.l3Hits > 0` does not compile and the only way to
+    // read a counter this library maintains is to cast it.
+    /** Reads answered by L3 after an L1 and L2 miss. */
+    l3Hits?: number;
+    /** Reads L3 did not answer: absent, failed, or refused by a pending clear. */
+    l3Misses?: number;
+    /** Writes handed to the L3 queue. */
+    l3Sets?: number;
+    /** L3 writes abandoned past `l3RetryMs`, or shed past `l3QueueMaxBytes`. */
+    l3SetFailed?: number;
+    /** L3 deletes abandoned past `l3RetryMs`. */
+    l3DeleteFailed?: number;
+    /** Failed L3 writes whose local copy was re-timed to `l3FailTtlMs`. */
+    l3FailTtlApplied?: number;
+    /** L3 hits returned to the caller but not promoted, because the key was
+     *  invalidated while the read was in flight or the ring could not rule it
+     *  out. Ordinary contention, not an error. */
+    l3PromotionsBlocked?: number;
+    /** L3 hits not promoted because the key cannot live in L1 or L2 at all
+     *  (an unpaired surrogate the arena cannot hash). */
+    l3UnhashableKeys?: number;
+    /** L3 hits discarded because this process deleted the key while the read
+     *  was in flight. */
+    l3DeletedWhileReading?: number;
     [k: string]: unknown;
 }
 

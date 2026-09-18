@@ -5,7 +5,7 @@
 // UNUSED expect-error, so this file only passes when each of those really is
 // an error and every line above them really is not.
 import { TurboKV, Cache, MSG } from 'turbokv';
-import type { CacheOptions, StorageMode, Codec, CacheStats } from 'turbokv';
+import type { CacheOptions, StorageMode, Codec, CacheStats, L3Adapter, L3SetOptions } from 'turbokv';
 
 // --- inference -------------------------------------------------------------
 const c = TurboKV.createPrimary<{ a: number }>('/t', 1, 1, { storage: 'bytes' });
@@ -90,3 +90,54 @@ void [kGet, kSet, kDelete, kClear, kHas, kClose];
 // @ts-expect-error op.kind is closed -- 'subscribe' is never a queued or reported L3 op
 const kSubscribe: L3ErrorKind = 'subscribe';
 void kSubscribe;
+
+// --- the L3 counters are usable as numbers ---------------------------------
+//
+// CacheStats carries an `[k: string]: unknown` index signature, so a counter
+// that is only reachable through it types as `unknown` and cannot be compared,
+// added or formatted without a cast. Declaring each one explicitly is what
+// makes `stats.l3Hits > 0` compile, and these lines fail the moment a counter
+// falls back to the index signature again.
+const l3Hits: number | undefined = c.stats.l3Hits;
+const l3Misses: number | undefined = c.stats.l3Misses;
+const l3Sets: number | undefined = c.stats.l3Sets;
+const l3SetFailed: number | undefined = c.stats.l3SetFailed;
+const l3DeleteFailed: number | undefined = c.stats.l3DeleteFailed;
+const l3FailTtl: number | undefined = c.stats.l3FailTtlApplied;
+const l3Blocked: number | undefined = c.stats.l3PromotionsBlocked;
+const l3Unhashable: number | undefined = c.stats.l3UnhashableKeys;
+const l3DelReading: number | undefined = c.stats.l3DeletedWhileReading;
+const anyHit: boolean = (c.stats.l3Hits ?? 0) > 0;
+void [l3Hits, l3Misses, l3Sets, l3SetFailed, l3DeleteFailed, l3FailTtl,
+     l3Blocked, l3Unhashable, l3DelReading, anyHit];
+
+// --- the adapter contract matches spec section 4 ---------------------------
+//
+// `subscribe` takes (onRemoteChange, onResync) and resolves with the
+// unsubscribe function; `originId` is the hex arena id, a string. Nothing
+// calls subscribe yet, so the declared shape is exactly what adapter authors
+// will implement against -- which is the only reason getting it wrong is
+// expensive later and free to fix now.
+const adapter: L3Adapter<string> = {
+    async get(key, o) { void [key, o?.willCache]; return { value: 'v', ttlMs: 10 }; },
+    async set(key, value, o) {
+        const origin: string | undefined = o?.originId;
+        void [key, value, origin, o?.ttlMs, o?.willCache];
+    },
+    async delete(key, o) { const origin: string | undefined = o?.originId; void [key, origin]; },
+    async clear() {},
+    async has(key) { return key.length > 0; },
+    async subscribe(onRemoteChange, onResync) {
+        onRemoteChange('k'); onResync();
+        return () => {};
+    },
+    async close() {},
+};
+const withL3: CacheOptions<string> = { l3: adapter, l3FailTtlMs: 100, l3RetryMs: 50 };
+void [adapter, withL3];
+// @ts-expect-error originId is the arena id, a string, not a worker number
+const badOrigin: L3SetOptions = { originId: 7 };
+void badOrigin;
+// @ts-expect-error subscribe resolves with an unsubscribe function, not void
+const badSub: L3Adapter<string> = { ...adapter, subscribe: async () => {} };
+void badSub;

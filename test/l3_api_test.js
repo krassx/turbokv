@@ -411,6 +411,25 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         c.close();
     }
 
+    // 26. originId reaches the adapter. Spec section 4: it is native.arenaId(),
+    //     stable per arena and identical in the primary and every worker
+    //     mapping it. It is the loop-suppression field -- an adapter author
+    //     writes `if (originId === mine) skip`, and handing them `undefined`
+    //     means that test silently never fires.
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        await c.setAsync('o1', 'v');
+        await c.deleteAsync('o1');
+        const s = f.calls.find(x => x[0] === 'set' && x[1] === 'o1');
+        const d = f.calls.find(x => x[0] === 'delete' && x[1] === 'o1');
+        ok(s && s[3] && typeof s[3].originId === 'string' && s[3].originId.length > 0,
+           `set receives a real originId (${s && s[3] && JSON.stringify(s[3].originId)})`);
+        ok(d && d[3] && d[3].originId === s[3].originId,
+           `delete reports the same arena identity (${d && d[3] && JSON.stringify(d[3].originId)})`);
+        c.close();
+    }
+
     // 27. a HUNG adapter read -- one that neither resolves nor rejects -- is a
     //     miss within the operation budget, and DOES NOT POISON THE KEY.
     //     retryMs is consulted only in a catch, so a hang never reached it:
@@ -442,6 +461,28 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 40 });
         const r = await Promise.race([c.setAsync('hw', 'v'), delay(3000).then(() => 'TIMED_OUT')]);
         ok(r === false, `a hung adapter write is abandoned rather than never settling (${r})`);
+        c.close();
+    }
+
+    // 29. #inflight is keyed by LEVEL AND KEY. Keyed by key alone, a joiner's
+    //     minLevel was silently replaced by whichever caller got there first --
+    //     so a minLevel:L3 read could promote into L1 because someone else
+    //     asked for the default, and the adapter heard one willCache for two
+    //     different requests.
+    {
+        const f = makeFake();
+        f.store.set('lv', { value: 'v', expiresAt: 0 });
+        f.latency.set('get', 25);
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        const [a, b] = await Promise.all([
+            c.getAsync('lv', { minLevel: TurboKV.L3 }),
+            c.getAsync('lv'),
+        ]);
+        ok(a === 'v' && b === 'v', 'both callers get the value');
+        const gets = f.calls.filter(x => x[0] === 'get' && x[1] === 'lv');
+        ok(gets.length === 2, `reads at different levels are not joined into one request (${gets.length})`);
+        ok(gets.some(g => g[2] === false) && gets.some(g => g[2] === true),
+           `each level announced its own willCache (${gets.map(g => g[2]).join(',')})`);
         c.close();
     }
 

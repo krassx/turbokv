@@ -1294,11 +1294,20 @@ class TurboKV {
         // already told had succeeded.
         if (this.#pendingDel.size && this.#pendingDel.has(key)) return undefined;
         const level = opts === undefined ? 1 : this.#resolveLevel(opts.minLevel);
-        const shared = this.#inflight.get(key);
+        // Keyed by LEVEL AND KEY, not by key alone. The herd only shares a
+        // request when the requests are the same request: two concurrent reads
+        // of one key at different `minLevel`s differ in what they fill and in
+        // the `willCache` they tell the adapter, so joining the second to the
+        // first silently gave it the first caller's placement -- a
+        // `minLevel: L3` read promoting into L1 because someone else asked
+        // first, or the reverse. ` ` cannot appear in a level, so the two
+        // parts cannot run together into an ambiguous id.
+        const shareId = level + ' ' + key;
+        const shared = this.#inflight.get(shareId);
         if (shared !== undefined) return shared;
 
-        const p = this.#fetchFromL3(key, level).finally(() => this.#inflight.delete(key));
-        this.#inflight.set(key, p);
+        const p = this.#fetchFromL3(key, level).finally(() => this.#inflight.delete(shareId));
+        this.#inflight.set(shareId, p);
         return p;
     }
 
@@ -1795,7 +1804,7 @@ class TurboKV {
             this.#l1Drop(key);
             TurboKV.#dropOthers(key, this);
             this.#lastQueued = this.#queue
-                ? this.#queue.push({ kind: 'delete', key, bytes: key.length + 48 })
+                ? this.#queue.push({ kind: 'delete', key, originId: this.#originId(), bytes: key.length + 48 })
                 : null;
             return had;
         }
@@ -1819,7 +1828,7 @@ class TurboKV {
         // local tombstone once the outage ends, unlike a set's short-TTL
         // revert.
         this.#lastQueued = this.#queue
-            ? this.#queue.push({ kind: 'delete', key, bytes: key.length + 48 })
+            ? this.#queue.push({ kind: 'delete', key, originId: this.#originId(), bytes: key.length + 48 })
             : null;
         if (this.#ringIdx >= 0) {
             if (native.submitDel(key)) this.#ringDoorbell();
