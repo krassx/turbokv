@@ -322,6 +322,88 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
            'a third call, after resolution, still does not re-invoke the adapter');
     }
 
+    // 27. a HUNG adapter read -- one that neither resolves nor rejects -- is a
+    //     miss within the operation budget, and DOES NOT POISON THE KEY.
+    //     retryMs is consulted only in a catch, so a hang never reached it:
+    //     getAsync's .finally never ran, the #inflight entry became permanent,
+    //     and every later read of that key in this process was handed the same
+    //     dead promise even after L3 recovered. Raced against a guard so a
+    //     regression fails an assertion rather than wedging CI.
+    {
+        const f = makeFake();
+        f.store.set('hung', { value: 'v', expiresAt: 0 });
+        f.hang.add('get');
+        const errs = [];
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 40,
+                                onL3Error: (e, op) => errs.push(op.kind) });
+        const first = await Promise.race([c.getAsync('hung'), delay(3000).then(() => 'TIMED_OUT')]);
+        ok(first === undefined, `a hung adapter read settles as a miss (${first})`);
+        ok(errs.includes('get'), `and is reported like any other failed read (${errs.join(',')})`);
+        f.hang.delete('get');
+        const second = await Promise.race([c.getAsync('hung'), delay(3000).then(() => 'TIMED_OUT')]);
+        ok(second === 'v', `the key recovers once L3 does rather than staying poisoned (${second})`);
+        c.close();
+    }
+
+    // 28. a hung adapter WRITE follows the same retry-and-abandon policy, so
+    //     setAsync settles instead of hanging its caller forever.
+    {
+        const f = makeFake();
+        f.hang.add('set');
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 40 });
+        const r = await Promise.race([c.setAsync('hw', 'v'), delay(3000).then(() => 'TIMED_OUT')]);
+        ok(r === false, `a hung adapter write is abandoned rather than never settling (${r})`);
+        c.close();
+    }
+
+    // 30. close()'s L3 half cannot reject either, and it is caught separately
+    //     from the local teardown so one failing does not swallow the other.
+    //     The adapter is the caller's object, so merely LOOKING at it can
+    //     throw -- `typeof adapter.close === 'function'` runs a getter.
+    {
+        const f = makeFake();
+        let reads = 0;
+        Object.defineProperty(f.adapter, 'close', {
+            configurable: true,
+            // assertAdapter reads it twice at construction (presence, then
+            // type); close() is the read after that.
+            get() { if (++reads > 2) throw new Error('adapter getter exploded'); return async () => {}; },
+        });
+        const reports = [];
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter,
+                                onL3Error: (e, op) => reports.push(op.kind) });
+        let rejected = null;
+        await c.close().then(() => {}, (e) => { rejected = e; });
+        ok(rejected === null, `close() does not reject when the adapter throws on access (${rejected && rejected.message})`);
+        ok(String(c.lastError).includes('adapter getter exploded'),
+           `the failure is reported through lastError (${c.lastError})`);
+        ok(reports.includes('close'), `and through the listener (${reports.join(',')})`);
+    }
+
+    // 31. close() NEVER REJECTS. Its synchronous teardown -- stopGuard(), the
+    //     ring-release loop, the unwrapped native.destroy() -- used to throw to
+    //     the caller. Once close() returned a promise, the same throw became a
+    //     rejection of a promise every caller in this codebase deliberately
+    //     ignores, which under Node 18's default terminates the process: a
+    //     failed ring release would kill the process it was cleaning up.
+    //
+    //     LAST in this file on purpose: the injected failure aborts the rest of
+    //     the teardown, leaving the arena undestroyed, and test/_cleanup.js
+    //     releases it on exit.
+    {
+        const f = makeFake();
+        const reports = [];
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter,
+                                onL3Error: (e, op) => reports.push(op.kind) });
+        c.stopGuard = () => { throw new Error('teardown exploded'); };
+        let rejected = null;
+        await c.close().then(() => {}, (e) => { rejected = e; });
+        ok(rejected === null, `close() does not reject when its teardown throws (${rejected && rejected.message})`);
+        ok(String(c.lastError).includes('teardown exploded'),
+           `the failure is reported through lastError instead (${c.lastError})`);
+        ok(reports.includes('close'), `and through the listener, as a close (${reports.join(',')})`);
+    }
+
     console.log(fail ? `  ${fail} failed` : '  [l3-api] all passed');
     process.exit(fail ? 1 : 0);
 })();

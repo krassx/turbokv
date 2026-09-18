@@ -15,17 +15,73 @@
 // chain rather than mixing it into any particular key's chain.
 const CLEAR_ID = Symbol('l3-clear');
 
+// Races `promise` against a bound, REJECTING when the bound wins.
+//
+// An adapter is user code talking to a network. "Threw" and "never settled" are
+// the same outage seen from two angles, but only the first one reaches a
+// `catch` -- so without this an adapter call that neither resolves nor rejects
+// wedges its caller forever: the queue's per-key chain stops draining, and on
+// the read side `getAsync`'s `.finally` never runs, leaving a permanent
+// `#inflight` entry that hands every future read of that key the same dead
+// promise even after L3 recovers. Turning the hang into a rejection puts it
+// back on the existing retry-and-abandon path, which already knows what to do
+// with a failed operation.
+//
+// The timer is unref'd: a bound that exists to stop a hang from wedging the
+// process must not itself become the reason the process cannot exit.
+function withDeadline(promise, ms, what) {
+    if (!(ms > 0)) return Promise.resolve(promise);
+    return new Promise((resolve, reject) => {
+        let done = false;
+        const timer = setTimeout(() => {
+            if (done) return;
+            done = true;
+            reject(new Error(`turbokv: the l3 adapter's ${what}() did not settle within ${ms}ms`));
+        }, ms);
+        if (timer.unref) timer.unref();
+        Promise.resolve(promise).then(
+            (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } },
+            (e) => { if (!done) { done = true; clearTimeout(timer); reject(e); } });
+    });
+}
+
 class L3Queue {
     #adapter; #maxBytes; #retryMs; #onError; #now;
     #chains = new Map();          // id -> { pending: op|null, settle: fn|null, busy: bool }
     #bytes = 0;
     #count = 0;
     #idle = [];
+    #closed = false;
+    #backoffs = new Set();        // retry timers currently sleeping; see close()
     stats = { shed: 0, failed: 0, retried: 0, coalesced: 0 };
 
     constructor(adapter, { maxBytes = 8 << 20, retryMs = 2000, onError = null, now = Date.now } = {}) {
         this.#adapter = adapter; this.#maxBytes = maxBytes; this.#retryMs = retryMs;
         this.#onError = onError; this.#now = now;
+    }
+
+    // The cache this queue belongs to is going away.
+    //
+    // A `clear` retries INDEFINITELY by design (decision 70), so without a way
+    // to say "stop", a failing clear keeps a retry loop running for the life of
+    // the process -- against a cache that no longer exists, and after close()
+    // has already returned. Two things are needed and neither substitutes for
+    // the other: UNREF'ING the sleeping backoff, so the wait already in
+    // progress stops holding the event loop the instant close begins, and the
+    // `#closed` FLAG, so the loop ends at its next attempt instead of retrying
+    // forever against a closed cache. Unref alone leaves the loop running;
+    // the flag alone leaves the current backoff detaining the process.
+    //
+    // Backoffs are unref'd HERE rather than at creation because a queue still
+    // in service must keep the loop alive for its own retries: with nothing
+    // else ref'd, an unconditionally unref'd backoff lets the process exit
+    // mid-retry, so `await setAsync(k, v)` against a failing L3 never resolves
+    // and the work is dropped with no caller left to hear about it. Measured,
+    // not theoretical -- it exits 0 in the middle of a test's assertions.
+    close() {
+        this.#closed = true;
+        for (const t of this.#backoffs) { if (t.unref) t.unref(); }
+        this.#backoffs.clear();
     }
 
     get pending() { return this.#count; }
@@ -114,12 +170,22 @@ class L3Queue {
             try {
                 const deadline = this.#now() + this.#retryMs;
                 for (let attempt = 0; ; attempt++) {
-                    try { await this.#apply(op); outcome = true; break; }
+                    // Each ATTEMPT is bounded, not just the retry budget: an
+                    // adapter that neither resolves nor rejects would otherwise
+                    // never reach the catch below, and this chain -- and every
+                    // caller waiting on it -- would hang forever. The budget is
+                    // `retryMs`, reused rather than given an option of its own:
+                    // it is already documented as the per-operation time budget
+                    // before an op is abandoned, and a call that has not
+                    // settled within it has already exhausted that budget, so a
+                    // second knob would only let the two disagree.
+                    try { await withDeadline(this.#apply(op), this.#retryMs, op.kind); outcome = true; break; }
                     catch (e) {
                         // A clear retries past the budget on purpose: flushing
                         // twice is harmless, and until it lands this process
-                        // must serve misses.
-                        const mayRetry = op.kind === 'clear' || this.#now() < deadline;
+                        // must serve misses. Once close() has begun it stops
+                        // anyway -- see close().
+                        const mayRetry = !this.#closed && (op.kind === 'clear' || this.#now() < deadline);
                         if (!mayRetry) { this.stats.failed++; this.#report(e, op); break; }
                         // No report here: a failure still inside the retry budget
                         // is not yet an event a caller should act on. Reporting it
@@ -131,7 +197,17 @@ class L3Queue {
                         // once per operation, and only when the operation is
                         // actually abandoned.
                         this.stats.retried++;
-                        await new Promise(r => setTimeout(r, Math.min(50 * (attempt + 1), 200)));
+                        // Registered with close(), which unrefs it. Ref'd while
+                        // the queue is in service, so a retry cannot be dropped
+                        // by a process that exits out from under it; unref'd the
+                        // moment close begins, so it cannot be the reason a
+                        // closed process stays alive. See close().
+                        await new Promise((r) => {
+                            const t = setTimeout(() => { this.#backoffs.delete(t); r(); },
+                                                 Math.min(50 * (attempt + 1), 200));
+                            if (this.#closed) { if (t.unref) t.unref(); }
+                            else this.#backoffs.add(t);
+                        });
                     }
                 }
             } catch (e) {
@@ -166,4 +242,4 @@ class L3Queue {
 
     drain() { return this.#count === 0 ? Promise.resolve() : new Promise(r => this.#idle.push(r)); }
 }
-module.exports = { L3Queue };
+module.exports = { L3Queue, withDeadline };

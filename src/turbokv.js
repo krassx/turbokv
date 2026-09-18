@@ -11,7 +11,7 @@ const v8 = require('v8');
 const v8ser = require('v8');
 const { callArgCounts } = require('./fastpath');
 const { assertAdapter } = require('./l3/adapter');
-const { L3Queue } = require('./l3/queue');
+const { L3Queue, withDeadline } = require('./l3/queue');
 
 // An unpaired surrogate encodes to U+FFFD in UTF-8, so '\uD800', '\uDC00' and
 // '\uFFFD' all became ONE key in the arena and returned each other's values --
@@ -254,6 +254,7 @@ class TurboKV {
     #queue = null;
     #l3FailTtlMs = 5000;
     #l3TtlMs = 60000;
+    #l3RetryMs = 2000;
     #l3CloseTimeoutMs = 5000;
     #closePromise = null;       // memoized: makes close() idempotent, see close()
     #lastQueued = null;
@@ -300,6 +301,12 @@ class TurboKV {
         // bound, matching l3TtlMs's own 0-disables convention) and must not
         // silently become the default instead.
         this.#l3CloseTimeoutMs = opts.l3CloseTimeoutMs ?? 5000;
+        // Held on the instance as well as handed to the queue: it is the budget
+        // for ONE L3 operation, and the read path has no queue to hold it for
+        // it. A hung `get` is the same outage as a failed one and has to be
+        // bounded by the same number, or the two halves of the adapter contract
+        // would give up at different times.
+        this.#l3RetryMs = opts.l3RetryMs ?? 2000;
         // One place holds the listener. It used to be read out of `opts` from
         // inside the queue's callback, which meant a second reporting path grew
         // the moment a second caller needed one -- and a duplicated report is
@@ -308,7 +315,7 @@ class TurboKV {
         if (this.#l3) {
             this.#queue = new L3Queue(this.#l3, {
                 maxBytes: opts.l3QueueMaxBytes ?? (8 << 20),
-                retryMs: opts.l3RetryMs ?? 2000,
+                retryMs: this.#l3RetryMs,
                 // A background failure must never reach `lastError`: the sync
                 // call it belongs to returned long ago, and a caller reading
                 // lastError would take it as the reason for a later operation.
@@ -692,10 +699,38 @@ class TurboKV {
         return 1;
     }
 
-    // Whether a value fetched or written at this level will occupy a local
-    // tier. The adapter needs to know: a read that fills nothing should not
-    // make the remote store remember this box for that key.
-    #willCache(level) { return level < 3; }
+    // Whether a value WRITTEN at this level will occupy a local tier. Level 3
+    // is the only level that stores nothing locally (spec 5.2). A degraded
+    // handle still caches a write: set() puts the value in L1 before it ever
+    // looks at the primary, so a worker that has lost its arena really is
+    // holding it.
+    #willCacheWrite(level) { return level < 3; }
+
+    // Whether a value READ at this level will occupy a local tier -- a
+    // different question, with a different answer on a degraded handle.
+    // #promotionBlock refuses EVERY promotion when there is no arena to read
+    // the invalidation ring from, so #fillFromL3 is never reached at all, not
+    // even for its L1 half. Answering `true` there told the adapter to remember
+    // this box for a key it was about to discard -- and the provider this seam
+    // exists for turns that into tracking state that is never invalidated,
+    // because nothing here ever changes.
+    #willCacheRead(level) { return level < 3 && storeReady && !this.#primaryDead; }
+
+    // Spec section 4: `originId` is `native.arenaId()` -- stable per arena,
+    // identical in the primary and in every worker mapping it, and changed by a
+    // primary restart, which is correct because a restarted primary has an
+    // empty cache. It is the loop-suppression field an adapter needs to tell
+    // its own writes coming back at it from a subscription apart from another
+    // box's, so handing it `undefined` would make `if (originId === mine) skip`
+    // silently never fire. `undefined` remains the honest answer for a handle
+    // with no arena mapped at all (`attached: false`), where there is no
+    // identity to report.
+    #originId() {
+        if (TurboKV.#arenaId === null) {
+            try { TurboKV.#arenaId = native.arenaId(); } catch { return undefined; }
+        }
+        return TurboKV.#arenaId;
+    }
 
     static #createError(arenaBytes) {
         let hint = '';
@@ -1260,7 +1295,14 @@ class TurboKV {
         // from here on happened while this read was in flight.
         const mark = storeReady && !this.#primaryDead ? native.ringHead() : -1;
         let rec;
-        try { rec = await this.#l3.get(key, { willCache: this.#willCache(level) }); }
+        // Bounded, not merely awaited. An adapter that neither resolves nor
+        // rejects would otherwise leave this promise pending forever -- and
+        // because getAsync shares it through #inflight, the `.finally` that
+        // removes the entry would never run either, so EVERY later read of this
+        // key in this process would be handed the same dead promise even after
+        // L3 came back. A hang is the same outage as a throw; it takes the same
+        // path.
+        try { rec = await withDeadline(this.#l3.get(key, { willCache: this.#willCacheRead(level) }), this.#l3RetryMs, 'get'); }
         catch (e) {
             this.stats.l3Misses = (this.stats.l3Misses || 0) + 1;
             this.#reportL3(e, { kind: 'get', key });
@@ -1363,7 +1405,7 @@ class TurboKV {
         this.stats.l3Sets = (this.stats.l3Sets || 0) + 1;
         return this.#queue.push({
             kind: 'set', key, value: enc, ttlMs,
-            willCache: this.#willCache(level),
+            willCache: this.#willCacheWrite(level),
             bytes: (typeof enc === 'string' ? enc.length : enc.length) + key.length + 48,
         });
     }
@@ -1621,12 +1663,15 @@ class TurboKV {
         // guard in #fetchFromL3, for a read that answers existence rather
         // than a value.
         if (this.#pendingDel.size && this.#pendingDel.has(key)) return false;
+        // Bounded for the same reason the read path is: a hung adapter must
+        // answer "not here" within the operation budget rather than never.
         try {
-            if (typeof this.#l3.has === 'function') return await this.#l3.has(key) === true;
+            if (typeof this.#l3.has === 'function')
+                return await withDeadline(this.#l3.has(key), this.#l3RetryMs, 'has') === true;
             // No has() on the adapter: fall back to a read. Correct, and it
             // transfers the value needlessly -- which is why has() is in the
             // contract as an optional member at all.
-            const rec = await this.#l3.get(key, { willCache: false });
+            const rec = await withDeadline(this.#l3.get(key, { willCache: false }), this.#l3RetryMs, 'get');
             return rec !== undefined && rec !== null;
         } catch (e) { this.#reportL3(e, { kind: 'has', key }); return false; }
     }
@@ -1853,7 +1898,38 @@ class TurboKV {
         return this.#closePromise;
     }
 
+    // close() NEVER REJECTS.
+    //
+    // The teardown below used to be the whole of close(), synchronous, and it
+    // threw to its caller: `stopGuard()`, the `#usesRing()` loop and the
+    // unwrapped `native.destroy()` can all raise. Making close() return a
+    // promise turned every one of those throws into a REJECTION -- of a promise
+    // that every caller in this codebase, and every shutdown hook, signal
+    // handler and test teardown outside it, deliberately ignores. Under Node
+    // 18's default that is an unhandled rejection, which terminates the
+    // process: a failure to release a ring slot would kill the process it was
+    // trying to shut down cleanly, and the widened return type of decision 71
+    // was supposed to be backwards compatible for exactly those callers.
+    //
+    // So a failure is REPORTED rather than propagated -- `lastError` for the
+    // caller who looks, `onL3Error` with the already-declared `close` kind for
+    // the listener who is watching -- and close() resolves either way. The two
+    // halves are caught separately so a local teardown that fails does not also
+    // skip the adapter's own close().
     async #doClose() {
+        try { this.#closeLocal(); }
+        catch (e) {
+            this.lastError = `close failed: ${e && e.message ? e.message : e}`;
+            this.#reportL3(e, { kind: 'close' });
+        }
+        try { await this.#closeL3(); }
+        catch (e) {
+            this.lastError = `close failed: ${e && e.message ? e.message : e}`;
+            this.#reportL3(e, { kind: 'close' });
+        }
+    }
+
+    #closeLocal() {
         // Everything below is synchronous, exactly as it was before close()
         // gained an L3 half -- deliberately. It runs to completion before
         // this function's first `await`, so a caller that calls `close()`
@@ -1889,7 +1965,9 @@ class TurboKV {
             submitName = null; isPrimaryProcess = false;
             native.destroy(); storeReady = false;
         }
+    }
 
+    async #closeL3() {
         // An open L3 connection keeps the event loop alive, so shutdown also
         // has to wait for the queue and then hand the adapter its own
         // close. This is the only reason close() returns a promise at all;
@@ -1916,6 +1994,18 @@ class TurboKV {
         if (this.#queue) {
             const drained = this.#queue.drain();
             await (this.#l3CloseTimeoutMs > 0 ? this.#withTimeout(drained, this.#l3CloseTimeoutMs) : drained);
+            // The bound above makes close() RETURN during an outage. It does
+            // not make the queue STOP: a `clear` retries indefinitely by
+            // design, so after close() returned, a backoff timer went on
+            // rescheduling itself forever against a cache that no longer
+            // exists -- the process could not exit, which is the failure
+            // decision 71 exists to prevent, reached by a route its bounded
+            // waits did not cover. Telling the queue it is closed ends the
+            // retry loop on its next attempt; the queue's own unref'd backoff
+            // (see L3Queue) keeps that last wait from holding the loop either.
+            // After the drain, not before: work already accepted from a caller
+            // still gets its bounded chance to land first.
+            this.#queue.close();
         }
         // The adapter's own close() is bounded too, separately from the
         // drain above and by the same l3CloseTimeoutMs ceiling. Its
