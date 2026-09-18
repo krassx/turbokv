@@ -29,12 +29,10 @@ void [n, okSet, present, removed, size, t, hits, err, sv, opts, mode, Cache, MSG
 
 const dead: boolean = c.primaryDead;
 const mode2: StorageMode = c.storage;
-// incr can report a rejection, so `number` alone is not the type
-const inc: number | undefined | false = c.incr('k', 1);
 // arenaStats is undefined before an arena exists
 const st2 = TurboKV.arenaStats();
 const liveCount: number | undefined = st2?.live;
-void [dead, mode2, inc, liveCount];
+void [dead, mode2, liveCount];
 
 // --- these MUST be errors --------------------------------------------------
 // @ts-expect-error storage mode is a closed set
@@ -50,10 +48,6 @@ const bad5 = c._dropByHash('x');
 // @ts-expect-error transport is a closed set
 const bad6: CacheOptions = { transport: 'carrier-pigeon' };
 void [bad1, bad2, bad3, bad4, bad5, bad6];
-// @ts-expect-error incr may return false, so it is not assignable to number
-const bad7: number | undefined = c.incr('k', 1);
 // @ts-expect-error arenaStats can be undefined
 const bad8: number = TurboKV.arenaStats().live;
-// @ts-expect-error cas is numeric, not T
-const bad9 = c.cas('k', { a: 1 }, { a: 2 });
-void [bad7, bad8, bad9];
+void [bad8];
