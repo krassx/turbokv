@@ -29,6 +29,13 @@ class L3Queue {
     }
 
     get pending() { return this.#count; }
+    // Bytes currently OUTSTANDING -- queued PLUS in flight, not merely
+    // queued. The synchronous pump (see push()) starts sending an op before
+    // push() returns, so "queued" alone would undercount from the instant a
+    // key goes idle-to-busy; #bytes is what maxBytes is actually checked
+    // against, and it has to count a slow send in flight or a burst across
+    // many distinct keys could grow this queue's outstanding work without
+    // bound even though every individual key looks idle right after push().
     get pendingBytes() { return this.#bytes; }
     // Test-only: lets tests prove the per-key chain map does not accumulate
     // one entry per distinct key for the life of the process.
@@ -94,32 +101,50 @@ class L3Queue {
             // the queue's outstanding work without limit even though every
             // individual key looked "idle" the instant after its push().
             let outcome = false;
-            const deadline = this.#now() + this.#retryMs;
-            for (let attempt = 0; ; attempt++) {
-                try { await this.#apply(op); outcome = true; break; }
-                catch (e) {
-                    // A clear retries past the budget on purpose: flushing
-                    // twice is harmless, and until it lands this process
-                    // must serve misses.
-                    const mayRetry = op.kind === 'clear' || this.#now() < deadline;
-                    if (!mayRetry) { this.stats.failed++; this.#report(e, op); break; }
-                    this.stats.retried++;
-                    if (attempt === 0) this.#report(e, op);
-                    await new Promise(r => setTimeout(r, Math.min(50 * (attempt + 1), 200)));
+            // `now` is a user-supplied constructor option -- untrusted input
+            // like any other. #run is invoked fire-and-forget (push() does
+            // not await or .catch it), so a throw escaping this whole block
+            // would both become an unhandled rejection (process termination
+            // under Node 18's default) AND hang this op's caller forever,
+            // since settle() would never run. The deadline computation used
+            // to sit outside any try for exactly that reason -- `this.#now`
+            // is called here too, not only inside the retry loop's catch --
+            // so the try now wraps the whole per-op attempt, not just the
+            // adapter call.
+            try {
+                const deadline = this.#now() + this.#retryMs;
+                for (let attempt = 0; ; attempt++) {
+                    try { await this.#apply(op); outcome = true; break; }
+                    catch (e) {
+                        // A clear retries past the budget on purpose: flushing
+                        // twice is harmless, and until it lands this process
+                        // must serve misses.
+                        const mayRetry = op.kind === 'clear' || this.#now() < deadline;
+                        if (!mayRetry) { this.stats.failed++; this.#report(e, op); break; }
+                        this.stats.retried++;
+                        if (attempt === 0) this.#report(e, op);
+                        await new Promise(r => setTimeout(r, Math.min(50 * (attempt + 1), 200)));
+                    }
                 }
+            } catch (e) {
+                this.stats.failed++; this.#report(e, op); outcome = false;
             }
             this.#bytes -= op.bytes; this.#count--;
             settle(outcome);
             if (this.#count === 0) { const w = this.#idle; this.#idle = []; for (const r of w) r(); }
         }
-        // Nothing left queued for this key. push() is synchronous, so this
-        // check and the delete below happen with no yield point in between --
-        // no push for this id can land after we observe pending === null and
-        // before we release the chain. Without this, a process writing a
-        // large keyspace would accumulate one Map entry per distinct key for
-        // its whole life. A later push simply creates a fresh chain.
+        // Nothing left queued for this key -- provably true here: this is
+        // the `while` loop's own exit condition, so `chain.pending === null`
+        // cannot be false at this point and guarding the delete on it again
+        // would be dead code. Worse than merely redundant: if some future
+        // edit made the guard's false branch reachable, the code below it
+        // would set `chain.busy = false` and return with an operation still
+        // queued and no pump left running to send it -- exactly the one
+        // failure mode a queue must not have (a promise that never settles).
+        // So the delete is unconditional rather than re-guarded; the
+        // invariant is enforced by the loop shape itself, not restated here.
         chain.busy = false;
-        if (chain.pending === null) this.#chains.delete(id);
+        this.#chains.delete(id);
     }
 
     #apply(op) {

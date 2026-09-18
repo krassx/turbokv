@@ -79,12 +79,15 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         const f = makeFake(); f.latency.set('set', 50);
         const q = new L3Queue(f.adapter, { maxBytes: 100 });
         const kept = [], shed = [];
+        // maxBytes:100, bytes:30/op: i=0,1,2 are admitted (30,60,90 <= 100);
+        // i=3 is the first to exceed it (90+30 > 100). Every push from i=3 on
+        // must shed, so the assertion below checks ALL of them, not just one.
         for (let i = 0; i < 20; i++) {
             const p = q.push({ kind: 'set', key: 'k' + i, value: 'v', bytes: 30 });
-            (i < 4 ? kept : shed).push(p);
+            (i < 3 ? kept : shed).push(p);
         }
         const results = await Promise.all(shed);
-        ok(results.some(r => r === false), 'work past the bound is shed');
+        ok(results.every(r => r === false), `every push past the bound is shed (${results.filter(r => r !== false).length} were not)`);
         ok(q.stats.shed > 0, `sheds counted (${q.stats.shed})`);
         ok(q.pendingBytes <= 100 + 30, `pending bytes stay bounded (${q.pendingBytes})`);
     }
@@ -106,6 +109,32 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         for (let i = 0; i < 500; i++) q.push({ kind: 'set', key: 'leak' + i, value: 'v', bytes: 10 });
         await q.drain();
         ok(q.chainCount === 0, `chains are released once drained (${q.chainCount} left)`);
+    }
+
+    // 9. delete reaches the adapter and removes the key
+    {
+        const f = makeFake();
+        const q = new L3Queue(f.adapter, {});
+        f.store.set('gone', { value: 'seed', expiresAt: 0 });   // present before the delete
+        const p = q.push({ kind: 'delete', key: 'gone', bytes: 0 });
+        ok(await p === true, 'a delete settles true');
+        ok(f.store.has('gone') === false, 'delete removes the key from L3');
+        ok(f.calls.some(c => c[0] === 'delete' && c[1] === 'gone'), 'the adapter delete method was actually called');
+    }
+
+    // 10. a delete is ordered against a set to the same key, not raced --
+    // otherwise a slow set queued behind a fast delete could resurrect a key
+    // this process just told L3 to remove.
+    {
+        const f = makeFake(); f.latency.set('set', 40); f.latency.set('delete', 5);
+        const q = new L3Queue(f.adapter, {});
+        q.push({ kind: 'set', key: 'resurrect', value: 'v', bytes: 10 });   // captures 40ms
+        const p = q.push({ kind: 'delete', key: 'resurrect', bytes: 0 });   // queued; captures 5ms only once it starts
+        await p; await q.drain();
+        ok(f.store.has('resurrect') === false,
+           `a delete queued behind a slower set still lands last and the key stays absent (has=${f.store.has('resurrect')})`);
+        const order = f.calls.filter(c => c[1] === 'resurrect').map(c => c[0]).join(',');
+        ok(order === 'set,delete', `set then delete were sent in that order (${order})`);
     }
 
     console.log(fail ? `  ${fail} failed` : '  [l3-queue] all passed');
