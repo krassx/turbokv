@@ -42,6 +42,58 @@ export interface Codec<T = unknown> {
     decode(encoded: string): T;
 }
 
+/** Options passed to an {@link L3Adapter}'s `get`. */
+export interface L3GetOptions {
+    /** Whether the value will be cached locally (L1/L2) once it is returned.
+     *  A `minLevel: L3` read passes `false`. */
+    willCache?: boolean;
+}
+
+/** Options passed to an {@link L3Adapter}'s `set`. */
+export interface L3SetOptions {
+    /** Time to live in milliseconds. 0 (or absent) means no expiry. */
+    ttlMs?: number;
+    /** Which worker originated the write, when known. */
+    originId?: number;
+    /** @see L3GetOptions.willCache */
+    willCache?: boolean;
+}
+
+/** Options passed to an {@link L3Adapter}'s `delete`. */
+export interface L3DeleteOptions {
+    /** Which worker originated the delete, when known. */
+    originId?: number;
+}
+
+/** What an L3 `get` resolves with for a key it holds. */
+export interface L3Record<T = unknown> {
+    value: T;
+    /** Milliseconds remaining until expiry, if the key has a TTL. */
+    ttlMs?: number;
+}
+
+/**
+ * A user-supplied remote store behind L1/L2. `get`, `set`, `delete` and
+ * `clear` are required; `has`, `subscribe` and `close` are optional. `has`
+ * falls back to `get` when absent (correct, and it transfers the value
+ * needlessly). Validated once, at construction, so a malformed adapter is a
+ * `TypeError` from `TurboKV.open`/`createPrimary`/`attachWorker`, never a
+ * rejection discovered on the first cache miss.
+ */
+export interface L3Adapter<T = unknown> {
+    get(key: string, options?: L3GetOptions): Promise<L3Record<T> | undefined | null>;
+    set(key: string, value: T, options?: L3SetOptions): Promise<void>;
+    delete(key: string, options?: L3DeleteOptions): Promise<void>;
+    clear(): Promise<void>;
+    /** Optional: `EXISTS`-shaped check. Falls back to `get` when absent. */
+    has?(key: string): Promise<boolean>;
+    /** Optional: push invalidations for cross-machine staleness. Without it,
+     *  staleness relies on TTL alone. */
+    subscribe?(onInvalidate: (key: string) => void): void;
+    /** Optional: release any resources the adapter holds. */
+    close?(): Promise<void> | void;
+}
+
 /** Bounds L1 by live heap measured after a collection, since the byte budget is
  *  only an estimate. Pass `false` to disable. Driven by a FinalizationRegistry,
  *  which works on Node, Bun and Deno, with a floor-polling backstop for when
@@ -101,6 +153,31 @@ export interface CacheOptions<T = unknown> {
     maintenanceMs?: number;
     sweepSlots?: number;
     sweepFullPassMs?: number;
+    /** A remote store behind L1/L2. With one attached, the three tiers are
+     *  ONE cache: `clearAll`/`clearAsync` empty it too, and reads fall
+     *  through to it on an L1/L2 miss. Validated once, at construction. */
+    l3?: L3Adapter<T>;
+    /** How long a value stays in the local tiers after its L3 write failed,
+     *  before it reverts to whatever L3 holds. Default 5000ms. */
+    l3FailTtlMs?: number;
+    /** TTL applied to a value filled into the local tiers from an L3 read
+     *  that carried none of its own. Default 60000ms. */
+    l3TtlMs?: number;
+    /** Byte bound on the per-process L3 write/delete queue, outstanding
+     *  (queued plus in flight). Past it, non-`clear` ops are shed under the
+     *  same contract as a full submission ring; `clear` is never shed.
+     *  Default 8MB. */
+    l3QueueMaxBytes?: number;
+    /** Time budget, per queued L3 operation, before it is abandoned and
+     *  `onL3Error` fires. A `clear` ignores this and retries indefinitely.
+     *  Default 2000ms. */
+    l3RetryMs?: number;
+    /** Called once per abandoned background L3 operation (a queued op past
+     *  its retry budget, or a failed read). Never called synchronously from
+     *  `set`/`get`/etc. — those report failure through their own return
+     *  value or promise, and `lastError` is never touched by a background
+     *  failure, which is why this listener exists. */
+    onL3Error?: (error: unknown, op: { kind: 'get' | 'set' | 'delete' | 'clear' | 'has'; key?: string }) => void;
 }
 
 export interface PrimaryOptions<T = unknown> extends CacheOptions<T> {
@@ -268,14 +345,48 @@ export declare class TurboKV<T = unknown> {
     static heapGuardPace(): { evaluations: number; debounced: number; minIntervalMs: number };
 
     get(key: string, options?: LevelOption): T | undefined;
+    /** `get`, then L3 on a local miss (if an adapter is attached), filling
+     *  L1/L2 back down to `options.minLevel`. Identical effects to `get`; the
+     *  only difference is that this one can wait for L3. Concurrent misses on
+     *  one key inside this process share a single L3 request. */
+    getAsync(key: string, options?: LevelOption): Promise<T | undefined>;
     set(key: string, value: T, options?: SetOptions): boolean;
+    /** `set`, then L3 (if an adapter is attached), resolving on the L3
+     *  outcome. Identical effects to `set`; the only difference is what the
+     *  caller can wait for — the value is in the local tiers before this
+     *  promise even settles. Resolves `false` when the L3 write failed (the
+     *  local write still stands), never throws. */
+    setAsync(key: string, value: T, options?: SetOptions): Promise<boolean>;
     has(key: string): boolean;
+    /** `has`, then L3 on a local miss (if an adapter is attached). Uses the
+     *  adapter's `has` when present, otherwise falls back to `get` and
+     *  discards the value. */
+    hasAsync(key: string): Promise<boolean>;
     /** Returns whether the key was present at call time. */
     delete(key: string): boolean;
+    /** `delete`, then L3 (if an adapter is attached), resolving once the L3
+     *  delete has settled. Identical effects to `delete`; the only
+     *  difference is what the caller can wait for. If L3 is unreachable the
+     *  local delete still stands for the whole outage — there is no local
+     *  tombstone to revert from the way a failed `setAsync` has one. */
+    deleteAsync(key: string): Promise<boolean>;
     /** Drop this process's L1. The arena is untouched. */
     clearLocal(): void;
-    /** Clear the whole arena and every process's L1. */
+    /** Clear the whole arena and every process's L1. With an adapter
+     *  attached this also clears L3 — the tiers are one cache, so clearing
+     *  only the local ones would be undone by the next read. Until the L3
+     *  clear lands, L3 reads in this process serve misses rather than the
+     *  values the clear was meant to remove. */
     clearAll(): void;
+    /** `clearAll`, then L3 (if an adapter is attached), resolving once the L3
+     *  clear has landed. A clear is never shed by the L3 queue and retries
+     *  indefinitely, so this promise always eventually resolves `true`. */
+    clearAsync(): Promise<boolean>;
+
+    /** Wait for every operation currently queued for L3 (of any kind, for
+     *  any key) to settle. No-op, resolving immediately, when no adapter is
+     *  attached. */
+    drainL3(): Promise<void>;
 
     /** Lazily enumerate keys. Not a snapshot: the arena may change mid-scan. */
     keys(options?: KeysOptions): Generator<string, void, unknown>;

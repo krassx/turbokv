@@ -42,6 +42,11 @@ if (process.env.TCG_ROLE === 'worker') {
 
         // 1. deleted, then read: the delete is known before the read starts.
         ok(w.get('gone') === 'L2VALUE', `the worker reads the key from L2 first (${w.get('gone')})`);
+        // Held in flight so L3 still holds 'gone' while the assertions below
+        // run -- otherwise the background delete could win the race and land
+        // before hasAsync/getAsync even ask, which would pass even with the
+        // #pendingDel guard missing and prove nothing.
+        f.latency.set('delete', 5000);
         ok(w.delete('gone') === true, 'the worker deletes it');
         ok(w.get('gone') === undefined, `the sync form reports it gone (${w.get('gone')})`);
         const got = await w.getAsync('gone');
@@ -49,6 +54,14 @@ if (process.env.TCG_ROLE === 'worker') {
         ok(w.get('gone') === undefined, `nothing was promoted back into L1 (${w.get('gone')})`);
         ok(f.calls.filter(x => x[0] === 'get' && x[1] === 'gone').length === 0,
            'and L3 was never even asked for a key this process had deleted');
+        // hasAsync must agree with the same guard: L3 still holds 'gone' (the
+        // queued delete has not necessarily landed there yet), so without the
+        // #pendingDel check hasAsync would report a key this caller was just
+        // told is gone as still present.
+        const hasGot = await w.hasAsync('gone');
+        ok(hasGot === false, `hasAsync agrees too, rather than reporting a deleted key present (${hasGot})`);
+        ok(f.calls.filter(x => x[0] === 'has' && x[1] === 'gone').length === 0,
+           'and L3 was never even asked has() for a key this process had deleted');
 
         // 2. the delete lands WHILE the read is in flight, so the early-out
         //    above cannot help and there may be no ring record yet either.

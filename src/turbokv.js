@@ -245,6 +245,11 @@ class TurboKV {
     #l3TtlMs = 60000;
     #lastQueued = null;
     #onL3Error = null;
+    // Set while a clearAll's L3 op is outstanding. Until it lands, L3 reads in
+    // this process must serve misses rather than the values the clear was
+    // meant to remove -- otherwise the read path resurrects exactly what
+    // clear() was supposed to erase.
+    #clearPending = false;
     #inflight = new Map();      // key -> in-flight L3 read, so a herd shares one request
     // Native expiry is milliseconds from the arena's creation time.
     #id;
@@ -1229,6 +1234,11 @@ class TurboKV {
     }
 
     async #fetchFromL3(key, level) {
+        // A clear is on its way to L3 but has not landed yet. Reading through
+        // here would hand back -- and promote into L2 -- exactly the value the
+        // clear was meant to remove. Miss instead; that is the failure mode
+        // this system is built around, a resurrected value is not.
+        if (this.#clearPending) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
         // Marked BEFORE the await: everything appended to the invalidation ring
         // from here on happened while this read was in flight.
         const mark = storeReady && !this.#primaryDead ? native.ringHead() : -1;
@@ -1575,6 +1585,32 @@ class TurboKV {
         return native.has(key);
     }
 
+    // has(), then L3 if the local tiers do not have it. Identical effects to
+    // has(); the only difference is that this one can wait for L3.
+    async hasAsync(key) {
+        if (this.has(key)) return true;
+        if (!this.#l3 || this.#clearPending) return false;
+        // `has` already rejected a non-string key by returning false; going on
+        // to L3 with it would hand the adapter something the contract does
+        // not accept.
+        if (!isStringKey(key)) return false;
+        // A key THIS process deleted, whose removal L3 has not applied yet
+        // (the delete is queued but has not landed). `has` already answers
+        // false for it; going to L3 here would say `true` for a key this
+        // caller was just told is gone -- same reasoning as the pendingDel
+        // guard in #fetchFromL3, for a read that answers existence rather
+        // than a value.
+        if (this.#pendingDel.size && this.#pendingDel.has(key)) return false;
+        try {
+            if (typeof this.#l3.has === 'function') return await this.#l3.has(key) === true;
+            // No has() on the adapter: fall back to a read. Correct, and it
+            // transfers the value needlessly -- which is why has() is in the
+            // contract as an optional member at all.
+            const rec = await this.#l3.get(key, { willCache: false });
+            return rec !== undefined && rec !== null;
+        } catch (e) { this.#reportL3(e, { kind: 'has', key }); return false; }
+    }
+
     delete(key) {
         this.#checkPrimary();
         if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
@@ -1583,6 +1619,9 @@ class TurboKV {
             const had = native.del(key, 0);
             this.#l1Drop(key);
             TurboKV.#dropOthers(key, this);
+            this.#lastQueued = this.#queue
+                ? this.#queue.push({ kind: 'delete', key, bytes: key.length + 48 })
+                : null;
             return had;
         }
         // A worker's delete is applied a tick later, so report whether the key
@@ -1599,6 +1638,14 @@ class TurboKV {
         if (this.#pendingDel.size >= 4096) { this.#pendingDel.clear(); this.#pendingDelHash.clear(); }
         this.#pendingDel.add(key);
         this.#pendingDelHash.set(native.hashKey(key), key);
+        // The L3 half, shared by every worker path below. Same contract as
+        // #queueSet: the sync caller ignores the promise, deleteAsync awaits
+        // it. L3 is the store of record for a worker's delete -- there is no
+        // local tombstone once the outage ends, unlike a set's short-TTL
+        // revert.
+        this.#lastQueued = this.#queue
+            ? this.#queue.push({ kind: 'delete', key, bytes: key.length + 48 })
+            : null;
         if (this.#ringIdx >= 0) {
             if (native.submitDel(key)) this.#ringDoorbell();
             else this.stats.writesShed = (this.stats.writesShed || 0) + 1;
@@ -1606,6 +1653,24 @@ class TurboKV {
         }
         this.#outbox.push('d', key, null, 0);
         this.#schedule(key.length + 48);
+        return had;
+    }
+
+    // Local delete, then L3. If L3 is UNREACHABLE, reads cannot refetch
+    // either, so the delete holds for the whole outage -- there is no local
+    // tombstone to fall back on the way a set() has a short-TTL revert. The
+    // only case where the old value returns is reads succeeding while the
+    // DEL failed, and the caller resolved false and knows it.
+    async deleteAsync(key) {
+        // A rejected key (delete() returns early, before touching #lastQueued)
+        // must not fall through to reading it below: #lastQueued would then
+        // be whatever an earlier, unrelated operation left there, and this
+        // call would await a promise that has nothing to do with it.
+        if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
+        const had = this.delete(key);
+        const p = this.#lastQueued;
+        this.#lastQueued = null;
+        if (p) await p;
         return had;
     }
 
@@ -1620,6 +1685,18 @@ class TurboKV {
     // cluster-wide side effect and the name should say so.
     clearAll() {
         this.clearLocal();
+        // With an adapter attached the tiers are ONE cache: a clear that only
+        // emptied the local tiers would silently undo itself, because the
+        // very next read refills everything straight back out of L3. Until
+        // this lands, L3 reads in this process must miss rather than serve
+        // the values the clear was meant to remove -- see #fetchFromL3. The
+        // queue never sheds a clear (src/l3/queue.js): flushing twice is
+        // harmless, never flushing is not.
+        if (this.#queue) {
+            this.#clearPending = true;
+            this.#lastQueued = this.#queue.push({ kind: 'clear', bytes: 0 })
+                .then((r) => { this.#clearPending = false; return r; });
+        }
         if (this.#id === 0) {
             native.clearAll(0);
             // The flush marker on the invalidation ring reaches other in-process
@@ -1632,6 +1709,17 @@ class TurboKV {
         }
         this.#outbox.push('c', '', null, 0);
         this.#schedule(48);
+    }
+
+    // clearAll(), then L3. Identical effects to clearAll(); the only
+    // difference is that this one can wait for L3 (and, unlike a set or a
+    // delete, its promise always eventually resolves true -- a clear is
+    // never shed).
+    async clearAsync() {
+        this.clearAll();
+        const p = this.#lastQueued;
+        this.#lastQueued = null;
+        return p ? p : true;
     }
 
     // Whether this addon build can compress. Compression is optional at build

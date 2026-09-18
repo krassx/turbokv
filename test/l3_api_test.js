@@ -133,6 +133,74 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         c.close();
     }
 
+    // 10. delete removes from local tiers and from L3
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        await c.setAsync('d1', 'v');
+        ok(await c.deleteAsync('d1') === true, 'deleteAsync reports the key was present');
+        ok(c.get('d1') === undefined && f.store.get('d1') === undefined, 'gone from both');
+        c.close();
+    }
+
+    // 11. a failed L3 delete leaves the local delete standing
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 20 });
+        await c.setAsync('d2', 'v');
+        f.fail.set('delete', new Error('L3 down'));
+        await c.deleteAsync('d2');
+        ok(c.get('d2') === undefined, 'the local delete stands');
+        ok(f.store.get('d2') !== undefined, 'L3 still has it, which the caller was told');
+        c.close();
+    }
+
+    // 12. hasAsync consults L3, and uses the adapter's has when it exists
+    {
+        const f = makeFake();
+        f.store.set('h1', { value: 'v', expiresAt: 0 });
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(await c.hasAsync('h1') === true, 'hasAsync sees a key that is only in L3');
+        ok(f.calls.some(x => x[0] === 'has'), 'the adapter has() is used when present');
+        ok(await c.hasAsync('nope') === false, 'and reports absence');
+        c.close();
+    }
+
+    // 13. without adapter.has, hasAsync falls back to get
+    {
+        const f = makeFake({ noOptional: true });
+        f.store.set('h2', { value: 'v', expiresAt: 0 });
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(await c.hasAsync('h2') === true, 'the get fallback answers correctly');
+        c.close();
+    }
+
+    // 14. clear empties every tier
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        await c.setAsync('c1', 'v');
+        ok(await c.clearAsync() === true, 'clearAsync resolves true');
+        ok(c.get('c1') === undefined, 'local tiers are empty');
+        ok(f.store.size === 0, 'L3 is empty');
+        c.close();
+    }
+
+    // 15. while a clear is pending, L3 reads serve misses rather than values
+    //     the clear was meant to remove
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 30 });
+        await c.setAsync('c2', 'v');
+        f.fail.set('clear', new Error('L3 down'));
+        c.clearAll();
+        ok(await c.getAsync('c2') === undefined,
+           'a pending clear makes L3 reads miss rather than resurrect the value');
+        f.fail.delete('clear');
+        await c.drainL3();
+        c.close();
+    }
+
     console.log(fail ? `  ${fail} failed` : '  [l3-api] all passed');
     process.exit(fail ? 1 : 0);
 })();
