@@ -104,7 +104,7 @@ int main() {
     for (auto& c : cases) {
       r->head.store(0); r->tail.store(0); r->corrupt.store(0);
       SubmitRec* rec = (SubmitRec*)base;
-      rec->len = c.len; rec->op = c.op; rec->flags = 0;
+      rec->len = c.len; rec->op = c.op; rec->flags = 0; rec->reserved2 = 0;
       rec->keyLen = c.keyLen; rec->valLen = c.valLen; rec->ttlMs = 0; rec->reserved = 0;
       r->head.store(4096, std::memory_order_release);       // claim bytes are live
       uint32_t n = drain(s, 3, [](SubmitRec*, uint8_t*) {});
@@ -209,7 +209,7 @@ int main() {
     uint8_t* base = s.ringData(2);
     for (uint32_t off = 0; off + sizeof(SubmitRec) <= cap; off += 24) {
       SubmitRec* r = (SubmitRec*)(base + off);
-      r->len = 24; r->op = SUBMIT_OP_SKIP; r->flags = 0;
+      r->len = 24; r->op = SUBMIT_OP_SKIP; r->flags = 0; r->reserved2 = 0;
       r->keyLen = 0; r->valLen = 0; r->ttlMs = 0; r->reserved = 0;
     }
     s.ring(2)->tail.store(0);

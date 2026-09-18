@@ -265,12 +265,15 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   {
     // Index pressure, not data pressure. A re-append frees no index SLOT, so
     // second chance cannot relieve this directly -- which is why this loop used
-    // to pass a null budget and drop unconditionally. But that made reference
-    // bits vanish entirely whenever the index was the binding constraint:
-    // measured 500 protected entries dropped regardless while liveBytes sat at
-    // 0.45MB of 32MB. autoSize() gives one slot per 512B, so any workload
-    // averaging under ~384B is index-bound in production and never saw the
-    // eviction policy at all.
+    // to pass a null budget and drop unconditionally. But that made the whole
+    // eviction policy vanish whenever the index was the binding constraint.
+    // The figure that established this was measured in the namespace era and
+    // cannot be restated for today's code: a cold namespace lost all 500 of its
+    // QUOTA-protected entries while liveBytes sat at 0.45MB of 32MB (decision
+    // 38). Quotas are gone (decision 63); what the budget still rescues is the
+    // CLOCK reference bit, which was dropped by the same mechanism. autoSize()
+    // gives one slot per 512B, so any workload averaging under ~384B is
+    // index-bound in production and never saw the eviction policy at all.
     //
     // Give it a bounded budget instead. Re-appending a protected entry lets the
     // scan step PAST it to find a droppable one, which does free a slot. Once

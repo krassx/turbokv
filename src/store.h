@@ -47,6 +47,13 @@ struct Entry {
   uint16_t keyLen;
   uint8_t  flags;
 };
+// Load-bearing, not cosmetic: keyOf/valOf place the key and value at
+// sizeof(Entry), logGapAt decides a wrap remainder against it, and logAlloc
+// sizes every block from it -- so a field added here silently moves every
+// offset in the data region AND changes what an existing arena means. Only the
+// tail padding after `flags` keeps this at 40; adding a field is a TC_LAYOUT
+// bump, and this assert is what forces that conversation.
+static_assert(sizeof(Entry) == 40, "Entry is the data region's stride: changing it is a TC_LAYOUT change");
 
 struct IndexSlot {
   std::atomic<uint64_t> hash;  // 0 empty, 1 tombstone, else hash

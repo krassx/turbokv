@@ -45,11 +45,21 @@ struct SubmitRec {
   uint32_t len;        // total record size incl. this header, 8-byte aligned
   uint8_t  op;
   uint8_t  flags;      // value type tag, same FLAG_* bits the arena uses
+  // The namespace id lived here (TCS_LAYOUT 1). It is named rather than left as
+  // an anonymous hole so every byte of a record is written: this segment is
+  // shared and reused lap after lap, so an unwritten hole carries whatever the
+  // previous record put there. Nothing reads it, but leaving it uninitialised
+  // is what MSan reports and what a future field would inherit.
+  uint16_t reserved2;
   uint32_t keyLen;
   uint32_t valLen;
   uint32_t ttlMs;      // 0 = no expiry
   uint32_t reserved;
 };
+// Load-bearing: submitPush reserves and the consumer steps by exactly this many
+// bytes, submitGapAt derives the implicit wrap gap from it, and submitValidate
+// bounds a record's payload against it. A field added here is a TCS_LAYOUT bump.
+static_assert(sizeof(SubmitRec) == 24, "SubmitRec is the ring's record stride: changing it is a TCS_LAYOUT change");
 
 // One per worker slot. Padded so head and tail never share a cache line: they
 // are written by different processes on different cores, and false sharing here
@@ -212,7 +222,7 @@ static inline bool submitPush(Submit& s, uint32_t idx, uint8_t op, uint8_t flags
   if (pad) {
     if (pad >= sizeof(SubmitRec)) {
       SubmitRec* skip = (SubmitRec*)(base + off);
-      skip->len = pad; skip->op = SUBMIT_OP_SKIP; skip->flags = 0;
+      skip->len = pad; skip->op = SUBMIT_OP_SKIP; skip->flags = 0; skip->reserved2 = 0;
       skip->keyLen = 0; skip->valLen = 0; skip->ttlMs = 0; skip->reserved = 0;
     }
     // else: implicit gap, see submitGapAt
@@ -220,7 +230,7 @@ static inline bool submitPush(Submit& s, uint32_t idx, uint8_t op, uint8_t flags
     off = 0;
   }
   SubmitRec* rec = (SubmitRec*)(base + off);
-  rec->len = need; rec->op = op; rec->flags = flags;
+  rec->len = need; rec->op = op; rec->flags = flags; rec->reserved2 = 0;
   rec->keyLen = keyLen; rec->valLen = valLen; rec->ttlMs = ttlMs; rec->reserved = 0;
   if (keyLen) memcpy(base + off + sizeof(SubmitRec), key, keyLen);
   if (valLen) memcpy(base + off + sizeof(SubmitRec) + keyLen, val, valLen);
