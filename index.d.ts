@@ -42,13 +42,6 @@ export interface Codec<T = unknown> {
     decode(encoded: string): T;
 }
 
-export interface NamespaceOptions {
-    name: string;
-    /** Soft byte quota. A namespace under its quota is protected from eviction
-     *  by a hotter one; over it, it competes normally. 0 means no quota. */
-    quotaBytes?: number;
-}
-
 /** Bounds L1 by live heap measured after a collection, since the byte budget is
  *  only an estimate. Pass `false` to disable. Driven by a FinalizationRegistry,
  *  which works on Node, Bun and Deno, with a floor-polling backstop for when
@@ -93,8 +86,6 @@ export interface CacheOptions<T = unknown> {
      *  JSON-shaped objects. Default 3. */
     heapFactor?: number;
     heapGuard?: HeapGuardOptions | false;
-    /** Prefix and arena-level identity, optionally carrying a byte quota. */
-    namespace?: string | NamespaceOptions;
     /** @see Transport. Default `'shm'`. */
     transport?: Transport;
     /** Bytes a worker may hold in the IPC outbox before shedding. Default 1MB. */
@@ -190,11 +181,6 @@ export interface ArenaStats {
     [k: string]: number;
 }
 
-export interface NamespaceStat {
-    name: string; id: number; bytes: number; quota: number;
-    protected: number; dropped: number;
-}
-
 export interface AutoSize {
     arenaBytes: number; indexSlots: number; l1MaxBytes: number;
 }
@@ -260,7 +246,6 @@ export declare class TurboKV<T = unknown> {
 
     /** Undefined when no arena is attached (before open, or after close). */
     static arenaStats(): ArenaStats | undefined;
-    static namespaceStats(): NamespaceStat[] | undefined;
     static submitStats(): SubmitStats | null;
     /** Milliseconds since the primary last stamped its heartbeat; -1 if never. */
     static primaryAgeMs(): number;
@@ -291,11 +276,10 @@ export declare class TurboKV<T = unknown> {
     clearLocal(): void;
     /** Clear the whole arena and every process's L1. */
     clearAll(): void;
-    clearNamespace(): number;
 
     /** Lazily enumerate keys. Not a snapshot: the arena may change mid-scan. */
     keys(options?: KeysOptions): Generator<string, void, unknown>;
-    /** Counts by enumerating, so it is O(index slots), not a cached counter. */
+    /** Live entries in the arena, from the arena-wide counter. */
     get size(): number;
 
     /** Which write path this handle negotiated. */

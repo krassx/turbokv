@@ -15,7 +15,7 @@ process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ? process.env.NODE_OPTION
 
 const SUITE = [
     'test.js', 'api_test.js', 'codec_test.js', 'prim_test.js', 'json_fastpath_test.js',
-    'v8codec_test.js', 'storage_modes_test.js', 'namespace_test.js', 'cluster_api_test.js',
+    'v8codec_test.js', 'storage_modes_test.js', 'cluster_api_test.js',
     'review_regression_test.js', 'gaps_test.js', 'typeflow_test.js', 'typematrix_test.js',
     'perf_regression_test.js', 'guard_test.js', 'recovery_test.js',
     'review2_regression_test.js', 'entrypoints_test.js',

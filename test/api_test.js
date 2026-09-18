@@ -2,7 +2,7 @@ const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
-const c = TurboKV.open({ storage: 'bytes', namespace: 'app' });
+const c = TurboKV.open({ storage: 'bytes' });
 
 // get / set
 ok(c.set('k', 'v') === true, 'set returns true on success');
@@ -24,11 +24,6 @@ ok(c.get('gone') === undefined && c.has('gone') === false, 'absent key: get unde
 ok(c.delete('k') === true, 'delete returns true when present');
 ok(c.get('k') === undefined && c.has('k') === false, 'deleted key is gone from both tiers');
 ok(c.delete('k') === false, 'delete returns false when absent');
-
-// namespace isolation
-const d = TurboKV.attachWorker.length >= 0 ? null : null;   // placeholder, same arena
-c.set('shared', 'ns-a');
-ok(c.get('shared') === 'ns-a', 'namespaced key reads back');
 
 // ttl, in both tiers
 c.set('tmp', 'x', { ttlMs: 60 });
@@ -57,7 +52,7 @@ ok(c.stats.rejectedType > 0, 'rejection counted in stats');
 // enumeration — decision 3 named this as a benefit of storing key text
 c.clearAll();
 for (let i = 0; i < 5; i++) c.set('e' + i, 'v');
-ok([...c.keys()].sort().join(',') === 'e0,e1,e2,e3,e4', 'keys() enumerates this namespace');
+ok([...c.keys()].sort().join(',') === 'e0,e1,e2,e3,e4', 'keys() enumerates the arena');
 ok(c.size === 5, 'size reports live entries');
 ok(typeof TurboKV.arenaStats().live === 'number', 'arenaStats() exposes arena counters');
 ok([...c.keys({ limit: 2 })].length === 2, 'keys() honours limit');
@@ -108,13 +103,13 @@ c.close();
 {
     const DECLARED_STATICS = [
         'createPrimary', 'attachWorker', 'open', 'install', 'isCacheMessage', 'applyBatch',
-        'arenaStats', 'namespaceStats', 'submitStats', 'primaryAgeMs', 'autoSize',
+        'arenaStats', 'submitStats', 'primaryAgeMs', 'autoSize',
         'defaultName', 'hasCompression', 'deepFreeze', 'assertFastCodec',
         'JSON_CODEC', 'V8_CODEC', 'drainSubmissions', 'heapGuardPace', 'L1', 'L2', 'L3',
     ];
     const DECLARED_INSTANCE = [
         'get', 'set', 'has', 'delete', 'clearLocal', 'clearAll',
-        'clearNamespace', 'keys', 'flush', 'close', 'stopGuard',
+        'keys', 'flush', 'close', 'stopGuard',
         'stats', 'lastError', 'liveHeapFraction', 'primaryDead', 'storage',
         'transport', 'size', 'l1Size',
     ];

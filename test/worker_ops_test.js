@@ -1,8 +1,7 @@
 // Worker-side operations that the rest of the suite never reaches: the
-// submission ring running out of room, clearAll() reaching a worker's L1, and
-// clearNamespace() issued FROM a worker rather than the primary.
+// submission ring running out of room, and clearAll() reaching a worker's L1.
 //
-// All three have the same contract and it is worth stating once: when a write
+// Both have the same contract and it is worth stating once: when a write
 // cannot reach L2, the value stays in the writing worker's L1 and the loss is
 // COUNTED. Other workers then see a miss, never a wrong value. A silent drop
 // here would be indistinguishable from success at the call site.
@@ -74,8 +73,6 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
         if (m.t === 'done') {
             ok(m.after === undefined,
                'clearAll() on the primary empties a WORKER\'s L1 (ring sentinel honoured)');
-            ok(m.nsCleared === true,
-               'clearNamespace() from a worker is accepted and queued');
             reapThen(Object.values(cluster.workers), () => {
                 native.destroy();
                 console.log(fails ? `  ${fails} FAILURES` : '  all passed');
@@ -115,8 +112,7 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
         }
         if (m && m.t === 'check-cleared') {
             const after = c.get('sentinel');
-            const nsCleared = c.clearNamespace() === true;   // worker path: queues, not direct
-            process.send({ t: 'done', after, nsCleared });
+            process.send({ t: 'done', after });
         }
     });
 }
