@@ -47,9 +47,9 @@ const mk = o => TurboKV.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 << 
 {
     const c = mk({});
     c.set('k', 'from-primary');
-    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['s', 'k', 'from-worker', 0, 0] });
+    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['s', 'k', 'from-worker', 0] });
     ok(c.get('k') === 'from-worker', 'primary L1 sees a worker set');
-    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['d', 'k', null, 0, 0] });
+    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['d', 'k', null, 0] });
     ok(c.get('k') === undefined, 'primary L1 sees a worker delete');
     __native.destroy();
 }

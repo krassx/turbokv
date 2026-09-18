@@ -43,7 +43,7 @@ int main() {
   // 1. round trip
   {
     const char* k = "alpha"; const char* v = "value-one";
-    ok(submitPush(s, 0, SUBMIT_OP_SET, 2, 0, 0, k, 5, v, 9), "push one record");
+    ok(submitPush(s, 0, SUBMIT_OP_SET, 2, 0, k, 5, v, 9), "push one record");
     std::string gotK, gotV;
     uint32_t n = drain(s, 0, [&](SubmitRec* r, uint8_t* p) {
       gotK.assign((char*)p, r->keyLen); gotV.assign((char*)p + r->keyLen, r->valLen); });
@@ -58,7 +58,7 @@ int main() {
     std::vector<uint8_t> val(200, 'x');
     while (sent < N) {
       char key[32]; int kl = snprintf(key, sizeof key, "k%u", sent);
-      if (submitPush(s, 1, SUBMIT_OP_SET, 2, 0, 0, key, kl, val.data(), (uint32_t)val.size())) sent++;
+      if (submitPush(s, 1, SUBMIT_OP_SET, 2, 0, key, kl, val.data(), (uint32_t)val.size())) sent++;
       else {
         drain(s, 1, [&](SubmitRec* r, uint8_t* p) {
           char want[32]; int wl = snprintf(want, sizeof want, "k%u", got);
@@ -80,7 +80,7 @@ int main() {
     std::vector<uint8_t> big(4000, 'y');
     uint32_t accepted = 0;
     for (int i = 0; i < 1000; i++)
-      if (submitPush(s, 2, SUBMIT_OP_SET, 2, 0, 0, "k", 1, big.data(), (uint32_t)big.size())) accepted++;
+      if (submitPush(s, 2, SUBMIT_OP_SET, 2, 0, "k", 1, big.data(), (uint32_t)big.size())) accepted++;
     ok(accepted > 0 && accepted < 1000, "full ring sheds rather than overruns");
     ok(s.ring(2)->shed.load() == 1000 - accepted, "every shed write is counted");
     uint32_t n = drain(s, 2, [](SubmitRec*, uint8_t*) {});
@@ -91,21 +91,20 @@ int main() {
   {
     SubmitRing* r = s.ring(3);
     uint8_t* base = s.ringData(3);
-    struct Case { const char* name; uint32_t len; uint8_t op; uint32_t keyLen; uint32_t valLen; uint16_t ns; };
+    struct Case { const char* name; uint32_t len; uint8_t op; uint32_t keyLen; uint32_t valLen; };
     Case cases[] = {
-      {"len below header",        8, SUBMIT_OP_SET,    4,   0, 0},
-      {"len not 8-aligned",      33, SUBMIT_OP_SET,    4,   0, 0},
-      {"keyLen beyond maxKey",   64, SUBMIT_OP_SET, 99999,  0, 0},
-      {"valLen beyond maxVal",   64, SUBMIT_OP_SET,    4, 999999, 0},
-      {"payload exceeds len",    32, SUBMIT_OP_SET,  100,   0, 0},
-      {"namespace out of range", 32, SUBMIT_OP_SET,    4,   0, 250},
-      {"unknown opcode",         32,           77,     4,   0, 0},
+      {"len below header",        8, SUBMIT_OP_SET,    4,   0},
+      {"len not 8-aligned",      33, SUBMIT_OP_SET,    4,   0},
+      {"keyLen beyond maxKey",   64, SUBMIT_OP_SET, 99999,  0},
+      {"valLen beyond maxVal",   64, SUBMIT_OP_SET,    4, 999999},
+      {"payload exceeds len",    32, SUBMIT_OP_SET,  100,   0},
+      {"unknown opcode",         32,           77,     4,   0},
     };
     int rejected = 0;
     for (auto& c : cases) {
       r->head.store(0); r->tail.store(0); r->corrupt.store(0);
       SubmitRec* rec = (SubmitRec*)base;
-      rec->len = c.len; rec->op = c.op; rec->flags = 0; rec->ns = c.ns;
+      rec->len = c.len; rec->op = c.op; rec->flags = 0;
       rec->keyLen = c.keyLen; rec->valLen = c.valLen; rec->ttlMs = 0; rec->reserved = 0;
       r->head.store(4096, std::memory_order_release);       // claim bytes are live
       uint32_t n = drain(s, 3, [](SubmitRec*, uint8_t*) {});
@@ -126,7 +125,7 @@ int main() {
       std::vector<uint8_t> v(120, 'z');
       for (uint32_t i = 0; i < N; ) {
         char key[32]; int kl = snprintf(key, sizeof key, "k%u", i);
-        if (submitPush(s, 0, SUBMIT_OP_SET, 2, 0, 0, key, kl, v.data(), (uint32_t)v.size())) i++;
+        if (submitPush(s, 0, SUBMIT_OP_SET, 2, 0, key, kl, v.data(), (uint32_t)v.size())) i++;
         else std::this_thread::yield();
       }
       done.store(true, std::memory_order_release);
@@ -171,7 +170,7 @@ int main() {
       int want = 1 + sent % 57;
       for (int j = kl; j < want; j++) key[j] = 'p';
       if (kl < want) kl = want;
-      if (submitPush(s, 3, SUBMIT_OP_SET, 2, 0, 0, key, kl, val.data(), (uint32_t)(sent % 300))) { sent++; stall = 0; }
+      if (submitPush(s, 3, SUBMIT_OP_SET, 2, 0, key, kl, val.data(), (uint32_t)(sent % 300))) { sent++; stall = 0; }
       else { uint32_t was = got; consume(); if (got == was) stall++; }
     }
     ok(stall < 3, "varied-size records: ring never wedges (producer always makes progress)");
@@ -210,7 +209,7 @@ int main() {
     uint8_t* base = s.ringData(2);
     for (uint32_t off = 0; off + sizeof(SubmitRec) <= cap; off += 24) {
       SubmitRec* r = (SubmitRec*)(base + off);
-      r->len = 24; r->op = SUBMIT_OP_SKIP; r->flags = 0; r->ns = 0;
+      r->len = 24; r->op = SUBMIT_OP_SKIP; r->flags = 0;
       r->keyLen = 0; r->valLen = 0; r->ttlMs = 0; r->reserved = 0;
     }
     s.ring(2)->tail.store(0);
@@ -236,7 +235,7 @@ int main() {
   {
     s.ring(1)->head.store(0); s.ring(1)->tail.store(0);
     const char* v16 = "0123456789abcdef";
-    ok(submitPush(s, 1, SUBMIT_OP_SET, 2, 0, 0, "k", 1, v16, 16), "pushed a record to attack");
+    ok(submitPush(s, 1, SUBMIT_OP_SET, 2, 0, "k", 1, v16, 16), "pushed a record to attack");
     uint8_t* base = s.ringData(1);
     SubmitRec* live = (SubmitRec*)base;
     uint64_t head = s.ring(1)->head.load(std::memory_order_acquire);

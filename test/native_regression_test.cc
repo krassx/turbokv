@@ -88,7 +88,7 @@ int main() {
       if (logGapAt(base % D, D) != r) continue;
       int kl = snprintf(key, sizeof key, "gap%u", r);
       storeSet(s, (const uint8_t*)key, (uint16_t)kl, val.data(), 200, 200,
-               FLAG_STRING, 0, 0, 0);
+               FLAG_STRING, 0, 0);
       ReadResult rr; uint8_t buf[256];
       bool got = storeGet(s, (const uint8_t*)key, (uint16_t)kl, buf, sizeof buf, &rr, 0);
       if (got && s.h->logHead % D != 0 && s.h->logHead > base + r) remaindersCovered++;
@@ -103,7 +103,7 @@ int main() {
       for (int j = kl; j < want; j++) key[j] = 'p';
       if (kl < want) kl = want;
       storeSet(s, (const uint8_t*)key, (uint16_t)kl, val.data(),
-               (uint32_t)(i % 180), (uint32_t)(i % 180), FLAG_STRING, 0, 0, 0);
+               (uint32_t)(i % 180), (uint32_t)(i % 180), FLAG_STRING, 0, 0);
       uint64_t remain = D - (s.h->logHead % D);
       if (remain < minRemain) minRemain = remain;
     }
@@ -112,7 +112,7 @@ int main() {
     ok(minRemain <= D, "the bulk loop wrapped the region");
     ok(dirty == 0, "nothing is written past the data region across 200k wrapping writes");
 
-    storeSet(s, (const uint8_t*)"final", 5, (const uint8_t*)"ok", 2, 2, FLAG_STRING, 0, 0, 0);
+    storeSet(s, (const uint8_t*)"final", 5, (const uint8_t*)"ok", 2, 2, FLAG_STRING, 0, 0);
     ReadResult rr; uint8_t buf[64];
     ok(storeGet(s, (const uint8_t*)"final", 5, buf, sizeof buf, &rr, 0),
        "the arena still serves reads after all those wraps");
@@ -134,7 +134,7 @@ int main() {
     s.h->tailPub.store(base, std::memory_order_release);
 
     std::vector<uint8_t> val(200, 'v');
-    storeSet(s, (const uint8_t*)"edge", 4, val.data(), 200, 200, FLAG_STRING, 0, 0, 0);
+    storeSet(s, (const uint8_t*)"edge", 4, val.data(), 200, 200, FLAG_STRING, 0, 0);
 
     uint8_t buf[8192];
     ReadResult rr;
@@ -236,7 +236,7 @@ int main() {
       std::vector<uint8_t> val(400, 'v');
       char key[32];
       const uint16_t VK = 6;
-      storeSet(t, (const uint8_t*)"victim", VK, val.data(), 400, 400, FLAG_STRING, 0, 0, 0);
+      storeSet(t, (const uint8_t*)"victim", VK, val.data(), 400, 400, FLAG_STRING, 0, 0);
       uint64_t hash = rapidhash_withSeed("victim", VK, 0);
       if (hash <= HASH_TOMB) hash += 2;
       int64_t slot = t.findSlot(hash, (const uint8_t*)"victim", VK);
@@ -245,7 +245,7 @@ int main() {
       for (int i = 0; i < 80000; i++) {            // lap the log well past it
         int kl = snprintf(key, sizeof key, "k%d", i);
         storeSet(t, (const uint8_t*)key, (uint16_t)kl, val.data(), 400, 400,
-                 FLAG_STRING, 0, 0, 0);
+                 FLAG_STRING, 0, 0);
       }
       ok(t.h->logTail > pos, "the victim's position really was lapped");
 

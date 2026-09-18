@@ -144,7 +144,7 @@ c.close();
 // Dead native code is worse than dead JS: it is reachable from anyone who can
 // require the addon, and it is not covered by any test (decision 47).
 {
-    const REMOVED_NATIVE = ['incr', 'cas'];
+    const REMOVED_NATIVE = ['incr', 'cas', 'nsResolve', 'clearNamespace', 'nsStats'];
     const present = REMOVED_NATIVE.filter(n => typeof __native[n] === 'function');
     ok(present.length === 0, `removed native functions are gone (still present: ${present.join(', ')})`);
 }

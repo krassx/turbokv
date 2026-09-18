@@ -1275,7 +1275,7 @@ class TurboKV {
             }
         }
         if (this.#id === 0) {
-            const ok = native.set(key, enc, 0, ttlMs, 0) === true;
+            const ok = native.set(key, enc, 0, ttlMs) === true;
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
             return ok;
         }
@@ -1288,7 +1288,7 @@ class TurboKV {
             return true;
         }
         if (this.#ringIdx >= 0) {
-            if (native.submitSet(key, enc, ttlMs, 0)) { this.stats.sent++; this.#ringDoorbell(); return true; }
+            if (native.submitSet(key, enc, ttlMs)) { this.stats.sent++; this.#ringDoorbell(); return true; }
             // Ring full. Same contract as a shed IPC write: the value is in this
             // worker's L1, it just has not reached L2, so other workers see a
             // miss rather than a wrong value. Counted, never silent.
@@ -1296,7 +1296,7 @@ class TurboKV {
             this.lastError = 'submission ring full; L2 write shed';
             return true;
         }
-        this.#outbox.push('s', key, enc, ttlMs, 0);
+        this.#outbox.push('s', key, enc, ttlMs);
         this.#schedule(encLen + key.length + 48);
         return true;                      // queued; capacity is decided by the primary
     }
@@ -1369,11 +1369,11 @@ class TurboKV {
         this.#pendingDel.add(key);
         this.#pendingDelHash.set(native.hashKey(key), key);
         if (this.#ringIdx >= 0) {
-            if (native.submitDel(key, 0)) this.#ringDoorbell();
+            if (native.submitDel(key)) this.#ringDoorbell();
             else this.stats.writesShed = (this.stats.writesShed || 0) + 1;
             return had;
         }
-        this.#outbox.push('d', key, null, 0, 0);
+        this.#outbox.push('d', key, null, 0);
         this.#schedule(key.length + 48);
         return had;
     }
@@ -1390,7 +1390,7 @@ class TurboKV {
     clearAll() {
         this.clearLocal();
         if (this.#id === 0) { native.clearAll(0); return; }
-        this.#outbox.push('c', '', null, 0, 0);
+        this.#outbox.push('c', '', null, 0);
         this.#schedule(48);
     }
 
@@ -1410,7 +1410,7 @@ class TurboKV {
     *keys({ limit = 1000, batch = 512 } = {}) {
         let cursor = 0, yielded = 0;
         for (;;) {
-            const r = native.scanKeys(0, cursor, batch);
+            const r = native.scanKeys(cursor, batch);
             if (!r) return;
             for (const k of r.keys) {
                 if (yielded++ >= limit) return;
@@ -1517,7 +1517,7 @@ class TurboKV {
             // Window full AND our own buffer is full: shed rather than grow
             // without bound. The value stays in this worker's L1, it just does
             // not reach L2, so other workers see a miss, never a wrong value.
-            this.stats.writesShed = (this.stats.writesShed || 0) + this.#outbox.length / 5;
+            this.stats.writesShed = (this.stats.writesShed || 0) + this.#outbox.length / 4;
             this.#outbox = [];
             this.#outboxBytes = 0;
             this.lastError = 'IPC send window full; L2 writes shed';
@@ -1528,7 +1528,7 @@ class TurboKV {
         this.#outbox = [];
         this.#outboxBytes = 0;
         this.stats.flushes++;
-        this.stats.sent += batch.length / 5;
+        this.stats.sent += batch.length / 4;
         // The channel can already be gone: a scheduled flush firing after the
         // primary exited threw EPIPE and killed the worker with an unhandled
         // 'error' event. Losing a batch during shutdown is acceptable; crashing
@@ -1591,9 +1591,9 @@ class TurboKV {
         // before it.
         if (submitName) { let guard = 0; while (TurboKV.drainSubmissions(8192) > 0 && ++guard < 512); }
         const b = msg.b;
-        for (let i = 0; i < b.length; i += 5) {
+        for (let i = 0; i < b.length; i += 4) {
             const op = b[i], key = b[i + 1];
-            if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboKV.#localDrop(key); }
+            if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3]); TurboKV.#localDrop(key); }
             else if (op === 'd') { native.del(key, msg.id); TurboKV.#localDrop(key); }
             else if (op === 'c') { native.clearAll(msg.id); for (const c of instances) c.clearLocal(); }
         }

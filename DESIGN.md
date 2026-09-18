@@ -57,9 +57,6 @@ Cache.install(cluster);          // the entire primary-side wiring
 // primary has not opened the arena yet: a worker must never create one, or it
 // silently shadows the primary's.
 const cache = Cache.open();
-
-// A second namespace in the same process binds to the arena already open.
-const other = Cache.open({ namespace: { name: 'sessions', quotaBytes: 32 << 20 } });
 ```
 
 ```ts
@@ -71,7 +68,6 @@ class Cache<T> {
     freeze?: boolean;                        // codec modes; also neutralises
                                              //   Date/Map/Set mutators
     isolate?: boolean;                       // decode per set, so L1 never aliases
-    namespace?: string | { name, quotaBytes };
     l1MaxBytes?: number;                     // default heapLimit x 0.5%, 512KB..2MB
     heapFactor?: number;                     // encoded bytes -> retained heap; ~3
     heapGuard?: false | { maxHeapFraction?, shedFraction?, minIntervalMs? };
@@ -88,7 +84,6 @@ class Cache<T> {
   delete(key: string): boolean;              // whether it was present at call time
   clearLocal(): void;                        // this process's L1 only
   clearAll(): void;                          // the shared arena AND every L1
-  clearNamespace(): number;
   flush(): void;                             // push buffered worker writes now
   close(): void;
 
@@ -98,7 +93,7 @@ class Cache<T> {
                                              //   path exists until L3
   cas(key, expected, next, opts?): boolean;  // primary only; throws in a worker
 
-  keys(opts?: { limit?, batch? }): Generator<string>;   // this namespace
+  keys(opts?: { limit?, batch? }): Generator<string>;   // the whole arena
   readonly size: number;                     // counts by enumerating, O(slots)
   readonly transport: 'shm' | 'ipc';         // what this handle negotiated
   readonly stats: CacheStats;                // hits, misses, writesShed,
@@ -113,7 +108,6 @@ class Cache<T> {
   static install(cluster): void;             // idempotent
   static drainSubmissions(budget?): number;  // primary: apply worker records
   static arenaStats(): ArenaStats;
-  static namespaceStats(): NamespaceStat[];
   static submitStats(): SubmitStats | null;
   static heapGuardPace(): { evaluations, debounced, minIntervalMs };
   static primaryAgeMs(): number;             // heartbeat age; -1 if never stamped
@@ -135,7 +129,7 @@ call costs 100–300ns of allocation and a microtask tick on a ~21ns operation.
 ┌─ primary process ─────────────────────────────────────────────────┐
 │  L2 arena   shm, mapped READ/WRITE — the primary is the sole writer│
 │    ├── header      magic (published last), geometry, heartbeat,    │
-│    │               arenaId, namespace table                        │
+│    │               arenaId, log and eviction stats                 │
 │    ├── hash index  open addressing, backward-shift delete, 75% cap │
 │    ├── invalidation ring   primary → workers, carries writerId     │
 │    └── data        circular log, bounded second-chance re-append   │
@@ -222,7 +216,7 @@ Created by the primary before forking. `shm_open` (mode 0600) + `ftruncate` + `m
 ```c
 struct Entry {
   uint32_t seq;         // seqlock: even = stable, odd = write in progress
-  uint64_t hash;        // rapidhash64(namespace + key)
+  uint64_t hash;        // rapidhash64(key)
   uint32_t version;     // bumped per write; matches invalidation ring
   uint32_t expiresAt;   // MILLISECONDS from the arena epoch; 0 = no TTL
   uint32_t rawLen;      // uncompressed length
@@ -230,9 +224,8 @@ struct Entry {
   uint32_t blockSize;   // total bytes of this record, for the tail walk
   uint16_t keyLen;
   uint8_t  flags;       // COMPRESSED | STRING | LATIN1 | NUMBER | BOOL | NULL | BIGINT
-  uint8_t  ns;          // namespace id (CLOCK bits live in the hints segment)
   // ... keyLen bytes of key text, then storedLen bytes of value
-};  // 40-byte header
+};  // 40-byte header (CLOCK bits live in the hints segment)
 ```
 
 **Key text is stored.** It costs bytes, and it buys three things: exact `memcmp` verification (so a 64-bit hash is *exactly* correct, no collision risk, rather than probabilistic); key enumeration remains possible; and the future L3 can use real Redis keys instead of opaque hash hex.
@@ -309,9 +302,9 @@ The primary drains the rings, applies each record as the sole writer, and then i
 
 Staleness is bounded by the drain, not by a tick: a worker's write is visible to another worker once the primary has applied it and the reader has drained the invalidation ring.
 
-> `incr`, `clearAll` and `clearNamespace` still travel over cluster IPC rather
-> than the rings. The primary drains the rings to empty before applying an IPC
-> batch, which is what keeps one worker's operations in order (decision 36).
+> `clearAll` still travels over cluster IPC rather than the rings. The primary
+> drains the rings to empty before applying an IPC batch, which is what keeps
+> one worker's operations in order (decision 36).
 
 ---
 
@@ -1307,10 +1300,11 @@ worker's L1. Capacity is now derived from the arena — 64KB records or 4% of th
 arena, whichever is smaller — giving ~100ms on the default 128MB arena for 0.8%
 of it, and degrading gracefully on small arenas (4MB arena keeps 3.1% and 13ms).
 
-### Namespaces: soft quotas through the eviction path
+### Namespace quotas, and why they are gone (historical)
 
-The problem was concrete: with `namespace` as nothing but a key prefix, a hot
-namespace evicts a cold one entirely.
+Namespaces once carried a soft byte quota enforced through the eviction path,
+because with `namespace` as nothing but a key prefix a hot namespace evicts a
+cold one entirely:
 
 | | cold survivors | cold bytes | hot bytes |
 |---|---|---|---|
@@ -1320,26 +1314,20 @@ namespace evicts a cold one entirely.
 *(8MB arena, ~4MB data region. `cold` writes 1000x500B once; `hot` then writes
 30000x500B — about 20x the arena.)*
 
-The solution needs no new structure, because the zero-copy second chance made
-protection free. Each entry carries a namespace id; the header tracks live bytes
-and a quota per namespace. At the tail:
+The quota needed no new structure, because the zero-copy second chance made
+protection free: at the tail, an entry of an under-quota namespace was given
+another lap and an over-quota one was dropped, with the CLOCK reference bit
+deciding for namespaces without a quota.
 
-- namespace **has a quota and is under it** → protected, given another lap
-- namespace **has a quota and is over it** → dropped
-- namespace **has no quota** → the plain CLOCK reference bit decides, competing freely
-
-Progress is guaranteed whenever the quotas sum to no more than capacity: a full
-arena then necessarily contains at least one over-quota namespace, so something
-is always droppable. The budget cap is the backstop if they are over-committed.
-
-`clearNamespace()` drops one namespace's entries by scanning the index — O(slots),
-and clearing is rare. Quotas are **soft**: a namespace may exceed its quota while
-space is free, and is only pushed back under pressure, which is the behaviour you
-want from a cache.
-
-This also exposed a missing capability: there was no way to bind a *second*
-namespace in one process. `open()` now returns an additional handle onto the
-arena the process already has, rather than trying to create it twice.
+That measurement is why the quota was the one namespace capability a caller
+could not reproduce in one line — and it is also why it could not survive the
+L3 seam, since Valkey evicts across the whole database and the guarantee would
+hold in L2 and break in L3. **Namespaces and their quotas are removed; see
+decision 63.** The eviction path is now plain CLOCK: at the tail, a live entry
+whose reference bit is set is given another lap and the bit cleared, bounded by
+the re-append budget. `TC_LAYOUT` 6 (the header table went with them) and
+`TCS_LAYOUT` 2 (the namespace id left the submission-ring record), so a process
+built before the removal cannot attach to an arena built after it.
 
 ### Three operational bugs found by auditing what was still open
 
@@ -1559,7 +1547,6 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 - `test.js`, `api_test.js` — core behaviour and the public API surface.
 - `codec_test.js`, `prim_test.js`, `v8codec_test.js`, `storage_modes_test.js`, `typeflow_test.js`, `typematrix_test.js` — the three storage modes. `typematrix_test.js` asserts a full input-type × mode matrix, including the cells JSON is *supposed* to degrade.
 - `json_fastpath_test.js` — that no codec falls off Node's JSON fast path.
-- `namespace_test.js` — quotas, including under index pressure rather than only data pressure.
 - `cluster_api_test.js`, `transport_regression_test.js` — cross-process behaviour, the latter over **both** transports, driving the public API in a real worker rather than the internals.
 - `recovery_test.js` — primary death, restart, stall and resume, using `child_process.fork` because under `cluster` a worker dies with its primary and none of those cases arise.
 - `guard_test.js` — that the heap guard actually fires, on the registry path and on the backstop alone.
@@ -1605,7 +1592,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | 60 | **The primary drains its submission rings on the maintenance tick, not only on a doorbell** | rely on the doorbell alone (previous behaviour) | A worker pushes to its submission ring and then rings `RING_MSG`; that doorbell was the ONLY thing that made the primary drain, because the primary's own `get()` returns immediately from `#drain` for id 0 and the maintenance tick only stamped a heartbeat and swept expiries. The doorbell is swallowed in two places -- `if (process.connected)` and a `catch` around `process.send` -- and losing one does not merely delay invalidation: **the record stays in the ring, so the write never reaches L2 at all** while `set()` reported success. Demonstrated by a worker that drops its own doorbells: without the backstop the value is still `undefined` after four maintenance intervals; with it, the write lands. Workers were never exposed to this because they drain on every operation and so self-heal; the primary now has the same property, bounded to one maintenance interval. Measured cost on an idle ring: **29.1ns per call, ~5ms of CPU per day** at the 500ms cadence, which is why the only real cost was not having it. |
 | 61 | **`minLevel` is a per-operation placement preference, never stored with the record** | store the level in a spare `ns` bit so it applies to every future read; a size threshold (`l1MaxValueBytes`) alone | Measured first. One pass over a cold keyspace evicts **93.7%** of a hot working set from L1, costs **1.54x** on the next pass (against 6-7ns of run-to-run spread), and the scan itself is **3.83x** more expensive than the same scan that does not promote -- the batch job pays for its own pollution, so both sides win. A size threshold was the obvious automatic alternative and is **not sufficient**: with cold values the same size as the hot ones it has nothing to discriminate on, and that scan evicted **100%** of the working set. Pollution is a property of the access pattern, and only the caller knows it is scanning. Storing the level with the entry was rejected on the stronger argument that it locks a value to one writer's opinion: another process may legitimately want it resident, and a record is data, not policy. So the option is per-operation, and `Entry` stays 40 bytes with no `TC_LAYOUT` bump. An unavailable level is clamped DOWN to the highest that exists rather than rejected, so `L3` is usable today (behaving as L2) and starts using L3 the day the seam lands, and a degraded worker clamps to L1 -- where its writes already go. A value that is not a level at all still throws (decision 48). **Invariant: `minLevel` changes only where a record lives and how fast it is reached, never which value is observed.** That holds for free on the primary, whose `set` is synchronous, but a worker bypassing L1 must also EVICT the local copy (or it serves the old value) and mark the key pending like a queued delete (or its own next read finds L2's PREVIOUS value -- wrong, not stale). Both guards are fault-injected: removing the eviction fails the stale-copy assertion, removing the pending mark returns `WORKER-OLD` to the process that just wrote `WORKER-NEW`. |
 | 62 | **`incr` and `cas` are removed rather than extended to L3** | keep them local-only; give them async-only variants | Neither can be atomic across L1, L2, L3 and many boxes without a global ordering this design does not have, and a synchronous return value cannot carry a remote atomic result. The codebase already drew this line: `cas` refused in a worker because "a queued CAS whose outcome the caller never learns is not a CAS", and L3 makes that true in every process. A caller who needs an atomic counter already has a Valkey client and `INCR`. Reverses decision 1, whose remaining wart -- `incr`'s return type differing by process role -- disappears with the method. The removal reaches the native layer too: with the JS methods gone, `Incr`/`Cas` in `src/binding.cc` and `storeIncr`/`storeCas` in `src/store_ops.h` were reachable from anyone who could `require` the addon directly and covered by no test -- the same shape of problem decision 47 deleted the compaction machinery for, not merely unused code left in place. Deleted along with their `FN(...)` registration entries; `findSlot`, `storeSet`, `unlinkSlot` and `ringAppend` all keep other callers, so nothing else moved. Pinned by a native-surface check in `api_test.js` alongside the public-surface pin from decision 59. |
-| 63 | **Namespaces are removed** | keep them; keep only the quota as an eviction class | A namespace was a key prefix plus a one-byte tag charging a byte quota. The prefix is something callers do themselves in one line. The quota is the only capability they cannot reproduce -- measured in §9 at 0/1000 cold survivors without it and 942/1000 with it -- but it is L2-only and cannot exist in L3, where Valkey evicts across the whole database, so namespaces would promise in one tier what the next tier breaks. With L3 attached, losing an entry from L2 costs a round trip rather than the data. Removal also deletes a verified aliasing bug (namespace `users` key `42` and default-namespace key `users:42` were one entry, because identity is the full string and names were never checked for `:`), the 15-namespace limit, open item 16, and a namespace clear that wiped every other namespace's L1. If a workload ever needs eviction isolation, it returns as a per-write class without namespaces coming back as key identity. |
+| 63 | **Namespaces are removed** | keep them; keep only the quota as an eviction class | A namespace was a key prefix plus a one-byte tag charging a byte quota. The prefix is something callers do themselves in one line. The quota is the only capability they cannot reproduce -- measured in §9 at 0/1000 cold survivors without it and 942/1000 with it -- but it is L2-only and cannot exist in L3, where Valkey evicts across the whole database, so namespaces would promise in one tier what the next tier breaks. With L3 attached, losing an entry from L2 costs a round trip rather than the data. Removal also deletes a verified aliasing bug (namespace `users` key `42` and default-namespace key `users:42` were one entry, because identity is the full string and names were never checked for `:`), the 15-namespace limit, open item 16, and a namespace clear that wiped every other namespace's L1. If a workload ever needs eviction isolation, it returns as a per-write class without namespaces coming back as key identity. **The removal reaches the arena itself.** The JS layer came out first, passing a literal `0` to native signatures that still took a namespace id; leaving it there would have been the worst of both -- a parameter no caller can vary, a header table nothing reads, and a quota branch in the eviction path that is dead by construction and therefore covered by nothing. So the native half went too: `nsResolve`, `clearNamespace` and `nsStats` are deleted from `binding.cc` along with their `FN(...)` entries (pinned by the native-surface check from decision 62), the `ns` argument is gone from `set`, `del`, `scanKeys`, `submitSet` and `submitDel`, and `Header` loses `nsCount`, `nsName`, `nsBytes`, `nsQuota`, `nsProtected` and `nsDropped` -- 900 bytes and the fixed 16-entry table. `Entry.ns` and `SubmitRec.ns` go with them; both structs stay 40 and 24 bytes, because the byte each field freed is padding either way, so nothing else that indexes by `sizeof` had to move. The eviction quota branch collapses to the plain CLOCK decision it already fell back to (`protect = liveHere && hints[slot]`), which deletes the `byQuota` accounting but leaves the zero-copy second chance and -- critically -- its verify-room-before-writing check untouched: that check is the fix for a real data-corruption bug (writing `bsz` bytes at the head unchecked, in the one branch that only runs when free space is scarce), and it is orthogonal to quotas. Reversing decision 38, whose whole subject was honouring a quota under index pressure; the bounded budget it added to the index-eviction loop stays, because the reference bit it also rescued is still there. Both layout versions move -- `TC_LAYOUT` 5 -> 6 and `TCS_LAYOUT` 1 -> 2 -- which is what makes a pre-removal build refuse a post-removal arena and ring instead of misreading a `Header` that is 900 bytes shorter and a record whose fields shifted. That refusal is exercised by `guard_test.js` against the header check in `attachReadOnly`. |
 | 59b | **`api_test.js` ran only its first half** | n/a -- a defect, not a choice | `process.exit(fail ? 1 : 0)` sat at line 68 of 126, so every block appended after it was dead code. Two were: the public-surface pin, and the create-failure diagnostic test added during the coverage work in decision 55 -- which was reported there as covering `#createError` and never executed once. Made live, it failed immediately, and for a real reason: it asserted Linux's behaviour unconditionally, but whether an oversized arena fails at all is platform-dependent. Linux reserves the space with `posix_fallocate` and fails; macOS allocates shared memory lazily and returns a 1TB arena without complaint. The test now asserts what each platform actually does. Test-that-cannot-fail number twelve, and the second in a row found by fault injection rather than by review. |
 | 59 | **The public surface is exactly what `index.d.ts` declares, and a test pins it** | leave internals reachable but undocumented (previous state) | An audit of the class against the declarations found **15 members reachable but undeclared** -- three statics and twelve instance members. Undeclared-but-reachable is an API you support whether you meant to or not, which is the same problem `TurboCache.native()` had in decision 45. Three were genuinely public and are now declared: `isCacheMessage` and `applyBatch` as a documented PAIR -- `install()` is the easy path, but an application that already routes cluster messages needs the first to identify ours and the second to apply them, and declaring only one would let a caller recognise a message it had no supported way to handle -- plus `l1Size` alongside `size`. Ten moved off the surface: seven `_`-prefixed internals became true `#private`, `useSubmissionRing` with them, and `callArgCounts` left the class entirely for `src/fastpath.js`, which an installed consumer cannot reach because the `exports` map has no deep paths. `__internalOnGc` is the one member that CANNOT be private: `gcNotify()` is a module-scope function declared above the class, so it has no access to a `#private` -- the wrapper is load-bearing, and is now named to say so. Two JS constraints cost time and are worth recording: a class may not have a static and an instance private of the SAME name (`static #staleMsFor` plus an instance `#staleMsFor` is a SyntaxError, which V8 reports against an unrelated line), and privatising a `_name` that already has a `#name` counterpart silently creates infinite recursion. `api_test.js` now pins the surface, verified to fail three ways: an undeclared static appearing, an undeclared instance member appearing, and a declared member vanishing. It must check instance OWN properties as well as the prototype -- `stats`, `lastError`, `storage` and `liveHeapFraction` are assigned in the constructor, so a prototype-only check reported four declared members as missing. |
 | 58 | **`create()` releases the segment it replaces; tests release theirs on exit** | raise the container's `--shm-size` until the suite fits (what the release workflow first did, at 8g) | The musl release job failed with turbokv's own diagnostic -- *"/dev/shm holds 64MB (64MB free) but the arena needs 128MB"* -- and raising `--shm-size` would have hidden a real resource leak behind a bigger bucket. Two distinct causes. **In-process:** `native` is process-global, so a second `create()` REPLACES the first, but it overwrote `base` and `name` without releasing either -- the old mapping and its shm name both survived for the life of the process. `attachReadOnly` and `Submit::open` each already carried exactly this guard, with a comment describing the leak; `create()` was the one that was missed, and the one that also owns a name to unlink. `Submit::create` had the same hole, and the ring's NAME could only be released in the binding because `Submit` tracks none. **Across processes:** a POSIX segment outlives its creator until unlinked -- correct for a live primary, wrong for a test -- so ~24 test processes each stranded their last arena and ring. `test/_cleanup.js` is preloaded through `NODE_OPTIONS` from `run.js`, so a test added later cannot forget and forked workers are covered too; it is a no-op unless the addon was loaded, and on a worker's read-only attach it closes without unlinking a segment it does not own. Measured in the release job's own image: **8g before, 256m after**, with the residue being one deliberate 128MB arena in `perf_regression_test`. Pinned by `shm_leak_test.js`, which scans from OUTSIDE the creating process -- the only place a stranded segment is observable -- and was itself caught being vacuous first: it derived its name prefix from `process.pid` in both parent and child, so the parent scanned names that never existed and could only ever report zero. Verified to fail with 11 leaked once the prefix was shared. |
