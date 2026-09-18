@@ -281,28 +281,19 @@ class TurboKV {
         this.#l3FailTtlMs = opts.l3FailTtlMs ?? 5000;
         this.#l3TtlMs = opts.l3TtlMs ?? 60000;
         if (this.#l3) {
-            // L3Queue#report fires onError TWICE for one abandoned op when a
-            // retry happens first: once early (attempt 0, so a listener learns
-            // fast) and once again at the terminal failure -- see l3_queue_test.js
-            // case 5, which already asserts `seen.length > 0` rather than `=== 1`
-            // for exactly this reason. The stats counters below mean "how many
-            // writes were abandoned", so they must count once per op regardless
-            // of how many times the op gets reported; the listener callback is
-            // NOT deduped -- it is the early-warning channel and is allowed to
-            // fire more than once per op.
-            const countedFailures = new WeakSet();
             this.#queue = new L3Queue(this.#l3, {
                 maxBytes: opts.l3QueueMaxBytes ?? (8 << 20),
                 retryMs: opts.l3RetryMs ?? 2000,
                 // A background failure must never reach `lastError`: the sync
                 // call it belongs to returned long ago, and a caller reading
                 // lastError would take it as the reason for a later operation.
+                // onError now fires exactly once per operation, and only when
+                // the operation is abandoned (see src/l3/queue.js) -- a retry
+                // that goes on to succeed reports nothing, so no dedup is
+                // needed here any more.
                 onError: (e, op) => {
-                    if (!countedFailures.has(op)) {
-                        countedFailures.add(op);
-                        if (op.kind === 'set') this.stats.l3SetFailed = (this.stats.l3SetFailed || 0) + 1;
-                        else if (op.kind === 'delete') this.stats.l3DeleteFailed = (this.stats.l3DeleteFailed || 0) + 1;
-                    }
+                    if (op.kind === 'set') this.stats.l3SetFailed = (this.stats.l3SetFailed || 0) + 1;
+                    else if (op.kind === 'delete') this.stats.l3DeleteFailed = (this.stats.l3DeleteFailed || 0) + 1;
                     if (typeof opts.onL3Error === 'function') { try { opts.onL3Error(e, op); } catch { /* not ours */ } }
                 },
             });

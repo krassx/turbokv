@@ -48,15 +48,20 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         ok(Date.now() - t0 < 60, `different keys run concurrently (${Date.now() - t0}ms for 3x25ms)`);
     }
 
-    // 4. a transient failure is retried inside the budget and settles true
+    // 4. a transient failure is retried inside the budget and settles true --
+    // and reports NOTHING through onError, because nothing was lost. onError
+    // used to fire once here too (on the first failed attempt), which made a
+    // "failed" listener hear about writes that went on to succeed; stats.retried
+    // is what makes a mid-flight retry visible, onError is for abandonment only.
     {
-        const f = makeFake();
+        const f = makeFake(); const seen = [];
         f.fail.set('set', new Error('connection reset'));
-        const q = new L3Queue(f.adapter, { retryMs: 500 });
+        const q = new L3Queue(f.adapter, { retryMs: 500, onError: (e, op) => seen.push([e.message, op.kind]) });
         const p = q.push({ kind: 'set', key: 'r', value: 'v', bytes: 10 });
         setTimeout(() => f.fail.delete('set'), 40);
         ok(await p === true, 'a retry that succeeds inside the budget settles true');
         ok(q.stats.retried > 0, `retries counted (${q.stats.retried})`);
+        ok(seen.length === 0, `a write that later succeeds reports nothing (${seen.length})`);
     }
 
     // 5. a failure that outlasts the budget settles false ONCE, and reports

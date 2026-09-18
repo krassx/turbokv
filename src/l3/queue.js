@@ -121,8 +121,16 @@ class L3Queue {
                         // must serve misses.
                         const mayRetry = op.kind === 'clear' || this.#now() < deadline;
                         if (!mayRetry) { this.stats.failed++; this.#report(e, op); break; }
+                        // No report here: a failure still inside the retry budget
+                        // is not yet an event a caller should act on. Reporting it
+                        // anyway made onError fire twice for one abandoned op (once
+                        // here, once more below) with no way for a listener to tell
+                        // the two apart, AND made it fire once for an op that goes
+                        // on to succeed -- nothing was lost, and stats.retried
+                        // already makes that visible. onError now fires exactly
+                        // once per operation, and only when the operation is
+                        // actually abandoned.
                         this.stats.retried++;
-                        if (attempt === 0) this.#report(e, op);
                         await new Promise(r => setTimeout(r, Math.min(50 * (attempt + 1), 200)));
                     }
                 }
