@@ -37,11 +37,11 @@ const mk = (o) => TurboKV.createPrimary('/tcr2_' + process.pid + '_' + (n++), 16
 }
 
 // The API promises set() never throws and returns a boolean. It threw for a
-// Symbol key (`this.#ns + key`), for an object whose toString throws, and for an
-// options object whose ttlMs getter throws -- all caller-supplied code running
-// inside a method documented not to throw. Non-string keys were also coerced
-// silently, so set(undefined, v) stored under 'undefined' and every plain object
-// aliased to '[object Object]'.
+// Symbol key (string concatenation while building the full key), for an
+// object whose toString throws, and for an options object whose ttlMs getter
+// throws -- all caller-supplied code running inside a method documented not
+// to throw. Non-string keys were also coerced silently, so set(undefined, v)
+// stored under 'undefined' and every plain object aliased to '[object Object]'.
 {
     const c = mk({});
     const noThrow = (fn) => { try { return { v: fn() }; } catch (e) { return { threw: e.constructor.name }; } };

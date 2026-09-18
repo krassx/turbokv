@@ -52,7 +52,14 @@ struct Entry {
 // sizes every block from it -- so a field added here silently moves every
 // offset in the data region AND changes what an existing arena means. Only the
 // tail padding after `flags` keeps this at 40; adding a field is a TC_LAYOUT
-// bump, and this assert is what forces that conversation.
+// bump, and this assert is what forces that conversation. But this assert does
+// NOT force it in every case: there is exactly one byte of tail padding after
+// `flags` (39 bytes of fields rounded up to the 8-byte alignment `hash`
+// imposes), so a single trailing byte-sized field -- another uint8_t, most
+// naturally -- lands in that byte, sizeof(Entry) stays 40, and this assert
+// does not fire. Do not treat "the assert didn't trip" as proof the layout is
+// unchanged; decide about TC_LAYOUT deliberately for any new field, byte-sized
+// or not.
 static_assert(sizeof(Entry) == 40, "Entry is the data region's stride: changing it is a TC_LAYOUT change");
 
 struct IndexSlot {

@@ -27,11 +27,11 @@ If you only read one thing: §3 for the shape, §12 for why it is that shape.
 
 **Non-goals for v1.** Persistence. Distribution. Async APIs.
 
-*Three of the original non-goals were reached anyway and are now supported:*
-arbitrary JS object values (the `direct` and `safe` codec modes, §9), Windows
-(every OS call is behind `src/platform.h`, and `windows-latest` is in CI), and
-atomic read-modify-write (`incr`/`cas`, with the role-dependent return type
-recorded in §13.1). The cache also runs unmodified on **Bun** and **Deno** — the
+*Two of the original non-goals were reached anyway and are now supported:*
+arbitrary JS object values (the `direct` and `safe` codec modes, §9) and Windows
+(every OS call is behind `src/platform.h`, and `windows-latest` is in CI). A
+third, atomic read-modify-write, was reached (`incr`/`cas`) and then reversed —
+see decision 62. The cache also runs unmodified on **Bun** and **Deno** — the
 addon is Node-API, so one binary serves all three — with the caveats in the
 runtime notes of the README.
 
@@ -86,12 +86,6 @@ class Cache<T> {
   clearAll(): void;                          // the shared arena AND every L1
   flush(): void;                             // push buffered worker writes now
   close(): void;
-
-  incr(key, by?, opts?): number | undefined; // primary returns the value; a
-                                             //   worker queues it and returns
-                                             //   undefined — no request/response
-                                             //   path exists until L3
-  cas(key, expected, next, opts?): boolean;  // primary only; throws in a worker
 
   keys(opts?: { limit?, batch? }): Generator<string>;   // the whole arena
   readonly size: number;                     // counts by enumerating, O(slots)
