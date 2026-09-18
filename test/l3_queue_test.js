@@ -8,14 +8,16 @@ const { makeFake, delay } = require('./l3_fake');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
 (async () => {
-    // 1. order per key is preserved even when the adapter is slow
+    // 1. order per key is preserved even when the FIRST write is much slower
     {
-        const f = makeFake(); f.latency.set('set', 20);
+        const f = makeFake(); f.latency.set('set', 40);
         const q = new L3Queue(f.adapter, {});
-        q.push({ kind: 'set', key: 'k', value: 'A', bytes: 10 });
+        q.push({ kind: 'set', key: 'k', value: 'A', bytes: 10 });   // captures 40ms
+        f.latency.set('set', 5);                                     // B is fast
         const last = q.push({ kind: 'set', key: 'k', value: 'B', bytes: 10 });
         await last; await q.drain();
-        ok(f.store.get('k').value === 'B', 'the last write to a key wins in L3');
+        ok(f.store.get('k').value === 'B',
+           `the last write to a key wins even when the first is slower (${f.store.get('k').value})`);
     }
 
     // 2. a superseded write is merged rather than sent, and still settles
