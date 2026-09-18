@@ -10,6 +10,7 @@ const fs = require('fs');
 const v8 = require('v8');
 const v8ser = require('v8');
 const { callArgCounts } = require('./fastpath');
+const { assertAdapter } = require('./l3/adapter');
 
 // An unpaired surrogate encodes to U+FFFD in UTF-8, so '\uD800', '\uDC00' and
 // '\uFFFD' all became ONE key in the arena and returned each other's values --
@@ -237,6 +238,7 @@ class TurboKV {
     #staleMs = 5000;
     #primaryDead = false;
     #keyMax = 1024;
+    #l3 = null;
     // Native expiry is milliseconds from the arena's creation time.
     #id;
     #codec;
@@ -267,6 +269,10 @@ class TurboKV {
         // making a control phase identical to the phase it was controlling.
         this.#maxInFlightBytes = opts.maxInFlightBytes ?? (8 << 20);
         this.#staleMs = opts.primaryStaleMs || 5000;
+        // Validated here rather than on the first cache miss: a malformed
+        // adapter discovered inside a promise chain, in a process that has been
+        // serving for an hour, is the worst place to learn about it.
+        if (opts.l3 !== undefined && opts.l3 !== null) this.#l3 = assertAdapter(opts.l3);
         // `|| 0` also mapped an explicit 0 to the primary role. That is only
         // legitimate in the process that actually created the arena.
         this.#id = opts.workerId ?? 0;
@@ -612,15 +618,34 @@ class TurboKV {
     // Clamping is for a level that is valid but not available. A value that is
     // not a level at all is a mistake, and gets the same treatment as every
     // other bad option (decision 48).
+    //
+    // Levels are NOT contiguous once L3 exists. A worker that has lost its
+    // primary has L1 and L3 but no L2, so the clamp cannot be a single ceiling:
+    //
+    //   state                   L1  L2  L3   minLevel 3 ->   minLevel 2 ->
+    //   normal, adapter          o   o   o        3                2
+    //   normal, no adapter       o   o   -        2                2
+    //   primary dead, adapter    o   -   o        3                1
+    //   primary dead, no adapter o   -   -        1                1
+    //
+    // The rule itself is unchanged: clamp DOWN to the highest level that
+    // exists, so data is always stored somewhere.
     #resolveLevel(minLevel) {
         if (minLevel === undefined) return 1;
         if (!Number.isInteger(minLevel) || minLevel < 1 || minLevel > 3) {
             throw new TypeError(
                 `turbokv: minLevel must be TurboKV.L1, L2 or L3 (1-3); got ${JSON.stringify(minLevel)}`);
         }
-        const highest = (this.#primaryDead || !storeReady) ? 1 : 2;   // L3: not built yet
-        return minLevel > highest ? highest : minLevel;
+        const hasL2 = !(this.#primaryDead || !storeReady);
+        if (minLevel === 3) return this.#l3 ? 3 : (hasL2 ? 2 : 1);
+        if (minLevel === 2) return hasL2 ? 2 : 1;
+        return 1;
     }
+
+    // Whether a value fetched or written at this level will occupy a local
+    // tier. The adapter needs to know: a read that fills nothing should not
+    // make the remote store remember this box for that key.
+    #willCache(level) { return level < 3; }
 
     static #createError(arenaBytes) {
         let hint = '';
@@ -719,6 +744,11 @@ class TurboKV {
     // #private -- this is the bridge. Prefixed to say plainly that it is not
     // API, matching the addon's __unsafe* hooks.
     __internalOnGc(used, limit) { this.#onGc(used, limit); }
+
+    // Test-only. Named to say so: level resolution is a pure function of state
+    // that is otherwise only observable through a cache miss.
+    __unsafeResolveLevel(minLevel) { return this.#resolveLevel(minLevel); }
+    __unsafeForcePrimaryDead() { this.#primaryDead = true; }
 
     #dropByHash(hash) {
         const k = this.#byHash.get(hash);

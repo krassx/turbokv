@@ -112,6 +112,7 @@ c.close();
         'keys', 'flush', 'close', 'stopGuard',
         'stats', 'lastError', 'liveHeapFraction', 'primaryDead', 'storage',
         'transport', 'size', 'l1Size',
+        '__unsafeResolveLevel', '__unsafeForcePrimaryDead',
     ];
 
     const statics = Object.getOwnPropertyNames(TurboKV)
