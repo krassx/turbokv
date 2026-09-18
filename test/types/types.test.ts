@@ -51,3 +51,14 @@ void [bad1, bad2, bad3, bad4, bad5, bad6];
 // @ts-expect-error arenaStats can be undefined
 const bad8: number = TurboKV.arenaStats().live;
 void [bad8];
+
+// --- the async surface, and close() returning a promise --------------------
+const ga: Promise<{ a: number } | undefined> = c.getAsync('k');
+const sa: Promise<boolean> = c.setAsync('k', { a: 1 });
+const da: Promise<boolean> = c.deleteAsync('k');
+const ha: Promise<boolean> = c.hasAsync('k');
+const ca: Promise<boolean> = c.clearAsync();
+const cl: Promise<void> = c.close();
+// @ts-expect-error getAsync returns a promise, not a bare value
+const bad10: { a: number } | undefined = c.getAsync('k');
+void [ga, sa, da, ha, ca, cl, bad10];

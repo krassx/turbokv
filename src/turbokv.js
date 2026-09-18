@@ -254,6 +254,7 @@ class TurboKV {
     #queue = null;
     #l3FailTtlMs = 5000;
     #l3TtlMs = 60000;
+    #l3CloseTimeoutMs = 5000;
     #lastQueued = null;
     #onL3Error = null;
     #inflight = new Map();      // key -> in-flight L3 read, so a herd shares one request
@@ -293,6 +294,11 @@ class TurboKV {
         if (opts.l3 !== undefined && opts.l3 !== null) this.#l3 = assertAdapter(opts.l3);
         this.#l3FailTtlMs = opts.l3FailTtlMs ?? 5000;
         this.#l3TtlMs = opts.l3TtlMs ?? 60000;
+        // See close(): bounds how long shutdown waits for the L3 queue to
+        // drain. `??` not `||` -- 0 is a meaningful value (wait without a
+        // bound, matching l3TtlMs's own 0-disables convention) and must not
+        // silently become the default instead.
+        this.#l3CloseTimeoutMs = opts.l3CloseTimeoutMs ?? 5000;
         // One place holds the listener. It used to be read out of `opts` from
         // inside the queue's callback, which meant a second reporting path grew
         // the moment a second caller needed one -- and a duplicated report is
@@ -1811,7 +1817,31 @@ class TurboKV {
     // has. A worker seeing a large value stops trusting L2.
     static primaryAgeMs() { return native.heartbeatAgeMs(); }
 
-    close() {
+    // Races `promise` against a bound. Never rejects: on expiry it simply
+    // resolves, same as the promise winning on its own. The timer is
+    // unref'd and cleared as soon as one side settles, so a slow drain can
+    // never itself become the reason the process stays alive -- the exact
+    // failure mode this exists to prevent.
+    #withTimeout(promise, ms) {
+        return new Promise((resolve) => {
+            let done = false;
+            const timer = setTimeout(() => { if (!done) { done = true; resolve(); } }, ms);
+            if (timer.unref) timer.unref();
+            promise.then(() => { if (!done) { done = true; clearTimeout(timer); resolve(); } });
+        });
+    }
+
+    async close() {
+        // Everything below is synchronous, exactly as it was before close()
+        // gained an L3 half -- deliberately. It runs to completion before
+        // this function's first `await`, so a caller that calls `close()`
+        // and does not await it (the overwhelmingly common case, and every
+        // caller before this task) still gets the local teardown -- ring
+        // slot released, arena destroyed on the primary -- synchronously,
+        // in the same tick, exactly as before. L3 shutdown never touches
+        // any of this state (queued writes go straight to the adapter, not
+        // through the arena), so nothing here depends on it and it does not
+        // need to wait for it.
         this.stopGuard();
         if (this.#timer) { clearInterval(this.#timer); this.#timer = null; }
         instances.delete(this);
@@ -1837,6 +1867,56 @@ class TurboKV {
             submitName = null; isPrimaryProcess = false;
             native.destroy(); storeReady = false;
         }
+
+        // An open L3 connection keeps the event loop alive, so shutdown also
+        // has to wait for the queue and then hand the adapter its own
+        // close. This is the only reason close() returns a promise at all;
+        // a caller that ignores it is unaffected.
+        //
+        // The wait on the queue is BOUNDED. A `clear` is never shed and
+        // retries indefinitely by design (see L3Queue): until it lands, this
+        // process must serve misses rather than the values the clear was
+        // meant to remove. So if L3 is unreachable, the queue's pending
+        // count never returns to zero and drain() never resolves --
+        // awaiting it unconditionally would hang close() forever during
+        // exactly the outage where an operator most wants the process to
+        // exit. `l3CloseTimeoutMs` (default 5000ms; 0 waits without a
+        // bound, for a caller that would rather hang than risk dropping
+        // work) caps the wait, and on expiry close() proceeds anyway -- a
+        // caller that asked to close gets to close. The honest cost: any
+        // work still queued at that point keeps retrying in the background,
+        // against an adapter this process is about to hand its own close()
+        // to, and gets no second chance to be waited on -- it either lands
+        // silently, is abandoned and reported through the usual
+        // `onL3Error`/stats path once it exceeds `l3RetryMs` (irrelevant for
+        // a `clear`, which never gives up on its own), or is still retrying
+        // when the process itself exits.
+        if (this.#queue) {
+            const drained = this.#queue.drain();
+            await (this.#l3CloseTimeoutMs > 0 ? this.#withTimeout(drained, this.#l3CloseTimeoutMs) : drained);
+        }
+        // The adapter's own close() is bounded too, separately from the
+        // drain above and by the same l3CloseTimeoutMs ceiling. Its
+        // duration is entirely up to the adapter -- a real client's close()
+        // can itself wait on a graceful-shutdown handshake -- and nothing
+        // about draining the queue first guarantees it returns promptly.
+        // Worst case this method now takes up to roughly 2x
+        // l3CloseTimeoutMs (once for the drain, once for the adapter's own
+        // close), which is the honest price of never hanging outright.
+        if (this.#l3 && typeof this.#l3.close === 'function') {
+            const closed = (async () => {
+                try { await this.#l3.close(); } catch (e) { this.#reportL3(e, { kind: 'close' }); }
+            })();
+            await (this.#l3CloseTimeoutMs > 0 ? this.#withTimeout(closed, this.#l3CloseTimeoutMs) : closed);
+        }
+        // In-flight L3 reads (getAsync's herd-sharing map) may still be
+        // pending against the adapter just closed above -- possibly
+        // forever, if the hang is the adapter's own connection. Nothing
+        // here can reach into the adapter and cancel them; clearing the map
+        // only drops THIS instance's reference to them, so a stalled read
+        // cannot keep a cache close() has already torn down reachable for
+        // the life of that hang.
+        this.#inflight.clear();
     }
 
     get l1Size() { return this.#l1.size; }

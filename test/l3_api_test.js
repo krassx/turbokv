@@ -236,6 +236,70 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         B.close(); A.close();
     }
 
+    // 17. close() drains the queue and closes the adapter, and the process
+    //     can exit
+    {
+        const f = makeFake(); f.latency.set('set', 20);
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        c.set('s1', 'v');                      // queued, not yet sent
+        await c.close();
+        ok(f.store.get('s1').value === 'v', 'close() waits for queued L3 work');
+        ok(f.calls.some(x => x[0] === 'close'), 'close() closes the adapter');
+    }
+
+    // 18. close() is safe without an adapter and still returns a promise
+    {
+        const c = TurboKV.open({ storage: 'bytes' });
+        const r = c.close();
+        ok(typeof r.then === 'function', 'close() returns a promise with no adapter too');
+        await r;
+    }
+
+    // 19. close() cannot hang forever waiting out an L3 outage: a `clear` is
+    //     never shed and retries without limit by design (see L3Queue), so
+    //     if L3 stays unreachable the queue's pending count never returns to
+    //     zero and drain() never resolves. close() bounds the wait
+    //     (l3CloseTimeoutMs) and proceeds anyway on expiry. Without that
+    //     bound this test would hang instead of failing -- the race against
+    //     `guard` below turns that hang into a failed assertion, so a
+    //     regression fails the suite rather than wedging CI.
+    {
+        const f = makeFake();
+        f.fail.set('clear', new Error('L3 permanently down'));   // never removed: never succeeds
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3CloseTimeoutMs: 20 });
+        c.clearAll();                                             // queues a clear that never lands
+        const guard = delay(2000).then(() => 'TIMED_OUT');
+        const winner = await Promise.race([c.close().then(() => 'CLOSED'), guard]);
+        ok(winner === 'CLOSED', `close() honours its bound instead of hanging forever (${winner})`);
+    }
+
+    // 20. a failing adapter.close() is reported through onL3Error, not
+    //     thrown, and close() still resolves -- shutdown must not get stuck
+    //     on the one call it cannot retry.
+    {
+        const f = makeFake();
+        f.adapter.close = async () => { throw new Error('close failed'); };
+        const reports = [];
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, onL3Error: (e, op) => reports.push(op.kind) });
+        await c.close();
+        ok(reports.includes('close'), `a failing adapter.close() is reported, not thrown (${reports})`);
+    }
+
+    // 21. an adapter.close() that never settles cannot hang close() either --
+    //     it is bounded by l3CloseTimeoutMs same as the queue drain, just
+    //     separately, since nothing about draining the queue first
+    //     guarantees the adapter's own close() returns promptly. Same guard
+    //     technique as test 19: a hang becomes a failed assertion instead
+    //     of wedging CI.
+    {
+        const f = makeFake();
+        f.adapter.close = () => new Promise(() => {});   // never resolves
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3CloseTimeoutMs: 20 });
+        const guard = delay(2000).then(() => 'TIMED_OUT');
+        const winner = await Promise.race([c.close().then(() => 'CLOSED'), guard]);
+        ok(winner === 'CLOSED', `a hung adapter.close() does not hang close() (${winner})`);
+    }
+
     console.log(fail ? `  ${fail} failed` : '  [l3-api] all passed');
     process.exit(fail ? 1 : 0);
 })();

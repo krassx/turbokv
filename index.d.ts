@@ -178,6 +178,11 @@ export interface CacheOptions<T = unknown> {
      *  value or promise, and `lastError` is never touched by a background
      *  failure, which is why this listener exists. */
     onL3Error?: (error: unknown, op: { kind: 'get' | 'set' | 'delete' | 'clear' | 'has'; key?: string }) => void;
+    /** How long `close()` waits for the L3 queue to drain before closing the
+     *  adapter anyway. A `clear` retries indefinitely and ignores
+     *  `l3RetryMs`, so an unreachable L3 would otherwise hang `close()`
+     *  forever. Default 5000ms; 0 waits without a bound. */
+    l3CloseTimeoutMs?: number;
 }
 
 export interface PrimaryOptions<T = unknown> extends CacheOptions<T> {
@@ -398,9 +403,12 @@ export declare class TurboKV<T = unknown> {
 
     /** Push any buffered worker writes now. */
     flush(): void;
-    /** Release the ring slot, stop the heap guard, deregister, and on the
-     *  primary destroy the arena. */
-    close(): void;
+    /** Drains the L3 queue (bounded by `l3CloseTimeoutMs`), closes the L3
+     *  adapter if one is attached, then releases the ring slot, stops the
+     *  heap guard, deregisters, and on the primary destroys the arena. An
+     *  open L3 connection keeps the event loop alive, which is why this
+     *  returns a promise; a caller that ignores it is unaffected. */
+    close(): Promise<void>;
 
     /** Entries currently held in this process's L1. `size` counts what the
      *  cache can serve; this counts only what is resident locally. */
