@@ -90,6 +90,12 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
                 withL3.__unsafeForcePrimaryDead();
                 ok(withL3.__unsafeResolveLevel(3) === 3, 'a degraded worker keeps L3');
                 ok(withL3.__unsafeResolveLevel(2) === 1, 'a degraded worker clamps L2 to L1');
+
+                const deadNoL3 = new TurboKV({ storage: 'bytes' });
+                deadNoL3.__unsafeForcePrimaryDead();
+                ok(deadNoL3.__unsafeResolveLevel(3) === 1, 'no adapter and no primary clamps L3 to L1');
+                ok(deadNoL3.__unsafeResolveLevel(2) === 1, 'no adapter and no primary clamps L2 to L1');
+
                 withL3.close(); noL3.close();
             }
             native.destroy();

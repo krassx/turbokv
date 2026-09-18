@@ -1,0 +1,81 @@
+'use strict';
+// The async API against a fake L3. The rule under test throughout: a sync
+// method and its async twin have IDENTICAL effects; the async one only lets
+// the caller wait for the L3 half.
+const { TurboKV } = require('../src/turbokv');
+const { makeFake, delay } = require('./l3_fake');
+let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
+
+(async () => {
+    // 1. setAsync writes locally AND to L3, and resolves on the L3 outcome
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(await c.setAsync('k', 'v') === true, 'setAsync resolves true');
+        ok(c.get('k') === 'v', 'the value is in the local tiers immediately');
+        ok(f.store.get('k').value === 'v', 'the value reached L3');
+        c.close();
+    }
+
+    // 2. sync set reaches L3 too, just without waiting
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(c.set('k2', 'v2') === true, 'sync set still returns a boolean');
+        ok(f.store.get('k2') === undefined, 'the L3 write has not happened yet');
+        await c.drainL3();
+        ok(f.store.get('k2').value === 'v2', 'the L3 write happens in the background');
+        c.close();
+    }
+
+    // 3. a failed L3 write keeps the local value, resolves false, and is counted
+    {
+        const f = makeFake();
+        f.fail.set('set', new Error('L3 down'));
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 30, l3FailTtlMs: 5000 });
+        ok(await c.setAsync('k3', 'v3') === false, 'a failed L3 write resolves false');
+        ok(c.get('k3') === 'v3', 'the local cache keeps working during an L3 outage');
+        ok(c.stats.l3SetFailed === 1, `the failure is counted (${c.stats.l3SetFailed})`);
+        c.close();
+    }
+
+    // 4. background failures do NOT write lastError
+    {
+        const f = makeFake();
+        f.fail.set('set', new Error('L3 down'));
+        const errs = [];
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 20,
+                                onL3Error: (e) => errs.push(e.message) });
+        c.set('k4', 'v4');                       // sync: returns before the failure
+        c.set('this key is way too long'.repeat(200), 'x');   // a real, synchronous rejection
+        const afterSync = c.lastError;
+        await delay(120);
+        ok(c.lastError === afterSync,
+           `a background L3 failure does not overwrite lastError (${c.lastError})`);
+        ok(errs.length > 0, 'the error listener hears about it instead');
+        c.close();
+    }
+
+    // 5. minLevel L3 does not store locally, and a failed L3 write stores nothing
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(await c.setAsync('k5', 'v5', { minLevel: TurboKV.L3 }) === true, 'minLevel L3 write succeeds');
+        ok(c.l1Size === 0, 'nothing was put in L1');
+        ok(f.store.get('k5').value === 'v5', 'the value is in L3');
+        ok(f.calls.some(x => x[0] === 'set' && x[1] === 'k5' && x[2] === false),
+           'the adapter is told willCache:false');
+        c.close();
+    }
+
+    // 6. without an adapter the async API still works, stopping at L2
+    {
+        const c = TurboKV.open({ storage: 'bytes' });
+        ok(await c.setAsync('k6', 'v6') === true, 'setAsync works with no adapter');
+        ok(c.get('k6') === 'v6', 'and stores locally');
+        c.close();
+    }
+
+    console.log(fail ? `  ${fail} failed` : '  [l3-api] all passed');
+    process.exit(fail ? 1 : 0);
+})();

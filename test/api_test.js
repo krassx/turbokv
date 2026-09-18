@@ -108,8 +108,8 @@ c.close();
         'JSON_CODEC', 'V8_CODEC', 'drainSubmissions', 'heapGuardPace', 'L1', 'L2', 'L3',
     ];
     const DECLARED_INSTANCE = [
-        'get', 'set', 'has', 'delete', 'clearLocal', 'clearAll',
-        'keys', 'flush', 'close', 'stopGuard',
+        'get', 'set', 'setAsync', 'has', 'delete', 'clearLocal', 'clearAll',
+        'keys', 'flush', 'close', 'stopGuard', 'drainL3',
         'stats', 'lastError', 'liveHeapFraction', 'primaryDead', 'storage',
         'transport', 'size', 'l1Size',
         '__unsafeResolveLevel', '__unsafeForcePrimaryDead',

@@ -11,6 +11,7 @@ const v8 = require('v8');
 const v8ser = require('v8');
 const { callArgCounts } = require('./fastpath');
 const { assertAdapter } = require('./l3/adapter');
+const { L3Queue } = require('./l3/queue');
 
 // An unpaired surrogate encodes to U+FFFD in UTF-8, so '\uD800', '\uDC00' and
 // '\uFFFD' all became ONE key in the arena and returned each other's values --
@@ -239,6 +240,10 @@ class TurboKV {
     #primaryDead = false;
     #keyMax = 1024;
     #l3 = null;
+    #queue = null;
+    #l3FailTtlMs = 5000;
+    #l3TtlMs = 60000;
+    #lastQueued = null;
     // Native expiry is milliseconds from the arena's creation time.
     #id;
     #codec;
@@ -273,6 +278,35 @@ class TurboKV {
         // adapter discovered inside a promise chain, in a process that has been
         // serving for an hour, is the worst place to learn about it.
         if (opts.l3 !== undefined && opts.l3 !== null) this.#l3 = assertAdapter(opts.l3);
+        this.#l3FailTtlMs = opts.l3FailTtlMs ?? 5000;
+        this.#l3TtlMs = opts.l3TtlMs ?? 60000;
+        if (this.#l3) {
+            // L3Queue#report fires onError TWICE for one abandoned op when a
+            // retry happens first: once early (attempt 0, so a listener learns
+            // fast) and once again at the terminal failure -- see l3_queue_test.js
+            // case 5, which already asserts `seen.length > 0` rather than `=== 1`
+            // for exactly this reason. The stats counters below mean "how many
+            // writes were abandoned", so they must count once per op regardless
+            // of how many times the op gets reported; the listener callback is
+            // NOT deduped -- it is the early-warning channel and is allowed to
+            // fire more than once per op.
+            const countedFailures = new WeakSet();
+            this.#queue = new L3Queue(this.#l3, {
+                maxBytes: opts.l3QueueMaxBytes ?? (8 << 20),
+                retryMs: opts.l3RetryMs ?? 2000,
+                // A background failure must never reach `lastError`: the sync
+                // call it belongs to returned long ago, and a caller reading
+                // lastError would take it as the reason for a later operation.
+                onError: (e, op) => {
+                    if (!countedFailures.has(op)) {
+                        countedFailures.add(op);
+                        if (op.kind === 'set') this.stats.l3SetFailed = (this.stats.l3SetFailed || 0) + 1;
+                        else if (op.kind === 'delete') this.stats.l3DeleteFailed = (this.stats.l3DeleteFailed || 0) + 1;
+                    }
+                    if (typeof opts.onL3Error === 'function') { try { opts.onL3Error(e, op); } catch { /* not ours */ } }
+                },
+            });
+        }
         // `|| 0` also mapped an explicit 0 to the primary role. That is only
         // legitimate in the process that actually created the arena.
         this.#id = opts.workerId ?? 0;
@@ -750,6 +784,9 @@ class TurboKV {
     __unsafeResolveLevel(minLevel) { return this.#resolveLevel(minLevel); }
     __unsafeForcePrimaryDead() { this.#primaryDead = true; }
 
+    // Test and shutdown helper: resolves when this process has no L3 work left.
+    drainL3() { return this.#queue ? this.#queue.drain() : Promise.resolve(); }
+
     #dropByHash(hash) {
         const k = this.#byHash.get(hash);
         if (k !== undefined) { this.#l1Drop(k); this.#byHash.delete(hash); this.stats.invalidated++; }
@@ -1167,6 +1204,29 @@ class TurboKV {
         return Buffer.isBuffer(v) ? Buffer.from(v) : v;
     }
 
+    // The L3 half of a write, shared by `set` and `setAsync`. The sync caller
+    // ignores the promise; the async caller awaits it. Identical effects.
+    #queueSet(key, enc, ttlMs, level) {
+        if (!this.#queue) return Promise.resolve(true);
+        this.stats.l3Sets = (this.stats.l3Sets || 0) + 1;
+        return this.#queue.push({
+            kind: 'set', key, value: enc, ttlMs,
+            willCache: this.#willCache(level),
+            bytes: (typeof enc === 'string' ? enc.length : enc.length) + key.length + 48,
+        });
+    }
+
+    // Local first, then L3. L3-first was rejected: when the remote is
+    // unreachable it writes NOTHING, not even locally, turning a remote outage
+    // into a local write outage. The promise still carries the guarantee.
+    async setAsync(key, value, opts) {
+        const ok = this.set(key, value, opts);
+        if (!ok) return false;
+        const p = this.#lastQueued;
+        this.#lastQueued = null;
+        return p ? p : true;
+    }
+
     // Always returns a boolean and never throws, so a caller may ignore the
     // result. Because that makes failure quiet, every rejection also bumps a
     // stats counter and records lastError.
@@ -1310,6 +1370,7 @@ class TurboKV {
             // Our own ring record is skipped on the primary, so nothing else
             // invalidates the copies other instances in THIS process hold.
             else TurboKV.#dropOthers(key, this);
+            if (ok) this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return ok;
         }
         // Shared-memory submission: a memcpy into this worker's own ring, which
@@ -1318,19 +1379,26 @@ class TurboKV {
         if (this.#primaryDead) {
             this.stats.writesShed = (this.stats.writesShed || 0) + 1;
             this.lastError = 'primary is not available; the write is in L1 only';
+            this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return true;
         }
         if (this.#ringIdx >= 0) {
-            if (native.submitSet(key, enc, ttlMs)) { this.stats.sent++; this.#ringDoorbell(); return true; }
+            if (native.submitSet(key, enc, ttlMs)) {
+                this.stats.sent++; this.#ringDoorbell();
+                this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
+                return true;
+            }
             // Ring full. Same contract as a shed IPC write: the value is in this
             // worker's L1, it just has not reached L2, so other workers see a
             // miss rather than a wrong value. Counted, never silent.
             this.stats.writesShed = (this.stats.writesShed || 0) + 1;
             this.lastError = 'submission ring full; L2 write shed';
+            this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return true;
         }
         this.#outbox.push('s', key, enc, ttlMs);
         this.#schedule(encLen + key.length + 48);
+        this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
         return true;                      // queued; capacity is decided by the primary
     }
 
