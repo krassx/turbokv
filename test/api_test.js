@@ -144,6 +144,16 @@ c.close();
     ok(missingInst.length === 0, `every declared instance member exists (missing: ${missingInst.join(', ')})`);
 }
 
+// --- the native surface carries nothing the JS layer no longer calls --------
+//
+// Dead native code is worse than dead JS: it is reachable from anyone who can
+// require the addon, and it is not covered by any test (decision 47).
+{
+    const REMOVED_NATIVE = ['incr', 'cas'];
+    const present = REMOVED_NATIVE.filter(n => typeof __native[n] === 'function');
+    ok(present.length === 0, `removed native functions are gone (still present: ${present.join(', ')})`);
+}
+
 // The summary and exit MUST be last. They were at line 68 of 126, so every
 // block appended after them -- the create-failure diagnostic and the public
 // surface pin -- was dead code that never ran and could never fail.

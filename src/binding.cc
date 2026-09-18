@@ -677,40 +677,6 @@ static napi_value ClearNamespace(napi_env env, napi_callback_info info) {
 // Expiry was lazy only, so an expired entry held its index slot and arena bytes
 // until the tail happened to reach it, and `live` drifted high. The primary is
 // the sole writer, so it can reclaim them directly.
-static napi_value Incr(napi_env env, napi_callback_info info) {
-  ARG(5)
-  NEED_STORE(nullptr)
-  NEED_WRITABLE(nullptr)
-  char key[KEY_MAX + 1]; size_t klen = 0;
-  if (!readKey(env, argv[0], key, &klen)) return nullptr;
-  double by = 1; napi_get_value_double(env, argv[1], &by);
-  int32_t writerId = 0, ttlMs = 0, ns = 0;
-  napi_get_value_int32(env, argv[2], &writerId);
-  napi_get_value_int32(env, argv[3], &ttlMs);
-  napi_get_value_int32(env, argv[4], &ns);
-  uint32_t expiresAt = ttlMs ? nowRelMs(g) + ttlMs : 0;
-  double out = 0;
-  if (!storeIncr(g, (const uint8_t *)key, (uint16_t)klen, by, expiresAt,
-                 (uint16_t)writerId, (uint8_t)ns, &out)) return nullptr;
-  napi_value r; napi_create_double(env, out, &r); return r;
-}
-
-static napi_value Cas(napi_env env, napi_callback_info info) {
-  ARG(4)
-  NEED_STORE(nullptr)
-  NEED_WRITABLE(nullptr)
-  char key[KEY_MAX + 1]; size_t klen = 0;
-  if (!readKey(env, argv[0], key, &klen)) return nullptr;
-  double expected = 0, next = 0; int32_t writerId = 0;
-  napi_get_value_double(env, argv[1], &expected);
-  napi_get_value_double(env, argv[2], &next);
-  napi_get_value_int32(env, argv[3], &writerId);
-  napi_value r;
-  napi_get_boolean(env, storeCas(g, (const uint8_t *)key, (uint16_t)klen,
-                                 expected, next, (uint16_t)writerId), &r);
-  return r;
-}
-
 static napi_value SweepExpired(napi_env env, napi_callback_info info) {
   ARG(2)
   NEED_STORE(nullptr)
@@ -1153,7 +1119,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("submitPending", SubmitPending) FN("submitStats", SubmitStats)
   FN("submitDestroy", SubmitDestroy) FN("submitRelease", SubmitRelease)
   FN("submitMaxValue", SubmitMaxValue)
-  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
+  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
   FN("arenaId", ArenaId) FN("detach", Detach) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("__unsafePokeArena", Poke)
   FN("__unsafeSuppressRefBit", SetSuppressRefBit) FN("__unsafeSecondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("__unsafeBackwardShift", SetBackwardShift) FN("__unsafeClearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)
