@@ -20,7 +20,6 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
     const c = TurboKV.createPrimary(ARENA, 32 << 20, 1 << 16,
         { storage: 'bytes', transport: T, submitRingBytes: 1 << 16 });
     TurboKV.install(cluster);
-    TurboKV.install(cluster);          // idempotent: a second install must not double-apply
 
     c.set('coh', 'PRIMARY');
     c.get('coh');                          // resident in the primary's own L1
@@ -50,13 +49,17 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
             ok(m.delThenGet === undefined, 'worker read-your-writes: delete then get is a miss');
             ok(m.delThenHas === false, 'worker read-your-writes: delete then has is false');
             ok(m.transport === T, `worker negotiated the ${T} transport`);
-            // install() was called twice above (line 22-23). A healthy worker carries
-            // three 'message' listeners: cluster's own internal control-message
-            // listener (attached by fork() itself), install()'s cache-message
-            // listener, and this test's own 'phase' handler below. If the second
-            // install() call re-attached its listener, the count would be four.
-            ok(w.listenerCount('message') === 3,
-               `a second install() does not double-attach the cache-message listener (got ${w.listenerCount('message')})`);
+            // A second install() must not attach another cache-message listener to
+            // an already-wired worker. Measured as a DELTA rather than an absolute
+            // count: the baseline includes listeners Node's own cluster internals
+            // attach on fork(), and that number is not ours to depend on -- an
+            // absolute count would couple this test to cluster-internals wiring
+            // that can differ across Node versions (this repo's CI matrix runs
+            // 18, 20, 22 and 24).
+            const before = w.listenerCount('message');
+            TurboKV.install(cluster);          // idempotent: a second install must not double-attach
+            ok(w.listenerCount('message') === before,
+               `a second install() does not add a listener (before=${before}, after=${w.listenerCount('message')})`);
 
             console.log(fails ? `\n[${T}] ${fails} FAILED` : `\n[${T}] all passed`);
             for (const id in cluster.workers) cluster.workers[id].kill();
