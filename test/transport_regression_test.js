@@ -50,6 +50,13 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
             ok(m.delThenGet === undefined, 'worker read-your-writes: delete then get is a miss');
             ok(m.delThenHas === false, 'worker read-your-writes: delete then has is false');
             ok(m.transport === T, `worker negotiated the ${T} transport`);
+            // install() was called twice above (line 22-23). A healthy worker carries
+            // three 'message' listeners: cluster's own internal control-message
+            // listener (attached by fork() itself), install()'s cache-message
+            // listener, and this test's own 'phase' handler below. If the second
+            // install() call re-attached its listener, the count would be four.
+            ok(w.listenerCount('message') === 3,
+               `a second install() does not double-attach the cache-message listener (got ${w.listenerCount('message')})`);
 
             console.log(fails ? `\n[${T}] ${fails} FAILED` : `\n[${T}] all passed`);
             for (const id in cluster.workers) cluster.workers[id].kill();
