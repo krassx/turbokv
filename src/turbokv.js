@@ -1424,67 +1424,6 @@ class TurboKV {
         this.#schedule(48);
     }
 
-    // Atomic increment. The primary is the sole writer, so on the primary this
-    // is genuinely atomic and returns the NEW value. In a worker the write is
-    // applied a tick later, so the result cannot be known synchronously without
-    // a round trip that does not exist yet: the delta is queued and undefined
-    // is returned. Read it back with get() once applied.
-    //
-    // A missing key counts as zero. Returns false if the key holds a non-numeric
-    // value, matching set()'s "accepted" contract.
-    incr(key, by = 1, opts) {
-        // incr and cas write a NATIVELY typed number straight into the arena,
-        // bypassing the codec. In a codec mode `get` then hands that number to
-        // codec.decode, which expects the encoded string it wrote -- so the key
-        // becomes permanently unreadable: `direct` threw a TypeError on every
-        // read, and `safe` threw SyntaxError once the value was NaN or Infinity.
-        // Refuse the operation rather than produce a key that throws.
-        if (this.#codec) {
-            this.stats.rejectedType = (this.stats.rejectedType || 0) + 1;
-            this.lastError = 'incr requires storage:"bytes"; a codec mode cannot ' +
-                             'represent a natively-typed counter';
-            return false;
-        }
-        this.#checkPrimary();
-        if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
-        let ttlIn = 0;
-        try { ttlIn = (opts && opts.ttlMs) || 0; } catch { return false; }
-        const full = this.#ns + key;
-        const ttlMs = Math.max(0, Math.min(ttlIn, 0x7fffffff));
-        if (Buffer.byteLength(full) > this.#keyMax) {
-            this.stats.rejectedKey = (this.stats.rejectedKey || 0) + 1;
-            this.lastError = 'key too long';
-            return false;
-        }
-        this.#l1Drop(full);                     // the arena becomes authoritative
-        if (this.#id === 0) {
-            const v = native.incr(full, by, 0, ttlMs, this.#nsId);
-            if (v === undefined) { this.lastError = 'incr on a non-numeric value'; return false; }
-            return v;
-        }
-        this.#outbox.push('i', full, by, ttlMs, this.#nsId);
-        this.#schedule(full.length + 48);
-        this.stats.incrQueued = (this.stats.incrQueued || 0) + 1;
-        return undefined;                       // queued; read it back with get()
-    }
-
-    // Compare-and-set on a numeric value. Primary-only: a queued CAS whose
-    // outcome the caller never learns is not a CAS, so a worker gets an error
-    // rather than a misleading `true`.
-    cas(key, expected, next) {
-        if (this.#codec) {
-            this.stats.rejectedType = (this.stats.rejectedType || 0) + 1;
-            this.lastError = 'cas requires storage:"bytes"; see incr';
-            return false;
-        }
-        if (this.#id !== 0)
-            throw new Error('cas() is primary-only: a worker cannot learn the outcome ' +
-                            'of a write applied a tick later');
-        const full = this.#ns + key;
-        this.#l1Drop(full);
-        return native.cas(full, expected, next, 0) === true;
-    }
-
     // Drops every entry of THIS cache's namespace, leaving other namespaces
     // untouched. The blunt clearAll() wipes the whole arena.
     clearNamespace() {
@@ -1692,7 +1631,7 @@ class TurboKV {
     // invalidate the primary's L1 - it kept serving its own stale value even
     // after a worker overwrote or deleted the key.
     static applyBatch(msg) {
-        // set/delete travel through the shared-memory ring while incr/clearAll/
+        // set/delete travel through the shared-memory ring while clearAll/
         // clearNamespace still travel over IPC. A worker pushes to its ring
         // synchronously and sends the IPC message afterwards, so draining the
         // rings to empty here is what keeps one worker's operations in order --
@@ -1706,7 +1645,6 @@ class TurboKV {
             else if (op === 'd') { native.del(key, msg.id); TurboKV.#localDrop(key); }
             else if (op === 'c') { native.clearAll(msg.id); for (const c of instances) c.clearLocal(); }
             else if (op === 'n') { native.clearNamespace(b[i + 4], msg.id); for (const c of instances) c.clearLocal(); }
-            else if (op === 'i') { native.incr(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboKV.#localDrop(key); }
         }
     }
 

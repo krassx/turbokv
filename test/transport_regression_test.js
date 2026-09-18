@@ -26,7 +26,6 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
     c.get('coh');                          // resident in the primary's own L1
     c.set('own', 'PRIMARY-OWN');
     c.get('own');
-    c.set('cnt', 5);
     for (let i = 0; i < 40; i++) c.set('bulk' + i, 'x');
 
     const w = cluster.fork({ TC_CHILD: '1', TC_T: T, TC_ARENA: ARENA });
@@ -50,7 +49,6 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
                            : 'without a ring, a large value that fits the arena is accepted');
             ok(m.delThenGet === undefined, 'worker read-your-writes: delete then get is a miss');
             ok(m.delThenHas === false, 'worker read-your-writes: delete then has is false');
-            ok(native.get('cnt') === 6, 'a single install() applies each batch exactly once');
             ok(m.transport === T, `worker negotiated the ${T} transport`);
 
             console.log(fails ? `\n[${T}] ${fails} FAILED` : `\n[${T}] all passed`);
@@ -71,7 +69,6 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
     c.set('rd', 'v'); c.delete('rd');
     const delThenGet = c.get('rd');
     const delThenHas = c.has('rd');
-    c.incr('cnt', 1);
     c.flush();
     setTimeout(() => process.send({
         t: 'phase', transport: c.transport, emptySet, bigSet, delThenGet, delThenHas,

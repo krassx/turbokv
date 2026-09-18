@@ -12,27 +12,6 @@ const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fa
 const mk = (o) => TurboKV.createPrimary('/tcr2_' + process.pid + '_' + (n++), 16 << 20, 1 << 14,
     { storage: 'bytes', l1MaxBytes: 1 << 18, ...o });
 
-// incr/cas write a natively-typed number, bypassing the codec. get() then fed
-// that number to codec.decode and the key became permanently unreadable:
-// `direct` threw TypeError on every read, `safe` threw SyntaxError once the
-// value was NaN. Refused now, rather than producing a key that throws.
-for (const mode of ['direct', 'safe']) {
-    const c = mk({ storage: mode });
-    ok(c.incr('fresh', 5) === false, `${mode}: incr is refused rather than writing an unreadable entry`);
-    ok(/storage/.test(c.lastError || ''), `${mode}: incr says why`);
-    ok(c.cas('fresh', 1, 2) === false, `${mode}: cas is refused too`);
-    let threw = false;
-    try { c.clearLocal(); c.get('fresh'); } catch { threw = true; }
-    ok(!threw, `${mode}: the key stays readable after a refused incr`);
-    c.close();
-}
-{
-    const c = mk({});
-    ok(c.incr('n', 2) === 2, 'bytes: incr still works');
-    ok(c.cas('n', 2, 7) === true, 'bytes: cas still works');
-    c.close();
-}
-
 // A degraded handle must be observable. `lastError` was the only signal and the
 // next write overwrote it with "submission ring full", blaming backpressure for
 // a dead primary.

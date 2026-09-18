@@ -174,7 +174,7 @@ export interface CacheStats {
     writesShed?: number;
     sent?: number; flushes?: number; flushDropped?: number; congested?: number;
     rejectedKey?: number; rejectedType?: number; rejectedSize?: number;
-    heapShed?: number; incrQueued?: number;
+    heapShed?: number;
     /** Times this worker re-attached after losing its primary. */
     recoveries?: number;
     lastRecovery?: { sameArena: boolean; at: number } | null;
@@ -287,17 +287,6 @@ export declare class TurboKV<T = unknown> {
     has(key: string): boolean;
     /** Returns whether the key was present at call time. */
     delete(key: string): boolean;
-    /** Numeric counter. On the primary returns the new value; from a worker the
-     *  update is applied a tick later and this returns `undefined`. */
-    /** Numeric counter. Requires `storage: 'bytes'` — a codec mode cannot
-     *  represent a natively-typed counter, and returns `false` there. On the
-     *  primary returns the new value; from a worker the update is applied a tick
-     *  later and this returns `undefined`. `false` also means a rejected key. */
-    incr(key: string, by?: number, options?: SetOptions): number | undefined | false;
-    /** Compare and swap on a NUMERIC value. Primary only (throws in a worker),
-     *  and requires `storage: 'bytes'` for the same reason as `incr`. */
-    cas(key: string, expected: number, next: number): boolean;
-
     /** Drop this process's L1. The arena is untouched. */
     clearLocal(): void;
     /** Clear the whole arena and every process's L1. */
