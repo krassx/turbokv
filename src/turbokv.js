@@ -1277,6 +1277,9 @@ class TurboKV {
         if (this.#id === 0) {
             const ok = native.set(key, enc, 0, ttlMs) === true;
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
+            // Our own ring record is skipped on the primary, so nothing else
+            // invalidates the copies other instances in THIS process hold.
+            else TurboKV.#dropOthers(key, this);
             return ok;
         }
         // Shared-memory submission: a memcpy into this worker's own ring, which
@@ -1353,7 +1356,12 @@ class TurboKV {
         this.#checkPrimary();
         if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
         this.stats.deletes++;
-        if (this.#id === 0) { const had = native.del(key, 0); this.#l1Drop(key); return had; }
+        if (this.#id === 0) {
+            const had = native.del(key, 0);
+            this.#l1Drop(key);
+            TurboKV.#dropOthers(key, this);
+            return had;
+        }
         // A worker's delete is applied a tick later, so report whether the key
         // was present at call time. Returning an unconditional true meant a
         // worker and the primary disagreed about the same absent key.
@@ -1601,6 +1609,15 @@ class TurboKV {
 
     static #localDrop(fullKey) { for (const c of instances) c.#dropExact(fullKey); }
     #dropExact(fullKey) { this.#l1Drop(fullKey); }
+
+    // Every instance keeps its own L1, and the primary skips the ring records it
+    // wrote itself, so a write through one instance leaves the others holding
+    // the old value. `instances` is normally a set of one, so this costs a
+    // branch per write in the common case.
+    static #dropOthers(fullKey, self) {
+        if (instances.size < 2) return;
+        for (const c of instances) if (c !== self) c.#l1Drop(fullKey);
+    }
     static isCacheMessage(m) { return m && m.t === MSG; }
     // `native()` used to hand the raw addon to any caller of the public class,
     // which put poke(), suppressRefBit(), backwardShift(), clearHints() and
