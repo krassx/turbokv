@@ -208,6 +208,17 @@ let isPrimaryProcess = false;   // set by createPrimary; guards the id-0 write p
 const installedWorkers = new WeakSet();   // workers already wired by install()      // the native store is a per-process singleton
 const instances = new Set();  // live caches in THIS process, for local invalidation
 
+// PROCESS-WIDE count of L3 clears currently in flight, not per-instance.
+// clearAll() wipes the shared arena (decision 64: several instances in one
+// process share one L2), so while ANY instance's clear is on its way to L3,
+// an L3 fill from ANY instance -- including one that never issued the clear
+// itself -- would promote a value the clear is erasing straight back into
+// the arena every instance reads from. A count rather than a boolean so two
+// overlapping clears cannot have the first one's completion unblock reads
+// while the second is still pending. Read on every L3 fetch, so kept to one
+// integer comparison.
+let l3ClearsInFlight = 0;
+
 class TurboKV {
     #l1 = new Map();          // key -> { v, bytes, hits }
     #byHash = new Map();      // hash hex -> key   (ring records carry hashes)
@@ -245,11 +256,6 @@ class TurboKV {
     #l3TtlMs = 60000;
     #lastQueued = null;
     #onL3Error = null;
-    // Set while a clearAll's L3 op is outstanding. Until it lands, L3 reads in
-    // this process must serve misses rather than the values the clear was
-    // meant to remove -- otherwise the read path resurrects exactly what
-    // clear() was supposed to erase.
-    #clearPending = false;
     #inflight = new Map();      // key -> in-flight L3 read, so a herd shares one request
     // Native expiry is milliseconds from the arena's creation time.
     #id;
@@ -1234,11 +1240,15 @@ class TurboKV {
     }
 
     async #fetchFromL3(key, level) {
-        // A clear is on its way to L3 but has not landed yet. Reading through
-        // here would hand back -- and promote into L2 -- exactly the value the
-        // clear was meant to remove. Miss instead; that is the failure mode
-        // this system is built around, a resurrected value is not.
-        if (this.#clearPending) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
+        // A clear -- from THIS instance or a sibling sharing the same arena
+        // (decision 64) -- is on its way to L3 but has not landed yet.
+        // Reading through here would hand back -- and promote into the
+        // SHARED L2 -- exactly the value the clear was meant to remove, and
+        // every instance in the process would see the resurrection, not
+        // only the one that happened to read it. Miss instead; that is the
+        // failure mode this system is built around, a resurrected value is
+        // not. Process-wide, not per-instance: see l3ClearsInFlight.
+        if (l3ClearsInFlight > 0) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
         // Marked BEFORE the await: everything appended to the invalidation ring
         // from here on happened while this read was in flight.
         const mark = storeReady && !this.#primaryDead ? native.ringHead() : -1;
@@ -1589,7 +1599,10 @@ class TurboKV {
     // has(); the only difference is that this one can wait for L3.
     async hasAsync(key) {
         if (this.has(key)) return true;
-        if (!this.#l3 || this.#clearPending) return false;
+        // Process-wide, same as #fetchFromL3's guard: a sibling instance's
+        // clear in flight must block this instance's L3 reads too, since
+        // they share the arena the clear is emptying.
+        if (!this.#l3 || l3ClearsInFlight > 0) return false;
         // `has` already rejected a non-string key by returning false; going on
         // to L3 with it would hand the adapter something the contract does
         // not accept.
@@ -1688,14 +1701,20 @@ class TurboKV {
         // With an adapter attached the tiers are ONE cache: a clear that only
         // emptied the local tiers would silently undo itself, because the
         // very next read refills everything straight back out of L3. Until
-        // this lands, L3 reads in this process must miss rather than serve
-        // the values the clear was meant to remove -- see #fetchFromL3. The
-        // queue never sheds a clear (src/l3/queue.js): flushing twice is
+        // this lands, L3 reads must miss rather than serve the values the
+        // clear was meant to remove -- see #fetchFromL3. That has to hold
+        // for every instance sharing this process's arena (decision 64), not
+        // only this one, so the flag l3ClearsInFlight counts against is
+        // module-scope. A count, not a boolean: two overlapping clears
+        // (this instance calling clearAll() twice before the first lands, or
+        // two sibling instances each clearing) must not have the first one's
+        // completion unblock reads while the second is still outstanding.
+        // The queue never sheds a clear (src/l3/queue.js): flushing twice is
         // harmless, never flushing is not.
         if (this.#queue) {
-            this.#clearPending = true;
+            l3ClearsInFlight++;
             this.#lastQueued = this.#queue.push({ kind: 'clear', bytes: 0 })
-                .then((r) => { this.#clearPending = false; return r; });
+                .then((r) => { l3ClearsInFlight--; return r; });
         }
         if (this.#id === 0) {
             native.clearAll(0);

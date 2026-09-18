@@ -172,6 +172,12 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         f.store.set('h2', { value: 'v', expiresAt: 0 });
         const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
         ok(await c.hasAsync('h2') === true, 'the get fallback answers correctly');
+        // The fallback calls the adapter directly and never goes through the
+        // fill path -- so it must not leave the value resident anywhere
+        // local. "Correct by inspection" is how an untested property quietly
+        // stops being true.
+        ok(c.l1Size === 0 && c.get('h2') === undefined,
+           'the get-fallback probe does not cache the value it discarded');
         c.close();
     }
 
@@ -199,6 +205,35 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         f.fail.delete('clear');
         await c.drainL3();
         c.close();
+    }
+
+    // 16. the pending-clear guard is PROCESS-WIDE, not per-instance: decision
+    //     64 established that several TurboKV instances in one process share
+    //     one arena, and clearAll() already reaches siblings (#clearOthers)
+    //     for exactly that reason. A clear issued by ONE instance must block
+    //     an L3 read on ANY instance sharing that arena -- otherwise a
+    //     sibling's own (unset) flag lets it read L3's not-yet-cleared value
+    //     straight back into the SHARED arena every instance then sees.
+    {
+        const f = makeFake();
+        const A = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 30 });
+        const B = new TurboKV({ storage: 'bytes', l3: f.adapter, l3RetryMs: 30 });
+        await A.setAsync('shared', 'v');
+        ok(B.get('shared') === 'v', "sanity: B reads A's write through the shared arena");
+        f.fail.set('clear', new Error('L3 down'));   // keep A's L3 clear outstanding
+        A.clearAll();                                 // wipes the SHARED arena; queues A's L3 clear
+        const got = await B.getAsync('shared');
+        ok(got === undefined,
+           `a sibling's clear blocks THIS instance's L3 read too (${got})`);
+        ok(f.calls.filter(x => x[0] === 'get' && x[1] === 'shared').length === 0,
+           "B's read never even asked L3 -- the guard short-circuited before the call");
+        // Checked from both sides, since the shared arena is what is being
+        // protected, not either instance individually.
+        ok(A.get('shared') === undefined, 'and the clearing instance still sees it gone');
+        ok(B.get('shared') === undefined, 'nothing was resurrected into the shared arena');
+        f.fail.delete('clear');
+        await A.drainL3();
+        B.close(); A.close();
     }
 
     console.log(fail ? `  ${fail} failed` : '  [l3-api] all passed');
