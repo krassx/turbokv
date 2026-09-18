@@ -255,6 +255,7 @@ class TurboKV {
     #l3FailTtlMs = 5000;
     #l3TtlMs = 60000;
     #l3CloseTimeoutMs = 5000;
+    #closePromise = null;       // memoized: makes close() idempotent, see close()
     #lastQueued = null;
     #onL3Error = null;
     #inflight = new Map();      // key -> in-flight L3 read, so a herd shares one request
@@ -1817,21 +1818,42 @@ class TurboKV {
     // has. A worker seeing a large value stops trusting L2.
     static primaryAgeMs() { return native.heartbeatAgeMs(); }
 
-    // Races `promise` against a bound. Never rejects: on expiry it simply
-    // resolves, same as the promise winning on its own. The timer is
-    // unref'd and cleared as soon as one side settles, so a slow drain can
-    // never itself become the reason the process stays alive -- the exact
-    // failure mode this exists to prevent.
+    // Races `promise` against a bound. Never rejects -- not even if `promise`
+    // does: both call sites today pre-swallow their own rejections (drain()
+    // never rejects at all; the adapter-close IIFE catches internally), but
+    // this is a general helper and the next caller to reuse it with a
+    // promise that CAN reject must not get an unhandled-rejection warning
+    // for free. A rejection settles the race exactly like a resolution
+    // does: this helper's whole contract is "did it finish or did the bound
+    // expire", not what it finished with. On expiry it simply resolves,
+    // same as the promise winning on its own. The timer is unref'd and
+    // cleared as soon as one side settles, so a slow drain can never itself
+    // become the reason the process stays alive -- the exact failure mode
+    // this exists to prevent.
     #withTimeout(promise, ms) {
         return new Promise((resolve) => {
             let done = false;
             const timer = setTimeout(() => { if (!done) { done = true; resolve(); } }, ms);
             if (timer.unref) timer.unref();
-            promise.then(() => { if (!done) { done = true; clearTimeout(timer); resolve(); } });
+            const settle = () => { if (!done) { done = true; clearTimeout(timer); resolve(); } };
+            promise.then(settle, settle);
         });
     }
 
-    async close() {
+    // close() is idempotent, via #closePromise below: a second call must not
+    // re-invoke adapter.close() or re-run the drain. close() is exactly the
+    // method that gets called from more than one place -- a shutdown hook, a
+    // signal handler, a test's own teardown -- and two of those firing is
+    // ordinary, not exotic. Returning the SAME promise from every call
+    // (rather than a fresh already-resolved one after the first) means a
+    // caller awaiting any of them observes the real outcome at the same
+    // time as every other caller, not a synthetic "done" ahead of it.
+    close() {
+        if (this.#closePromise === null) this.#closePromise = this.#doClose();
+        return this.#closePromise;
+    }
+
+    async #doClose() {
         // Everything below is synchronous, exactly as it was before close()
         // gained an L3 half -- deliberately. It runs to completion before
         // this function's first `await`, so a caller that calls `close()`

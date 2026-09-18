@@ -62,3 +62,31 @@ const cl: Promise<void> = c.close();
 // @ts-expect-error getAsync returns a promise, not a bare value
 const bad10: { a: number } | undefined = c.getAsync('k');
 void [ga, sa, da, ha, ca, cl, bad10];
+
+// --- onL3Error's op.kind is a closed set that must match every kind the
+//     runtime actually reports: 'get' (a failed read), 'set'/'delete'/
+//     'clear' (abandoned queued writes), 'has' (fallback-read failure), and
+//     'close' (a failing adapter.close()). 'close' used to be missing from
+//     the declared union while close() already emitted it at runtime -- a
+//     TypeScript consumer narrowing on op.kind would hit a value the type
+//     ruled out.
+//
+// Pinned by assignability, not by a runtime-style `===` chain: a chain of
+// `op.kind === '...' || ...` narrows op.kind via control flow as each arm is
+// excluded, so by the LAST comparison in the chain TS has already narrowed
+// it to `never` and silently accepts a comparison against a kind that was
+// never declared -- an equality check against a value already narrowed to
+// `never` raises no error. Extracting the declared kind type and assigning
+// each literal to it individually has no such narrowing and fails to
+// compile the moment a real kind (in either direction) is missing from it.
+type L3ErrorKind = NonNullable<Parameters<NonNullable<CacheOptions['onL3Error']>>[1]>['kind'];
+const kGet: L3ErrorKind = 'get';
+const kSet: L3ErrorKind = 'set';
+const kDelete: L3ErrorKind = 'delete';
+const kClear: L3ErrorKind = 'clear';
+const kHas: L3ErrorKind = 'has';
+const kClose: L3ErrorKind = 'close';
+void [kGet, kSet, kDelete, kClear, kHas, kClose];
+// @ts-expect-error op.kind is closed -- 'subscribe' is never a queued or reported L3 op
+const kSubscribe: L3ErrorKind = 'subscribe';
+void kSubscribe;

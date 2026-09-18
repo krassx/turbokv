@@ -300,6 +300,28 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         ok(winner === 'CLOSED', `a hung adapter.close() does not hang close() (${winner})`);
     }
 
+    // 22. close() is idempotent: a second call must not re-invoke
+    //     adapter.close() or re-run the drain, and it returns the SAME
+    //     promise every time so every caller observes the real outcome
+    //     together. close() is exactly the method a shutdown hook, a
+    //     signal handler and a test's own teardown all reach for -- two of
+    //     those firing is ordinary, not exotic.
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        const p1 = c.close();
+        const p2 = c.close();
+        ok(p1 === p2, 'both calls return the same promise');
+        await Promise.all([p1, p2]);
+        const closes = f.calls.filter(x => x[0] === 'close').length;
+        ok(closes === 1, `adapter.close() is invoked exactly once across two close() calls (${closes})`);
+        const p3 = c.close();
+        ok(p3 === p1, 'a close() after the first has already resolved still returns the same promise');
+        await p3;
+        ok(f.calls.filter(x => x[0] === 'close').length === 1,
+           'a third call, after resolution, still does not re-invoke the adapter');
+    }
+
     console.log(fail ? `  ${fail} failed` : '  [l3-api] all passed');
     process.exit(fail ? 1 : 0);
 })();

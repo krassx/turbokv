@@ -177,7 +177,7 @@ export interface CacheOptions<T = unknown> {
      *  `set`/`get`/etc. — those report failure through their own return
      *  value or promise, and `lastError` is never touched by a background
      *  failure, which is why this listener exists. */
-    onL3Error?: (error: unknown, op: { kind: 'get' | 'set' | 'delete' | 'clear' | 'has'; key?: string }) => void;
+    onL3Error?: (error: unknown, op: { kind: 'get' | 'set' | 'delete' | 'clear' | 'has' | 'close'; key?: string }) => void;
     /** How long `close()` waits for the L3 queue to drain before closing the
      *  adapter anyway. A `clear` retries indefinitely and ignores
      *  `l3RetryMs`, so an unreachable L3 would otherwise hang `close()`
