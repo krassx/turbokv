@@ -1213,6 +1213,12 @@ class TurboKV {
         // on to L3 with it would hand the adapter -- and hashKey -- something
         // neither of them accepts.
         if (!isStringKey(key)) return undefined;
+        // A key THIS process deleted, whose removal the arena has not applied
+        // yet. `get` answers undefined for it deliberately; L3 has not seen the
+        // delete either, so going there would both resurrect the key locally
+        // and make the two forms disagree about a delete this caller was
+        // already told had succeeded.
+        if (this.#pendingDel.size && this.#pendingDel.has(key)) return undefined;
         const level = opts === undefined ? 1 : this.#resolveLevel(opts.minLevel);
         const shared = this.#inflight.get(key);
         if (shared !== undefined) return shared;
@@ -1235,10 +1241,21 @@ class TurboKV {
         }
         if (rec === undefined || rec === null) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
         this.stats.l3Hits = (this.stats.l3Hits || 0) + 1;
+        // The delete landed WHILE this read was in flight. Two separate reasons
+        // this cannot be treated like any other blocked promotion: the arena may
+        // not have applied it yet, so there is no ring record for the guard
+        // below to find; and `get` now answers undefined for this key, so
+        // handing back L3's value would make the two forms disagree about a
+        // delete this process issued itself. Not a stale read -- a resurrection.
+        if (this.#pendingDel.size && this.#pendingDel.has(key)) {
+            this.stats.l3DeletedWhileReading = (this.stats.l3DeletedWhileReading || 0) + 1;
+            return undefined;
+        }
         // The caller gets what L3 returned either way. Blocking changes only
         // what is stored locally, never what this caller observes.
-        if (this.#promotionBlocked(key, mark)) {
-            this.stats.l3PromotionsBlocked = (this.stats.l3PromotionsBlocked || 0) + 1;
+        const why = this.#promotionBlock(key, mark);
+        if (why) {
+            this.stats[why] = (this.stats[why] || 0) + 1;
             return this.#decodeFromL3(rec.value);
         }
         this.#fillFromL3(key, rec, level);
@@ -1249,17 +1266,23 @@ class TurboKV {
     // for the key's own hash rather than "did the head move at all" matters:
     // under load the head always moves, so the conservative version would never
     // promote and L3 hits would never reach L2.
-    #promotionBlocked(key, mark) {
+    //
+    // Returns '' to promote, or the name of the counter to bump. The two reasons
+    // are unrelated events and an operator watching one is misled by the other:
+    // `l3PromotionsBlocked` is ordinary contention -- this key changed, or the
+    // ring cannot rule out that it did -- while `l3UnhashableKeys` is a key that
+    // can never live in L1 or L2 at all, whatever the ring says.
+    #promotionBlock(key, mark) {
         // A degraded worker has no arena to read the ring from, so it cannot
         // know what happened and must refuse. Refusing costs a promotion, not
         // correctness.
-        if (mark < 0 || !storeReady || this.#primaryDead) return true;
+        if (mark < 0 || !storeReady || this.#primaryDead) return 'l3PromotionsBlocked';
         const h = native.hashKey(key);
         // A key the arena cannot even hash -- a lone surrogate -- has no ring
         // record to compare against, and `get` already treats it as never
         // stored. Promoting it would file an unreachable L1 entry under the
         // hash `undefined`, which every such key would then share.
-        if (h === undefined) return true;
+        if (h === undefined) return 'l3UnhashableKeys';
         let cursor = mark;
         // Batched, not truncated. ringRead returns at most `max` records, so a
         // single call covering only the first 1024 of the 8192 a ring holds
@@ -1267,15 +1290,15 @@ class TurboKV {
         // very defect the guard exists to prevent, just harder to hit.
         for (;;) {
             let r;
-            try { r = native.ringRead(cursor, 1024); } catch { return true; }
-            if (!r || r.wrapped) return true;          // fell too far behind to know
+            try { r = native.ringRead(cursor, 1024); } catch { return 'l3PromotionsBlocked'; }
+            if (!r || r.wrapped) return 'l3PromotionsBlocked';   // fell too far behind to know
             for (let i = 0; i < r.hashes.length; i++) {
                 // The flush marker is not a key hash -- it means EVERYTHING changed,
                 // so it matches every key. A guard that only compared hashes would
                 // let a value the clear removed straight back in.
-                if (r.hashes[i] === 'ffffffffffffffff' || r.hashes[i] === h) return true;
+                if (r.hashes[i] === 'ffffffffffffffff' || r.hashes[i] === h) return 'l3PromotionsBlocked';
             }
-            if (r.head <= cursor || r.head >= r.ringHead) return false;
+            if (r.head <= cursor || r.head >= r.ringHead) return '';
             cursor = r.head;
         }
     }
