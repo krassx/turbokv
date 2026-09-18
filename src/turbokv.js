@@ -182,11 +182,12 @@ const { performance } = require('perf_hooks');
 const monoMs = () => performance.now();
 
 // Keys are strings. Anything else is a caller error, and the API promises to
-// report those rather than throw -- but `this.#ns + key` throws outright for a
-// Symbol, and runs arbitrary caller code for an object with a toString. It also
-// silently coerced: set(undefined, v) stored under 'undefined', and every plain
-// object aliased to '[object Object]', so two different objects were one key.
-// Reject anything that is not already a string.
+// report those rather than throw -- but handing a non-string straight to the
+// native layer throws outright for a Symbol, and runs arbitrary caller code
+// for an object with a toString. It also silently coerced: set(undefined, v)
+// stored under 'undefined', and every plain object aliased to
+// '[object Object]', so two different objects were one key. Reject anything
+// that is not already a string.
 function isStringKey(k) { return typeof k === 'string'; }
 
 // The storage presets. Anything else is a misconfiguration, not a mode.
@@ -227,8 +228,6 @@ class TurboKV {
     #maxInFlightBytes = 8 << 20;
     #flushScheduled = false;
     #cursor = 0;
-    #ns = '';
-    #nsId = 0;
     #maxValue = 0;
     #timer = null;
     #sweepCursor = 0;
@@ -258,27 +257,6 @@ class TurboKV {
     // entirely - which is what decision 5 was actually for. Without a codec the
     // value is already opaque bytes and L1 is optimal as-is.
     constructor(opts = {}) {
-        // A namespace is a key prefix AND an arena-level identity, so it can
-        // carry a byte quota that eviction respects.
-        const nsOpt = typeof opts.namespace === 'string' ? { name: opts.namespace } : opts.namespace;
-        if (nsOpt && nsOpt.name) {
-            this.#ns = nsOpt.name + ':';
-            // #id is assigned further down, so read the option directly: only the
-            // primary may register a namespace; a worker must find it already there.
-            // Only a process that actually created the arena may register a
-            // namespace. `(opts.workerId||0) === 0` is not that test: a worker
-            // constructing a cache directly passes it and then asks the native
-            // layer to write the header through a read-only mapping, which is a
-            // SIGBUS rather than an error.
-            const mayCreate = (opts.workerId || 0) === 0 && isPrimaryProcess;
-            this.#nsId = native.nsResolve(nsOpt.name, nsOpt.quotaBytes || 0, mayCreate);
-            if (this.#nsId === -2)
-                throw new Error(`namespace name must be under 24 bytes, got ${Buffer.byteLength(nsOpt.name)}`);
-            if (this.#nsId < 0)
-                throw new Error(this.#id === 0
-                    ? 'namespace table full (15 named namespaces max)'
-                    : `namespace '${nsOpt.name}' was not registered by the primary`);
-        }
         this.#maxValue = native.maxValueBytes();
         this.#keyMax = native.keyMaxBytes();
         instances.add(this);
@@ -503,10 +481,6 @@ class TurboKV {
     // the primary (create the arena) or a worker (attach to it), and sizes
     // everything from the machine. createPrimary/attachWorker remain for tests
     // and for callers that want to pin the numbers.
-    // Second and later calls in the same process bind another namespace to the
-    // arena this process already created or attached, rather than trying to
-    // create it again. Several namespaces in one process is a normal thing to
-    // want and there was previously no way to express it.
     static open(opts = {}) {
         TurboKV.#assertStorageOptions(opts);   // see createPrimary
         const cluster = require('cluster');
@@ -1120,7 +1094,6 @@ class TurboKV {
         // the key happens to be resident.
         const minLevel = opts === undefined ? 1 : this.#resolveLevel(opts.minLevel);
         this.#drain();
-        key = this.#ns + key;
         // Our own delete has not reached the arena yet; serving L2 here would
         // hand back the value this process just deleted.
         if (hasLoneSurrogate(key)) return undefined;   // cannot have been stored
@@ -1180,7 +1153,6 @@ class TurboKV {
         let ttlOpt = 0;
         try { ttlOpt = (opts && opts.ttlMs) || 0; }
         catch (e) { this.lastError = `reading options failed: ${e.message}`; return false; }
-        key = this.#ns + key;
         // uint32 milliseconds from the arena epoch is ~49 days of range; clamp
         // rather than overflow (ttlMs near INT32_MAX used to overflow the
         // seconds conversion and expire immediately).
@@ -1303,8 +1275,11 @@ class TurboKV {
             }
         }
         if (this.#id === 0) {
-            const ok = native.set(key, enc, 0, ttlMs, this.#nsId) === true;
+            const ok = native.set(key, enc, 0, ttlMs) === true;
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
+            // Our own ring record is skipped on the primary, so nothing else
+            // invalidates the copies other instances in THIS process hold.
+            else TurboKV.#dropOthers(key, this);
             return ok;
         }
         // Shared-memory submission: a memcpy into this worker's own ring, which
@@ -1316,7 +1291,7 @@ class TurboKV {
             return true;
         }
         if (this.#ringIdx >= 0) {
-            if (native.submitSet(key, enc, ttlMs, this.#nsId)) { this.stats.sent++; this.#ringDoorbell(); return true; }
+            if (native.submitSet(key, enc, ttlMs)) { this.stats.sent++; this.#ringDoorbell(); return true; }
             // Ring full. Same contract as a shed IPC write: the value is in this
             // worker's L1, it just has not reached L2, so other workers see a
             // miss rather than a wrong value. Counted, never silent.
@@ -1324,7 +1299,7 @@ class TurboKV {
             this.lastError = 'submission ring full; L2 write shed';
             return true;
         }
-        this.#outbox.push('s', key, enc, ttlMs, this.#nsId);
+        this.#outbox.push('s', key, enc, ttlMs);
         this.#schedule(encLen + key.length + 48);
         return true;                      // queued; capacity is decided by the primary
     }
@@ -1364,7 +1339,6 @@ class TurboKV {
     has(key) {
         if (!isStringKey(key)) return false;
         this.#drain();
-        key = this.#ns + key;
         // Degraded means the arena is unmapped, so native.has returns undefined.
         // The declared return type is boolean; L1 is all we can answer from.
         if (this.#primaryDead) return this.#l1.has(key);
@@ -1381,9 +1355,13 @@ class TurboKV {
     delete(key) {
         this.#checkPrimary();
         if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
-        key = this.#ns + key;
         this.stats.deletes++;
-        if (this.#id === 0) { const had = native.del(key, 0); this.#l1Drop(key); return had; }
+        if (this.#id === 0) {
+            const had = native.del(key, 0);
+            this.#l1Drop(key);
+            TurboKV.#dropOthers(key, this);
+            return had;
+        }
         // A worker's delete is applied a tick later, so report whether the key
         // was present at call time. Returning an unconditional true meant a
         // worker and the primary disagreed about the same absent key.
@@ -1399,11 +1377,11 @@ class TurboKV {
         this.#pendingDel.add(key);
         this.#pendingDelHash.set(native.hashKey(key), key);
         if (this.#ringIdx >= 0) {
-            if (native.submitDel(key, this.#nsId)) this.#ringDoorbell();
+            if (native.submitDel(key)) this.#ringDoorbell();
             else this.stats.writesShed = (this.stats.writesShed || 0) + 1;
             return had;
         }
-        this.#outbox.push('d', key, null, 0, this.#nsId);
+        this.#outbox.push('d', key, null, 0);
         this.#schedule(key.length + 48);
         return had;
     }
@@ -1419,111 +1397,41 @@ class TurboKV {
     // cluster-wide side effect and the name should say so.
     clearAll() {
         this.clearLocal();
-        if (this.#id === 0) { native.clearAll(0); return; }
-        this.#outbox.push('c', '', null, 0, this.#nsId);
-        this.#schedule(48);
-    }
-
-    // Atomic increment. The primary is the sole writer, so on the primary this
-    // is genuinely atomic and returns the NEW value. In a worker the write is
-    // applied a tick later, so the result cannot be known synchronously without
-    // a round trip that does not exist yet: the delta is queued and undefined
-    // is returned. Read it back with get() once applied.
-    //
-    // A missing key counts as zero. Returns false if the key holds a non-numeric
-    // value, matching set()'s "accepted" contract.
-    incr(key, by = 1, opts) {
-        // incr and cas write a NATIVELY typed number straight into the arena,
-        // bypassing the codec. In a codec mode `get` then hands that number to
-        // codec.decode, which expects the encoded string it wrote -- so the key
-        // becomes permanently unreadable: `direct` threw a TypeError on every
-        // read, and `safe` threw SyntaxError once the value was NaN or Infinity.
-        // Refuse the operation rather than produce a key that throws.
-        if (this.#codec) {
-            this.stats.rejectedType = (this.stats.rejectedType || 0) + 1;
-            this.lastError = 'incr requires storage:"bytes"; a codec mode cannot ' +
-                             'represent a natively-typed counter';
-            return false;
-        }
-        this.#checkPrimary();
-        if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
-        let ttlIn = 0;
-        try { ttlIn = (opts && opts.ttlMs) || 0; } catch { return false; }
-        const full = this.#ns + key;
-        const ttlMs = Math.max(0, Math.min(ttlIn, 0x7fffffff));
-        if (Buffer.byteLength(full) > this.#keyMax) {
-            this.stats.rejectedKey = (this.stats.rejectedKey || 0) + 1;
-            this.lastError = 'key too long';
-            return false;
-        }
-        this.#l1Drop(full);                     // the arena becomes authoritative
         if (this.#id === 0) {
-            const v = native.incr(full, by, 0, ttlMs, this.#nsId);
-            if (v === undefined) { this.lastError = 'incr on a non-numeric value'; return false; }
-            return v;
+            native.clearAll(0);
+            // The flush marker on the invalidation ring reaches other in-process
+            // instances too, but only whenever #primaryInvalidate next runs after
+            // a drain -- so between this call and that drain a sibling instance
+            // keeps serving values that no longer exist. Same bug as set/delete,
+            // same family, no key to pass this time.
+            TurboKV.#clearOthers(this);
+            return;
         }
-        this.#outbox.push('i', full, by, ttlMs, this.#nsId);
-        this.#schedule(full.length + 48);
-        this.stats.incrQueued = (this.stats.incrQueued || 0) + 1;
-        return undefined;                       // queued; read it back with get()
-    }
-
-    // Compare-and-set on a numeric value. Primary-only: a queued CAS whose
-    // outcome the caller never learns is not a CAS, so a worker gets an error
-    // rather than a misleading `true`.
-    cas(key, expected, next) {
-        if (this.#codec) {
-            this.stats.rejectedType = (this.stats.rejectedType || 0) + 1;
-            this.lastError = 'cas requires storage:"bytes"; see incr';
-            return false;
-        }
-        if (this.#id !== 0)
-            throw new Error('cas() is primary-only: a worker cannot learn the outcome ' +
-                            'of a write applied a tick later');
-        const full = this.#ns + key;
-        this.#l1Drop(full);
-        return native.cas(full, expected, next, 0) === true;
-    }
-
-    // Drops every entry of THIS cache's namespace, leaving other namespaces
-    // untouched. The blunt clearAll() wipes the whole arena.
-    clearNamespace() {
-        this.clearLocal();
-        if (this.#id === 0) return native.clearNamespace(this.#nsId, 0);
-        this.#outbox.push('n', '', null, 0, this.#nsId);
+        this.#outbox.push('c', '', null, 0);
         this.#schedule(48);
-        return true;
     }
-
-    static namespaceStats() { return native.nsStats(); }
 
     // Whether this addon build can compress. Compression is optional at build
     // time so the default build has no external dependencies.
     static hasCompression() { return native.hasLz4(); }
 
-    // Live entries in this cache's namespace. Arena-wide counters are in
-    // TurboKV.arenaStats().
     get size() {
-        const st = native.nsStats();
-        if (!st) return 0;
-        if (this.#nsId === 0 && st.length <= 1) return (native.stats() || {}).live || 0;
-        let n = 0;
-        for (const k of this.keys({ limit: Infinity })) n++;
-        return n;
+        const st = native.stats();
+        return st ? st.live : 0;
     }
 
     static arenaStats() { return native.stats(); }
 
-    // Enumerate the keys this cache's namespace holds, newest-slot order.
+    // Enumerate the keys the arena holds, newest-slot order.
     // O(index slots); intended for operations and debugging, not the hot path.
     *keys({ limit = 1000, batch = 512 } = {}) {
         let cursor = 0, yielded = 0;
         for (;;) {
-            const r = native.scanKeys(this.#nsId, cursor, batch);
+            const r = native.scanKeys(cursor, batch);
             if (!r) return;
             for (const k of r.keys) {
                 if (yielded++ >= limit) return;
-                yield this.#ns ? k.slice(this.#ns.length) : k;
+                yield k;
             }
             if (r.done) return;
             cursor = r.cursor;
@@ -1626,7 +1534,7 @@ class TurboKV {
             // Window full AND our own buffer is full: shed rather than grow
             // without bound. The value stays in this worker's L1, it just does
             // not reach L2, so other workers see a miss, never a wrong value.
-            this.stats.writesShed = (this.stats.writesShed || 0) + this.#outbox.length / 5;
+            this.stats.writesShed = (this.stats.writesShed || 0) + this.#outbox.length / 4;
             this.#outbox = [];
             this.#outboxBytes = 0;
             this.lastError = 'IPC send window full; L2 writes shed';
@@ -1637,7 +1545,7 @@ class TurboKV {
         this.#outbox = [];
         this.#outboxBytes = 0;
         this.stats.flushes++;
-        this.stats.sent += batch.length / 5;
+        this.stats.sent += batch.length / 4;
         // The channel can already be gone: a scheduled flush firing after the
         // primary exited threw EPIPE and killed the worker with an unhandled
         // 'error' event. Losing a batch during shutdown is acceptable; crashing
@@ -1692,26 +1600,40 @@ class TurboKV {
     // invalidate the primary's L1 - it kept serving its own stale value even
     // after a worker overwrote or deleted the key.
     static applyBatch(msg) {
-        // set/delete travel through the shared-memory ring while incr/clearAll/
-        // clearNamespace still travel over IPC. A worker pushes to its ring
-        // synchronously and sends the IPC message afterwards, so draining the
-        // rings to empty here is what keeps one worker's operations in order --
-        // without it a clearAll() was observed leaving 3808 keys that had been
-        // written before it.
+        // set/delete travel through the shared-memory ring while clearAll
+        // still travels over IPC. A worker pushes to its ring synchronously and
+        // sends the IPC message afterwards, so draining the rings to empty here
+        // is what keeps one worker's operations in order -- without it a
+        // clearAll() was observed leaving 3808 keys that had been written
+        // before it.
         if (submitName) { let guard = 0; while (TurboKV.drainSubmissions(8192) > 0 && ++guard < 512); }
         const b = msg.b;
-        for (let i = 0; i < b.length; i += 5) {
+        for (let i = 0; i < b.length; i += 4) {
             const op = b[i], key = b[i + 1];
-            if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboKV.#localDrop(key); }
+            if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3]); TurboKV.#localDrop(key); }
             else if (op === 'd') { native.del(key, msg.id); TurboKV.#localDrop(key); }
             else if (op === 'c') { native.clearAll(msg.id); for (const c of instances) c.clearLocal(); }
-            else if (op === 'n') { native.clearNamespace(b[i + 4], msg.id); for (const c of instances) c.clearLocal(); }
-            else if (op === 'i') { native.incr(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboKV.#localDrop(key); }
         }
     }
 
     static #localDrop(fullKey) { for (const c of instances) c.#dropExact(fullKey); }
     #dropExact(fullKey) { this.#l1Drop(fullKey); }
+
+    // Every instance keeps its own L1, and the primary skips the ring records it
+    // wrote itself, so a write through one instance leaves the others holding
+    // the old value. `instances` is normally a set of one, so this costs a
+    // branch per write in the common case.
+    static #dropOthers(fullKey, self) {
+        if (instances.size < 2) return;
+        for (const c of instances) if (c !== self) c.#l1Drop(fullKey);
+    }
+
+    // Same reasoning as #dropOthers, for the no-key case: clearAll() has
+    // nothing to drop by key, so every other instance's L1 is reset wholesale.
+    static #clearOthers(self) {
+        if (instances.size < 2) return;
+        for (const c of instances) if (c !== self) c.clearLocal();
+    }
     static isCacheMessage(m) { return m && m.t === MSG; }
     // `native()` used to hand the raw addon to any caller of the public class,
     // which put poke(), suppressRefBit(), backwardShift(), clearHints() and

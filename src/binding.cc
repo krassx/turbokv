@@ -320,35 +320,30 @@ static napi_value SubmitClaim(napi_env env, napi_callback_info info) {
   napi_create_int32(env, -1, &r); return r;
 }
 
-// worker: submitSet(key, value, ttlMs, ns) -> bool (false = shed, ring full)
+// worker: submitSet(key, value, ttlMs) -> bool (false = shed, ring full)
 static napi_value SubmitSet(napi_env env, napi_callback_info info) {
-  ARG(4)
+  ARG(3)
   napi_value r;
   if (!g_submit.base || g_ringIdx < 0) { napi_get_boolean(env, false, &r); return r; }
   char key[KEY_MAX + 1]; size_t klen = 0;
   if (!readKey(env, argv[0], key, &klen)) return nullptr;
   size_t vlen = 0; uint8_t flags = 0;
   if (!encodeValue(env, argv[1], &vlen, &flags)) { napi_get_boolean(env, false, &r); return r; }
-  int32_t ns = 0;
   uint32_t ttlMs = argc > 2 ? readTtlMs(env, argv[2]) : 0;
-  if (argc > 3) napi_get_value_int32(env, argv[3], &ns);
-  bool ok = submitPush(g_submit, (uint32_t)g_ringIdx, SUBMIT_OP_SET, flags,
-                       (uint16_t)ns, ttlMs,
+  bool ok = submitPush(g_submit, (uint32_t)g_ringIdx, SUBMIT_OP_SET, flags, ttlMs,
                        key, (uint32_t)klen, scratch, (uint32_t)vlen);
   napi_get_boolean(env, ok, &r); return r;
 }
 
-// worker: submitDel(key, ns) -> bool
+// worker: submitDel(key) -> bool
 static napi_value SubmitDel(napi_env env, napi_callback_info info) {
-  ARG(2)
+  ARG(1)
   napi_value r;
   if (!g_submit.base || g_ringIdx < 0) { napi_get_boolean(env, false, &r); return r; }
   char key[KEY_MAX + 1]; size_t klen = 0;
   if (!readKey(env, argv[0], key, &klen)) return nullptr;
-  int32_t ns = 0;
-  if (argc > 1) napi_get_value_int32(env, argv[1], &ns);
   bool ok = submitPush(g_submit, (uint32_t)g_ringIdx, SUBMIT_OP_DEL, 0,
-                       (uint16_t)ns, 0, key, (uint32_t)klen, nullptr, 0);
+                       0, key, (uint32_t)klen, nullptr, 0);
   napi_get_boolean(env, ok, &r); return r;
 }
 
@@ -425,7 +420,7 @@ static napi_value SubmitDrain(napi_env env, napi_callback_info info) {
           uint32_t ttl = rec.ttlMs > TC_TTL_MAX_MS ? TC_TTL_MAX_MS : rec.ttlMs;
           uint32_t expiresAt = ttl ? nowRelMs(g) + ttl : 0;
           storeSet(g, k, (uint16_t)rec.keyLen, v, rec.valLen, rec.valLen,
-                   rec.flags, expiresAt, (uint16_t)(i + 1), (uint8_t)rec.ns);
+                   rec.flags, expiresAt, (uint16_t)(i + 1));
         } else {
           storeDelete(g, k, (uint16_t)rec.keyLen, (uint16_t)(i + 1));
         }
@@ -510,9 +505,9 @@ static napi_value SubmitDestroy(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
-// set(key, value) - value is a latin1 string in this prototype
+// set(key, value, writerId, ttlMs) - value is a latin1 string in this prototype
 static napi_value Set(napi_env env, napi_callback_info info) {
-  ARG(5)
+  ARG(4)
   NEED_STORE(nullptr)
   NEED_WRITABLE(nullptr)
   char key[KEY_MAX + 1]; size_t klen = 0;
@@ -531,13 +526,12 @@ static napi_value Set(napi_env env, napi_callback_info info) {
     }
 #endif
   }
-  int32_t writerId = 0, ns = 0;
+  int32_t writerId = 0;
   if (argc > 2) napi_get_value_int32(env, argv[2], &writerId);
   uint32_t ttlMs = argc > 3 ? readTtlMs(env, argv[3]) : 0;
-  if (argc > 4) napi_get_value_int32(env, argv[4], &ns);
   uint32_t expiresAt = ttlMs ? nowRelMs(g) + ttlMs : 0;
   bool ok = storeSet(g, (const uint8_t *)key, (uint16_t)klen, payload, storedLen, rawLen,
-                     flags, expiresAt, (uint16_t)writerId, (uint8_t)ns);
+                     flags, expiresAt, (uint16_t)writerId);
   napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
@@ -638,79 +632,10 @@ static napi_value Del(napi_env env, napi_callback_info info) {
   return r;
 }
 
-// nsResolve(name, quotaBytes, create) -> id, or -1 if the table is full
-static napi_value NsResolve(napi_env env, napi_callback_info info) {
-  ARG(3)
-  NEED_STORE(nullptr) char nm[64]; size_t n = 0;
-  // UTF-8, not latin1: latin1 truncates each code unit to its low byte, so
-  // 'a\u0100' folded to "a" and shared an id -- and therefore a quota -- with a
-  // different namespace. Same aliasing class the key path was already fixed for.
-  napi_get_value_string_utf8(env, argv[0], nm, sizeof(nm), &n);
-  double quota = 0; napi_get_value_double(env, argv[1], &quota);
-  bool create = false; napi_get_value_bool(env, argv[2], &create);
-  // Registering a namespace WRITES the header (nsName/nsQuota), so a worker
-  // asking to create one took a SIGBUS on the read-only mapping rather than an
-  // exception it could handle. Looking one up is a pure read and stays allowed.
-  if (create) { NEED_WRITABLE(nullptr) }
-  // Names were compared on NS_NAMELEN-1 chars, so two longer names sharing a
-  // prefix silently shared one id and one quota. Reject instead of aliasing.
-  if (n >= NS_NAMELEN) { napi_value r; napi_create_int32(env, -2, &r); return r; }
-  napi_value r; napi_create_int32(env, nsResolve(g, nm, (uint64_t)quota, create), &r); return r;
-}
-
-static napi_value ClearNamespace(napi_env env, napi_callback_info info) {
-  ARG(2)
-  NEED_STORE(nullptr) int32_t ns = 0, writerId = 0;
-  NEED_WRITABLE(nullptr)
-  napi_get_value_int32(env, argv[0], &ns);
-  if (argc > 1) napi_get_value_int32(env, argv[1], &writerId);
-  napi_value r;
-  napi_create_double(env, (double)storeClearNamespace(g, (uint8_t)ns, (uint16_t)writerId), &r);
-  return r;
-}
-
-// scanKeys(nsId, cursorSlot, max) -> { keys: [...], cursor }
-// Enumeration is possible because entries store the key text - decision 3 named
-// this as a benefit of verifying keys, but nothing ever exposed it, so there
-// was no way to see what a cache actually held.
 // sweepExpired(cursorSlot, maxSlots) -> { removed, cursor, done }
 // Expiry was lazy only, so an expired entry held its index slot and arena bytes
 // until the tail happened to reach it, and `live` drifted high. The primary is
 // the sole writer, so it can reclaim them directly.
-static napi_value Incr(napi_env env, napi_callback_info info) {
-  ARG(5)
-  NEED_STORE(nullptr)
-  NEED_WRITABLE(nullptr)
-  char key[KEY_MAX + 1]; size_t klen = 0;
-  if (!readKey(env, argv[0], key, &klen)) return nullptr;
-  double by = 1; napi_get_value_double(env, argv[1], &by);
-  int32_t writerId = 0, ttlMs = 0, ns = 0;
-  napi_get_value_int32(env, argv[2], &writerId);
-  napi_get_value_int32(env, argv[3], &ttlMs);
-  napi_get_value_int32(env, argv[4], &ns);
-  uint32_t expiresAt = ttlMs ? nowRelMs(g) + ttlMs : 0;
-  double out = 0;
-  if (!storeIncr(g, (const uint8_t *)key, (uint16_t)klen, by, expiresAt,
-                 (uint16_t)writerId, (uint8_t)ns, &out)) return nullptr;
-  napi_value r; napi_create_double(env, out, &r); return r;
-}
-
-static napi_value Cas(napi_env env, napi_callback_info info) {
-  ARG(4)
-  NEED_STORE(nullptr)
-  NEED_WRITABLE(nullptr)
-  char key[KEY_MAX + 1]; size_t klen = 0;
-  if (!readKey(env, argv[0], key, &klen)) return nullptr;
-  double expected = 0, next = 0; int32_t writerId = 0;
-  napi_get_value_double(env, argv[1], &expected);
-  napi_get_value_double(env, argv[2], &next);
-  napi_get_value_int32(env, argv[3], &writerId);
-  napi_value r;
-  napi_get_boolean(env, storeCas(g, (const uint8_t *)key, (uint16_t)klen,
-                                 expected, next, (uint16_t)writerId), &r);
-  return r;
-}
-
 static napi_value SweepExpired(napi_env env, napi_callback_info info) {
   ARG(2)
   NEED_STORE(nullptr)
@@ -732,9 +657,9 @@ static napi_value SweepExpired(napi_env env, napi_callback_info info) {
     // is still valid -- once per 49.7 days of primary uptime, a whole TTL
     // window of live data swept away.
     if (!tcExpired(e->expiresAt, now)) continue;
-    uint32_t bsz = e->blockSize; uint8_t ns = e->ns; uint64_t eh = e->hash;
+    uint32_t bsz = e->blockSize; uint64_t eh = e->hash;
     indexRemove(g, i);
-    h->live--; h->liveBytes -= bsz; h->nsBytes[ns] -= bsz; h->evictions++;
+    h->live--; h->liveBytes -= bsz; h->evictions++;
     ringAppend(g, eh, ++h->inserts, 0);      // workers must drop their L1 copy
     removed++;
     i--;                                     // backward shift may refill this slot
@@ -803,13 +728,16 @@ static napi_value Detach(napi_env env, napi_callback_info) {
   return nullptr;
 }
 
+// scanKeys(cursorSlot, max) -> { keys: [...], cursor }
+// Enumeration is possible because entries store the key text - decision 3 named
+// this as a benefit of verifying keys, but nothing ever exposed it, so there
+// was no way to see what a cache actually held.
 static napi_value ScanKeys(napi_env env, napi_callback_info info) {
-  ARG(3)
+  ARG(2)
   NEED_STORE(nullptr)
-  int32_t ns = 0, max = 0; double cur = 0;
-  napi_get_value_int32(env, argv[0], &ns);
-  napi_get_value_double(env, argv[1], &cur);
-  napi_get_value_int32(env, argv[2], &max);
+  int32_t max = 0; double cur = 0;
+  napi_get_value_double(env, argv[0], &cur);
+  napi_get_value_int32(env, argv[1], &max);
   Header *h = g.h;
   napi_value arr; napi_create_array(env, &arr);
   uint32_t n = 0;
@@ -832,7 +760,6 @@ static napi_value ScanKeys(napi_env env, napi_callback_info info) {
     uint32_t s1 = e->seq.load(std::memory_order_acquire);
     if (s1 & 1u) continue;                       // write in progress
     uint16_t kl = e->keyLen;
-    uint8_t ens = e->ns;
     uint64_t ehash = e->hash;
     if (kl == 0 || kl > KEY_MAX) continue;
     memcpy(kbuf, g.keyOf(e), kl);
@@ -842,7 +769,6 @@ static napi_value ScanKeys(napi_env env, napi_callback_info info) {
     // reused underneath us, which a seqlock alone cannot (see decision 19).
     if (h->tailPub.load(std::memory_order_acquire) > pos) continue;
     if (ehash != hv) continue;                   // slot no longer points here
-    if (ns >= 0 && ens != (uint8_t)ns) continue;
     napi_value k;
     if (napi_create_string_utf8(env, kbuf, kl, &k) != napi_ok) continue;
     napi_set_element(env, arr, n++, k);
@@ -853,23 +779,6 @@ static napi_value ScanKeys(napi_env env, napi_callback_info info) {
   napi_value done; napi_get_boolean(env, i >= h->indexSlots, &done);
   napi_set_named_property(env, o, "done", done);
   return o;
-}
-
-static napi_value NsStats(napi_env env, napi_callback_info) {
-  NEED_STORE(nullptr)
-  napi_value arr; napi_create_array(env, &arr);
-  for (uint32_t i = 0; i < g.h->nsCount; i++) {
-    napi_value o; napi_create_object(env, &o);
-    napi_value nm; napi_create_string_utf8(env, g.h->nsName[i], NAPI_AUTO_LENGTH, &nm);
-    napi_set_named_property(env, o, "name", nm);
-    put(env, o, "id", i);
-    put(env, o, "bytes", (double)g.h->nsBytes[i]);
-    put(env, o, "quota", (double)g.h->nsQuota[i]);
-    put(env, o, "protected", (double)g.h->nsProtected[i]);
-    put(env, o, "dropped", (double)g.h->nsDropped[i]);
-    napi_set_element(env, arr, i, o);
-  }
-  return arr;
 }
 
 static napi_value ClearAll(napi_env env, napi_callback_info info) {
@@ -1153,7 +1062,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("submitPending", SubmitPending) FN("submitStats", SubmitStats)
   FN("submitDestroy", SubmitDestroy) FN("submitRelease", SubmitRelease)
   FN("submitMaxValue", SubmitMaxValue)
-  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
+  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
   FN("arenaId", ArenaId) FN("detach", Detach) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("__unsafePokeArena", Poke)
   FN("__unsafeSuppressRefBit", SetSuppressRefBit) FN("__unsafeSecondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("__unsafeBackwardShift", SetBackwardShift) FN("__unsafeClearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)

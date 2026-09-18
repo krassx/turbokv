@@ -47,9 +47,9 @@ const mk = o => TurboKV.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 << 
 {
     const c = mk({});
     c.set('k', 'from-primary');
-    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['s', 'k', 'from-worker', 0, 0] });
+    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['s', 'k', 'from-worker', 0] });
     ok(c.get('k') === 'from-worker', 'primary L1 sees a worker set');
-    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['d', 'k', null, 0, 0] });
+    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['d', 'k', null, 0] });
     ok(c.get('k') === undefined, 'primary L1 sees a worker delete');
     __native.destroy();
 }
@@ -63,18 +63,14 @@ const mk = o => TurboKV.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 << 
 }
 // 10. no crash before an arena exists or after close
 {
-    ok(TurboKV.namespaceStats() === undefined, 'namespaceStats before an arena does not crash');
     const c = mk({}); c.close();
     ok(native.get('anything') === undefined, 'native get after destroy does not crash');
 }
-// sev3: ttl clamp, namespace name length
+// sev3: ttl clamp
 {
     const c = mk({});
     c.set('big', 'v', { ttlMs: 2147483600 });
     ok(c.has('big') === true, 'huge ttlMs does not overflow into instant expiry');
-    let threw = false;
-    try { TurboKV.open({ namespace: { name: 'a'.repeat(40) } }); } catch { threw = true; }
-    ok(threw, 'over-long namespace name rejected rather than aliased');
     __native.destroy();
 }
 ok(typeof Cache === 'function', 'Cache alias is exported as the docs describe');
@@ -111,12 +107,6 @@ ok(typeof Cache === 'function', 'Cache alias is exported as the docs describe');
 // Native-layer defects found by the second adversarial review.
 {
     const c = mk({});
-    // Namespace ids index nsBytes[16] with no check: ns>=16 walked into
-    // nsQuota/nsProtected/nsDropped and past ~77 into the INDEX itself, silently
-    // corrupting a live slot that eviction could then never reclaim.
-    ok(native.set('nsbad', 'v', 0, 0, 77) === false, 'namespace id 77 is rejected, not written past nsBytes');
-    ok(native.set('nsbad', 'v', 0, 0, 255) === false, 'namespace id 255 is rejected');
-    ok(native.set('nsok', 'v', 0, 0, 3) === true, 'a valid namespace id is still accepted');
 
     // Unpaired surrogates all encode to U+FFFD, so distinct keys aliased and
     // returned each other's values.

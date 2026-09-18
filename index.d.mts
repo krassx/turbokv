@@ -14,9 +14,9 @@
 // re-exports rather than duplicating, so there is exactly one place where the
 // API is declared and the two can never drift.
 export type {
-    StorageMode, Transport, Codec, NamespaceOptions, HeapGuardOptions,
+    StorageMode, Transport, Codec, HeapGuardOptions,
     CacheOptions, PrimaryOptions, OpenOptions, SetOptions, CacheStats,
-    ArenaStats, NamespaceStat, AutoSize, SubmitStats, KeysOptions,
+    ArenaStats, AutoSize, SubmitStats, KeysOptions,
 } from './index.js';
 
 export { TurboKV, Cache, MSG } from './index.js';

@@ -36,7 +36,7 @@
 #include "platform.h"
 
 static const uint32_t TCS_MAGIC  = 0x54435331;   // "TCS1"
-static const uint32_t TCS_LAYOUT = 1;
+static const uint32_t TCS_LAYOUT = 2;   // 2: namespace id removed from the record header
 
 enum { SUBMIT_OP_SET = 1, SUBMIT_OP_DEL = 2, SUBMIT_OP_SKIP = 3 };
 
@@ -45,12 +45,21 @@ struct SubmitRec {
   uint32_t len;        // total record size incl. this header, 8-byte aligned
   uint8_t  op;
   uint8_t  flags;      // value type tag, same FLAG_* bits the arena uses
-  uint16_t ns;
+  // The namespace id lived here (TCS_LAYOUT 1). It is named rather than left as
+  // an anonymous hole so every byte of a record is written: this segment is
+  // shared and reused lap after lap, so an unwritten hole carries whatever the
+  // previous record put there. Nothing reads it, but leaving it uninitialised
+  // is what MSan reports and what a future field would inherit.
+  uint16_t reserved2;
   uint32_t keyLen;
   uint32_t valLen;
   uint32_t ttlMs;      // 0 = no expiry
   uint32_t reserved;
 };
+// Load-bearing: submitPush reserves and the consumer steps by exactly this many
+// bytes, submitGapAt derives the implicit wrap gap from it, and submitValidate
+// bounds a record's payload against it. A field added here is a TCS_LAYOUT bump.
+static_assert(sizeof(SubmitRec) == 24, "SubmitRec is the ring's record stride: changing it is a TCS_LAYOUT change");
 
 // One per worker slot. Padded so head and tail never share a cache line: they
 // are written by different processes on different cores, and false sharing here
@@ -156,7 +165,7 @@ struct Submit {
     // Close any mapping we already hold. Overwriting `base` leaked the previous
     // one, and open() is called again on every recovery and on every second
     // cache in a worker -- measured six full copies (8MB -> 48MB) after five
-    // re-opens, unbounded for an app that opens namespaces dynamically.
+    // re-opens, unbounded for an app that re-attaches repeatedly.
     if (base) { shmClose(base, bytes, &h); base = nullptr; }
     bytes = sizeFor(probeHdr.ringCount, probeHdr.ringBytes);
     base = shmOpenRW(name, bytes, false, &h);
@@ -177,7 +186,7 @@ static inline uint32_t submitAlign8(uint32_t n) { return (n + 7u) & ~7u; }
 // PRODUCER (worker). Returns false when the ring cannot take the record, which
 // the caller reports as a shed write - never as an error, and never by blocking.
 static inline bool submitPush(Submit& s, uint32_t idx, uint8_t op, uint8_t flags,
-                              uint16_t ns, uint32_t ttlMs,
+                              uint32_t ttlMs,
                               const void* key, uint32_t keyLen,
                               const void* val, uint32_t valLen) {
   SubmitRing* r = s.ring(idx);
@@ -213,7 +222,7 @@ static inline bool submitPush(Submit& s, uint32_t idx, uint8_t op, uint8_t flags
   if (pad) {
     if (pad >= sizeof(SubmitRec)) {
       SubmitRec* skip = (SubmitRec*)(base + off);
-      skip->len = pad; skip->op = SUBMIT_OP_SKIP; skip->flags = 0; skip->ns = 0;
+      skip->len = pad; skip->op = SUBMIT_OP_SKIP; skip->flags = 0; skip->reserved2 = 0;
       skip->keyLen = 0; skip->valLen = 0; skip->ttlMs = 0; skip->reserved = 0;
     }
     // else: implicit gap, see submitGapAt
@@ -221,7 +230,7 @@ static inline bool submitPush(Submit& s, uint32_t idx, uint8_t op, uint8_t flags
     off = 0;
   }
   SubmitRec* rec = (SubmitRec*)(base + off);
-  rec->len = need; rec->op = op; rec->flags = flags; rec->ns = ns;
+  rec->len = need; rec->op = op; rec->flags = flags; rec->reserved2 = 0;
   rec->keyLen = keyLen; rec->valLen = valLen; rec->ttlMs = ttlMs; rec->reserved = 0;
   if (keyLen) memcpy(base + off + sizeof(SubmitRec), key, keyLen);
   if (valLen) memcpy(base + off + sizeof(SubmitRec) + keyLen, val, valLen);
@@ -248,7 +257,6 @@ static inline bool submitValidate(const Submit& s, const SubmitRec* rec, uint64_
   if (rec->op != SUBMIT_OP_SET && rec->op != SUBMIT_OP_DEL) return false;
   if (rec->keyLen == 0 || rec->keyLen > s.maxKey) return false;
   if (rec->valLen > s.maxVal) return false;
-  if (rec->ns >= NS_MAX) return false;
   uint64_t need = (uint64_t)sizeof(SubmitRec) + rec->keyLen + rec->valLen;
   if (need > rec->len) return false;                 // payload must fit the record
   if (submitAlign8((uint32_t)need) != rec->len) return false;

@@ -49,23 +49,6 @@ static bool g_backwardShift = true;   // bisect hook
 // Measured: hit rate saturates at 8 re-appends per allocation (85.6% at 0,
 // 85.9% at 1, 86.3% from 8 upward, flat to 8192). 16 gives margin at no cost.
 static int  g_secondChanceBudget = 16;
-// Register (primary) or look up (worker) a namespace by name.
-static inline int nsResolve(Store &s, const char *name, uint64_t quota, bool create) {
-  Header *h = s.h;
-  if (!name || !name[0]) return 0;
-  for (uint32_t i = 1; i < h->nsCount; i++)
-    if (strncmp(h->nsName[i], name, NS_NAMELEN - 1) == 0) {
-      if (create && quota) h->nsQuota[i] = quota;
-      return (int)i;
-    }
-  if (!create) return -1;
-  uint32_t id = h->nsCount < 1 ? 1 : h->nsCount;
-  if (id >= NS_MAX) return -1;
-  snprintf(h->nsName[id], NS_NAMELEN, "%s", name);
-  h->nsQuota[id] = quota; h->nsBytes[id] = 0;
-  h->nsCount = id + 1;
-  return (int)id;
-}
 
 static inline void indexRemove(Store &s, uint64_t i) {
   Header *h = s.h;
@@ -107,7 +90,6 @@ static inline void unlinkSlot(Store &s, uint64_t slot) {
   Entry *e = s.entryAt(pos);
   h->live--;
   h->liveBytes -= e->blockSize;
-  h->nsBytes[e->ns] -= e->blockSize;
   h->evictions++;
 }
 
@@ -115,10 +97,9 @@ static inline void unlinkSlot(Store &s, uint64_t slot) {
 static const uint32_t SLOT_PAD = 0xFFFFFFFFu;
 
 // Advance the tail past one record.
-// In MODE_LOG2, a live entry that is protected (by quota, or by its reference
-// bit) is re-appended at the head
-// instead of dropped (its bit is cleared), giving the log CLOCK-style second
-// chance. `budget` caps re-appends so a hot arena still makes progress.
+// In MODE_LOG2, a live entry whose reference bit is set is re-appended at the
+// head instead of dropped (its bit is cleared), giving the log CLOCK-style
+// second chance. `budget` caps re-appends so a hot arena still makes progress.
 // Bytes the log must step over without a record header, because a header does
 // not fit in what is left before the wrap. Records are 8-aligned and the header
 // is 40 bytes, so a remainder of 8, 16, 24 or 32 is reachable -- writing a pad
@@ -154,17 +135,7 @@ static inline void logDropTail(Store &s, int *budget) {
         s.idx[slot].off.load(std::memory_order_relaxed) == tailPos &&
         s.idx[slot].hash.load(std::memory_order_relaxed) == e->hash;
     if (liveHere) h->tailLive++;
-    // Quota decides first, reference bit second. A namespace with a quota is
-    // protected while it is under it and dropped once over, so a hot namespace
-    // can no longer evict a cold one. A namespace without a quota keeps the
-    // plain CLOCK behaviour and competes freely.
-    bool protect, byQuota = false;
-    if (liveHere && h->nsQuota[e->ns]) {
-      protect = h->nsBytes[e->ns] <= h->nsQuota[e->ns];
-      byQuota = protect;
-    } else {
-      protect = liveHere && s.hints[slot].load(std::memory_order_relaxed);
-    }
+    bool protect = liveHere && s.hints[slot].load(std::memory_order_relaxed);
     if (liveHere && protect && budget && *budget > 0) {
       uint64_t newPos = h->logHead;
       uint64_t hp = newPos % h->dataBytes;
@@ -185,9 +156,6 @@ static inline void logDropTail(Store &s, int *budget) {
       // pointers gives it another lap for free. No memcpy, no room required.
       if (hp == phys && bsz <= h->dataBytes) {
         (*budget)--; h->reappends++;
-        if (byQuota) h->nsProtected[e->ns]++;   // counted where it is GRANTED, not where
-                                                // it is merely considered: the old placement
-                                                // credited protection to entries it then dropped
         s.hints[slot].store(0, std::memory_order_relaxed);   // chance consumed
         s.idx[slot].off.store(newPos, std::memory_order_release);
         h->logHead += bsz;
@@ -198,7 +166,6 @@ static inline void logDropTail(Store &s, int *budget) {
       if (freeBytes < bsz) h->reappendSkippedNoRoom++;
       if (freeBytes >= bsz && hp + bsz <= h->dataBytes && hp != phys) {
         (*budget)--; h->reappends++;
-        if (byQuota) h->nsProtected[e->ns]++;
         Entry *dst = s.entryAt(hp);
         uint32_t dseq = dst->seq.load(std::memory_order_relaxed);
         dst->seq.store(dseq | 1, std::memory_order_release);
@@ -217,8 +184,8 @@ static inline void logDropTail(Store &s, int *budget) {
     }
     if (liveHere) {
       indexRemove(s, slot);
-      h->live--; h->liveBytes -= bsz; h->nsBytes[e->ns] -= bsz;
-      h->evictions++; h->dropped++; h->nsDropped[e->ns]++;
+      h->live--; h->liveBytes -= bsz;
+      h->evictions++; h->dropped++;
     }
   }
   h->logTail += bsz;
@@ -284,16 +251,7 @@ static inline void ringAppend(Store &s, uint64_t hash, uint32_t version, uint16_
 // Sole-writer path. Returns false if the value could not be allocated.
 static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
                             const uint8_t *val, uint32_t storedLen, uint32_t rawLen,
-                            uint8_t flags, uint32_t expiresAt, uint16_t writerId,
-                            uint8_t ns = 0) {
-  // NS_MAX is 16 and `ns` is a uint8_t, so an out-of-range id indexes past
-  // nsBytes[] into nsQuota / nsProtected / nsDropped and, past ~77, into the
-  // INDEX itself -- `nsBytes[ns] += blockSize` then corrupts a live index slot
-  // permanently (the slot no longer matches any entry, so eviction can never
-  // reclaim it and `live` leaks toward the ceiling). nsResolve can return -1
-  // (table full) and -2 (name too long), so this is reachable from the public
-  // API the moment a caller registers a 17th namespace.
-  if (ns >= NS_MAX) return false;
+                            uint8_t flags, uint32_t expiresAt, uint16_t writerId) {
   Header *h = s.h;
   uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;   // reserve 0/1 as sentinels
@@ -307,12 +265,15 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   {
     // Index pressure, not data pressure. A re-append frees no index SLOT, so
     // second chance cannot relieve this directly -- which is why this loop used
-    // to pass a null budget and drop unconditionally. But that made quotas and
-    // reference bits vanish entirely whenever the index was the binding
-    // constraint: measured a cold namespace losing all 500 of its quota-
-    // protected entries while liveBytes sat at 0.45MB of 32MB. autoSize() gives
-    // one slot per 512B, so any workload averaging under ~384B is index-bound in
-    // production and never saw the eviction policy at all.
+    // to pass a null budget and drop unconditionally. But that made the whole
+    // eviction policy vanish whenever the index was the binding constraint.
+    // The figure that established this was measured in the namespace era and
+    // cannot be restated for today's code: a cold namespace lost all 500 of its
+    // QUOTA-protected entries while liveBytes sat at 0.45MB of 32MB (decision
+    // 38). Quotas are gone (decision 63); what the budget still rescues is the
+    // CLOCK reference bit, which was dropped by the same mechanism. autoSize()
+    // gives one slot per 512B, so any workload averaging under ~384B is
+    // index-bound in production and never saw the eviction policy at all.
     //
     // Give it a bounded budget instead. Re-appending a protected entry lets the
     // scan step PAST it to find a droppable one, which does free a slot. Once
@@ -363,7 +324,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   e->slot = (uint32_t)slot; e->hash = hash; e->version = ++h->inserts;
   e->expiresAt = expiresAt; e->rawLen = rawLen; e->storedLen = storedLen;
   e->blockSize = (uint32_t)align8(need);
-  e->keyLen = keyLen; e->flags = flags; e->ns = ns;
+  e->keyLen = keyLen; e->flags = flags;
   memcpy(s.keyOf(e), key, keyLen);
   memcpy(s.valOf(e), val, storedLen);
 
@@ -373,7 +334,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   s.idx[slot].off.store((uint64_t)off, std::memory_order_release);
   s.idx[slot].hash.store(hash, std::memory_order_release);
   s.hints[slot].store(1, std::memory_order_relaxed);   // a fresh entry gets one chance
-  h->live++; h->liveBytes += e->blockSize; h->nsBytes[e->ns] += e->blockSize;
+  h->live++; h->liveBytes += e->blockSize;
   ringAppend(s, hash, e->version, writerId);
   return true;
 }
@@ -394,27 +355,6 @@ static inline bool storeDelete(Store &s, const uint8_t *key, uint16_t keyLen, ui
 // every previously published position becomes stale under the 
 // liveness rule. Rewinding to zero would move the tail BACKWARDS and let a
 // reader trust a stale position pointing at reused bytes.
-// Drop every entry of one namespace. O(index slots); clearing is rare.
-static inline uint64_t storeClearNamespace(Store &s, uint8_t ns, uint16_t writerId) {
-  if (ns >= NS_MAX) return 0;
-  Header *h = s.h;
-  uint64_t removed = 0;
-  for (uint64_t i = 0; i < h->indexSlots; i++) {
-    uint64_t hv = s.idx[i].hash.load(std::memory_order_relaxed);
-    if (hv == HASH_EMPTY || hv == HASH_TOMB) continue;
-    uint64_t pos = s.idx[i].off.load(std::memory_order_relaxed);
-    Entry *e = s.entryAt(pos);
-    if (e->ns != ns) continue;
-    uint32_t bsz = e->blockSize;
-    indexRemove(s, i);
-    h->live--; h->liveBytes -= bsz; h->nsBytes[ns] -= bsz; h->evictions++;
-    removed++;
-    i--;                       // backward-shift may have moved an entry into i
-  }
-  ringAppend(s, RING_FLUSH_ALL, ++h->inserts, writerId);
-  return removed;
-}
-
 static inline void storeClear(Store &s, uint16_t writerId) {
   Header *h = s.h;
   memset(s.idx, 0, h->indexSlots * sizeof(IndexSlot));
@@ -422,7 +362,6 @@ static inline void storeClear(Store &s, uint16_t writerId) {
   h->logTail = h->logHead;
   h->tailPub.store(h->logTail, std::memory_order_release);
   h->live = 0; h->liveBytes = 0;
-  for (int i = 0; i < NS_MAX; i++) h->nsBytes[i] = 0;
   ringAppend(s, RING_FLUSH_ALL, ++h->inserts, writerId);   // tells workers to drop L1
 }
 
@@ -524,79 +463,4 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
     return false;
   }
   return false;
-}
-
-// ----------------------------------------------------------- atomic RMW ----
-// Only the primary runs these, so they are atomic by construction - there is no
-// other writer to race with. A numeric value is 8 fixed bytes, so the update is
-// in place under the seqlock and needs no reallocation.
-//
-// `out` receives the resulting value. Returns false if the key exists but is
-// not numeric.
-static inline bool storeIncr(Store &s, const uint8_t *key, uint16_t keyLen,
-                             double by, uint32_t expiresAt, uint16_t writerId,
-                             uint8_t ns, double *out) {
-  if (ns >= NS_MAX) return false;
-  Header *h = s.h;
-  uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
-  if (hash <= HASH_TOMB) hash += 2;
-  int64_t slot = s.findSlot(hash, key, keyLen);
-  if (slot < 0) {                                  // absent counts as zero
-    double v = by;
-    if (!storeSet(s, key, keyLen, (const uint8_t *)&v, sizeof(v), sizeof(v),
-                  FLAG_NUMBER, expiresAt, writerId, ns)) return false;
-    *out = v;
-    return true;
-  }
-  uint64_t pos = s.idx[slot].off.load(std::memory_order_acquire);
-  Entry *e = s.entryAt(pos);
-  if (!(e->flags & FLAG_NUMBER) || e->storedLen != sizeof(double)) return false;
-  uint32_t now = nowRelMs(s);
-  if (tcExpired(e->expiresAt, now)) {              // expired: restart from zero
-    double v = by;
-    unlinkSlot(s, (uint64_t)slot);
-    if (!storeSet(s, key, keyLen, (const uint8_t *)&v, sizeof(v), sizeof(v),
-                  FLAG_NUMBER, expiresAt, writerId, ns)) return false;
-    *out = v;
-    return true;
-  }
-  double cur = 0; memcpy(&cur, s.valOf(e), sizeof(cur));
-  double next = cur + by;
-  uint32_t seq = e->seq.load(std::memory_order_relaxed);
-  e->seq.store(seq | 1, std::memory_order_release);
-  std::atomic_thread_fence(std::memory_order_release);
-  memcpy(s.valOf(e), &next, sizeof(next));
-  e->version = ++h->inserts;
-  std::atomic_thread_fence(std::memory_order_release);
-  e->seq.store((seq | 1) + 1, std::memory_order_release);
-  ringAppend(s, hash, e->version, writerId);
-  *out = next;
-  return true;
-}
-
-// Compare-and-set on a numeric value. Returns true only if the stored value
-// equalled `expected` and was replaced.
-static inline bool storeCas(Store &s, const uint8_t *key, uint16_t keyLen,
-                            double expected, double next, uint16_t writerId) {
-  Header *h = s.h;
-  uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
-  if (hash <= HASH_TOMB) hash += 2;
-  int64_t slot = s.findSlot(hash, key, keyLen);
-  if (slot < 0) return false;
-  uint64_t pos = s.idx[slot].off.load(std::memory_order_acquire);
-  Entry *e = s.entryAt(pos);
-  if (!(e->flags & FLAG_NUMBER) || e->storedLen != sizeof(double)) return false;
-  uint32_t now = nowRelMs(s);
-  if (tcExpired(e->expiresAt, now)) return false;
-  double cur = 0; memcpy(&cur, s.valOf(e), sizeof(cur));
-  if (!(cur == expected)) return false;            // NaN never matches, as with ===
-  uint32_t seq = e->seq.load(std::memory_order_relaxed);
-  e->seq.store(seq | 1, std::memory_order_release);
-  std::atomic_thread_fence(std::memory_order_release);
-  memcpy(s.valOf(e), &next, sizeof(next));
-  e->version = ++h->inserts;
-  std::atomic_thread_fence(std::memory_order_release);
-  e->seq.store((seq | 1) + 1, std::memory_order_release);
-  ringAppend(s, hash, e->version, writerId);
-  return true;
 }

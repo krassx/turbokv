@@ -17,7 +17,7 @@
 #include "vendor/rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
-static const uint32_t TC_LAYOUT = 5;   // 2: BigInt words at 8; 3: tick epoch + arenaId; 4: data region no longer power-of-two; 5: slab state out of Header
+static const uint32_t TC_LAYOUT = 6;   // 2: BigInt words at 8; 3: tick epoch + arenaId; 4: data region no longer power-of-two; 5: slab state out of Header; 6: namespace table removed
 static const uint32_t FEATURE_LZ4 = 1;
 static const uint64_t HASH_EMPTY = 0;
 static const uint64_t HASH_TOMB  = 1;
@@ -46,8 +46,21 @@ struct Entry {
   uint32_t blockSize;          // total bytes incl. header (slab class size, or log record size)
   uint16_t keyLen;
   uint8_t  flags;
-  uint8_t  ns;          // namespace id, 0 = default
 };
+// Load-bearing, not cosmetic: keyOf/valOf place the key and value at
+// sizeof(Entry), logGapAt decides a wrap remainder against it, and logAlloc
+// sizes every block from it -- so a field added here silently moves every
+// offset in the data region AND changes what an existing arena means. Only the
+// tail padding after `flags` keeps this at 40; adding a field is a TC_LAYOUT
+// bump, and this assert is what forces that conversation. But this assert does
+// NOT force it in every case: there is exactly one byte of tail padding after
+// `flags` (39 bytes of fields rounded up to the 8-byte alignment `hash`
+// imposes), so a single trailing byte-sized field -- another uint8_t, most
+// naturally -- lands in that byte, sizeof(Entry) stays 40, and this assert
+// does not fire. Do not treat "the assert didn't trip" as proof the layout is
+// unchanged; decide about TC_LAYOUT deliberately for any new field, byte-sized
+// or not.
+static_assert(sizeof(Entry) == 40, "Entry is the data region's stride: changing it is a TC_LAYOUT change");
 
 struct IndexSlot {
   std::atomic<uint64_t> hash;  // 0 empty, 1 tombstone, else hash
@@ -64,9 +77,6 @@ struct RingRec { uint64_t hash; uint32_t version; uint16_t writerId; uint16_t _p
 // saturate before the data region does (which silently failed inserts before).
 static const double MAX_LOAD = 0.75;
 static const uint64_t MIN_DATA_BYTES = 1u << 16;
-
-#define NS_MAX 16
-#define NS_NAMELEN 24
 
 struct Header {
   // magic is ATOMIC and published LAST. create() used to write it first and the
@@ -109,17 +119,6 @@ struct Header {
   uint64_t inserts, evictions, live, liveBytes, allocBytes;
   uint64_t maxLive, indexEvictions, shiftMoves;
 
-  // Namespaces. Without quotas a hot namespace evicts a cold one and neither
-  // can be sized or cleared on its own. Quotas are SOFT and enforced through
-  // the second-chance path: at the tail, an entry of an under-quota namespace
-  // gets another lap, an over-quota one is dropped. Progress is guaranteed
-  // whenever the quotas sum to no more than capacity, since a full arena then
-  // always contains at least one over-quota namespace.
-  uint32_t nsCount;
-  char     nsName[NS_MAX][NS_NAMELEN];
-  uint64_t nsBytes[NS_MAX];
-  uint64_t nsQuota[NS_MAX];          // 0 = no quota, competes freely
-  uint64_t nsProtected[NS_MAX], nsDropped[NS_MAX];
   uint64_t reappends, reappendSkippedNoRoom, dropped, tailAdvances, tailLive;
   // Set the first time a compressed entry is written. An attaching process
   // built without LZ4 cannot read those entries, so it refuses the arena

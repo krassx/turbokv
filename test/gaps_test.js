@@ -1,5 +1,5 @@
 // Covers the gaps closed after the adversarial review: binary values, TTL
-// sweeping, primary heartbeat, and atomic RMW.
+// sweeping, and primary heartbeat.
 const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 const __native = native;
@@ -50,21 +50,6 @@ function stage2() {
     // --- heartbeat
     const c = mk({ maintenance: true, maintenanceMs: 40 });
     ok(TurboKV.primaryAgeMs() >= 0 && TurboKV.primaryAgeMs() < 1000, 'primary stamps a heartbeat');
-    __native.destroy();
-
-    // --- atomic RMW on the primary
-    const d = mk({});
-    ok(d.incr('n') === 1, 'incr on a missing key starts at zero');
-    ok(d.incr('n', 5) === 6 && d.incr('n', -2) === 4, 'incr adds and subtracts');
-    ok(d.get('n') === 4, 'incr result is readable');
-    ok(d.cas('n', 4, 10) === true && d.get('n') === 10, 'cas replaces on match');
-    ok(d.cas('n', 4, 99) === false && d.get('n') === 10, 'cas refuses on mismatch');
-    d.set('s', 'text');
-    ok(d.incr('s') === false, 'incr on a non-numeric value is refused');
-    ok(d.cas('missing', 1, 2) === false, 'cas on a missing key is false');
-    d.incr('t', 1, { ttlMs: 30 });
-    const u = Date.now() + 90; while (Date.now() < u);
-    ok(d.get('t') === undefined, 'incr honours ttl');
     __native.destroy();
 
     console.log(fail ? `  ${fail} FAILURES` : '  all passed');

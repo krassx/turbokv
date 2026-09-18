@@ -39,7 +39,7 @@ if (cluster.isPrimary) {
             const t0 = process.hrtime.bigint();
             const r = realSend(msg, ...rest);
             durs.push(Number(process.hrtime.bigint() - t0) / 1e6);
-            bytes += msg.b.length * 50;         // rough: 5 slots per write, ~250B each
+            bytes += msg.b.length * 62;         // rough: 4 slots per write, ~250B each
             return r;
         }
         return realSend(msg, ...rest);
