@@ -244,6 +244,8 @@ class TurboKV {
     #l3FailTtlMs = 5000;
     #l3TtlMs = 60000;
     #lastQueued = null;
+    #onL3Error = null;
+    #inflight = new Map();      // key -> in-flight L3 read, so a herd shares one request
     // Native expiry is milliseconds from the arena's creation time.
     #id;
     #codec;
@@ -280,6 +282,11 @@ class TurboKV {
         if (opts.l3 !== undefined && opts.l3 !== null) this.#l3 = assertAdapter(opts.l3);
         this.#l3FailTtlMs = opts.l3FailTtlMs ?? 5000;
         this.#l3TtlMs = opts.l3TtlMs ?? 60000;
+        // One place holds the listener. It used to be read out of `opts` from
+        // inside the queue's callback, which meant a second reporting path grew
+        // the moment a second caller needed one -- and a duplicated report is
+        // exactly the defect the queue's own onError contract just removed.
+        this.#onL3Error = typeof opts.onL3Error === 'function' ? opts.onL3Error : null;
         if (this.#l3) {
             this.#queue = new L3Queue(this.#l3, {
                 maxBytes: opts.l3QueueMaxBytes ?? (8 << 20),
@@ -294,7 +301,7 @@ class TurboKV {
                 onError: (e, op) => {
                     if (op.kind === 'set') this.stats.l3SetFailed = (this.stats.l3SetFailed || 0) + 1;
                     else if (op.kind === 'delete') this.stats.l3DeleteFailed = (this.stats.l3DeleteFailed || 0) + 1;
-                    if (typeof opts.onL3Error === 'function') { try { opts.onL3Error(e, op); } catch { /* not ours */ } }
+                    this.#reportL3(e, op);
                 },
             });
         }
@@ -1193,6 +1200,110 @@ class TurboKV {
         // The L2 path used to return the very object it just placed in L1, so a
         // caller mutating a binary result corrupted the cached copy.
         return Buffer.isBuffer(v) ? Buffer.from(v) : v;
+    }
+
+    // L1 -> L2 -> L3, filling downward per minLevel. Simultaneous misses on one
+    // key inside this process share a single L3 request, so the herd is bounded
+    // by the number of processes rather than by the request rate.
+    async getAsync(key, opts) {
+        const local = this.get(key, opts);
+        if (local !== undefined) return local;
+        if (!this.#l3) return undefined;
+        // `get` already rejected a non-string key by returning undefined; going
+        // on to L3 with it would hand the adapter -- and hashKey -- something
+        // neither of them accepts.
+        if (!isStringKey(key)) return undefined;
+        const level = opts === undefined ? 1 : this.#resolveLevel(opts.minLevel);
+        const shared = this.#inflight.get(key);
+        if (shared !== undefined) return shared;
+
+        const p = this.#fetchFromL3(key, level).finally(() => this.#inflight.delete(key));
+        this.#inflight.set(key, p);
+        return p;
+    }
+
+    async #fetchFromL3(key, level) {
+        // Marked BEFORE the await: everything appended to the invalidation ring
+        // from here on happened while this read was in flight.
+        const mark = storeReady && !this.#primaryDead ? native.ringHead() : -1;
+        let rec;
+        try { rec = await this.#l3.get(key, { willCache: this.#willCache(level) }); }
+        catch (e) {
+            this.stats.l3Misses = (this.stats.l3Misses || 0) + 1;
+            this.#reportL3(e, { kind: 'get', key });
+            return undefined;
+        }
+        if (rec === undefined || rec === null) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
+        this.stats.l3Hits = (this.stats.l3Hits || 0) + 1;
+        // The caller gets what L3 returned either way. Blocking changes only
+        // what is stored locally, never what this caller observes.
+        if (this.#promotionBlocked(key, mark)) {
+            this.stats.l3PromotionsBlocked = (this.stats.l3PromotionsBlocked || 0) + 1;
+            return this.#decodeFromL3(rec.value);
+        }
+        this.#fillFromL3(key, rec, level);
+        return this.#decodeFromL3(rec.value);
+    }
+
+    // Did anything invalidate THIS key while the read was in flight? Checking
+    // for the key's own hash rather than "did the head move at all" matters:
+    // under load the head always moves, so the conservative version would never
+    // promote and L3 hits would never reach L2.
+    #promotionBlocked(key, mark) {
+        // A degraded worker has no arena to read the ring from, so it cannot
+        // know what happened and must refuse. Refusing costs a promotion, not
+        // correctness.
+        if (mark < 0 || !storeReady || this.#primaryDead) return true;
+        const h = native.hashKey(key);
+        // A key the arena cannot even hash -- a lone surrogate -- has no ring
+        // record to compare against, and `get` already treats it as never
+        // stored. Promoting it would file an unreachable L1 entry under the
+        // hash `undefined`, which every such key would then share.
+        if (h === undefined) return true;
+        let cursor = mark;
+        // Batched, not truncated. ringRead returns at most `max` records, so a
+        // single call covering only the first 1024 of the 8192 a ring holds
+        // would miss an invalidation sitting at 1025 and promote over it -- the
+        // very defect the guard exists to prevent, just harder to hit.
+        for (;;) {
+            let r;
+            try { r = native.ringRead(cursor, 1024); } catch { return true; }
+            if (!r || r.wrapped) return true;          // fell too far behind to know
+            for (let i = 0; i < r.hashes.length; i++) {
+                // The flush marker is not a key hash -- it means EVERYTHING changed,
+                // so it matches every key. A guard that only compared hashes would
+                // let a value the clear removed straight back in.
+                if (r.hashes[i] === 'ffffffffffffffff' || r.hashes[i] === h) return true;
+            }
+            if (r.head <= cursor || r.head >= r.ringHead) return false;
+            cursor = r.head;
+        }
+    }
+
+    // Fill downward per minLevel. A worker cannot write L2 directly, so its
+    // promotion goes through the submission ring like any other write; a full
+    // ring sheds it, and "no promotion" is a benign failure.
+    #fillFromL3(key, rec, level) {
+        const cap = this.#l3TtlMs > 0
+            ? (rec.ttlMs ? Math.min(rec.ttlMs, this.#l3TtlMs) : this.#l3TtlMs)
+            : (rec.ttlMs || 0);
+        if (level <= 2) {
+            if (this.#id === 0) native.set(key, rec.value, 0, cap);
+            else if (this.#ringIdx >= 0) { if (native.submitSet(key, rec.value, cap)) this.#ringDoorbell(); }
+        }
+        if (level === 1) {
+            const v = this.#codec && !this.#l1Decoded ? rec.value : this.#decodeFromL3(rec.value);
+            this.#l1Put(key, v, native.hashKey(key), this.#noCodec ? 0 : rec.value.length,
+                        cap ? monoMs() + cap : 0);
+        }
+    }
+
+    #decodeFromL3(enc) { return this.#codec ? this.#codec.decode(enc) : enc; }
+
+    // The single reporting path for a background L3 failure. The listener is
+    // the caller's, so it can throw; that is not our failure to propagate.
+    #reportL3(e, op) {
+        if (this.#onL3Error) { try { this.#onL3Error(e, op); } catch { /* not ours */ } }
     }
 
     // The L3 half of a write, shared by `set` and `setAsync`. The sync caller

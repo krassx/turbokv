@@ -76,6 +76,63 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         c.close();
     }
 
+    // 7. getAsync reads through to L3 and fills the local tiers
+    {
+        const f = makeFake();
+        f.store.set('r1', { value: 'from-l3', expiresAt: 0 });
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(await c.getAsync('r1') === 'from-l3', 'getAsync reads through to L3');
+        ok(c.get('r1') === 'from-l3', 'and the value is now local');
+        ok(c.stats.l3Hits === 1, `L3 hits are counted (${c.stats.l3Hits})`);
+        c.close();
+    }
+
+    // 8. concurrent misses on one key share a single L3 request
+    {
+        const f = makeFake();
+        f.store.set('r2', { value: 'v', expiresAt: 0 });
+        f.latency.set('get', 30);
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        const all = await Promise.all([c.getAsync('r2'), c.getAsync('r2'), c.getAsync('r2')]);
+        ok(all.every(v => v === 'v'), 'every caller gets the value');
+        const gets = f.calls.filter(x => x[0] === 'get').length;
+        ok(gets === 1, `concurrent misses share one request (made ${gets})`);
+        c.close();
+    }
+
+    // 9. minLevel L3 returns the value without storing it anywhere local
+    {
+        const f = makeFake();
+        f.store.set('r3', { value: 'v', expiresAt: 0 });
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(await c.getAsync('r3', { minLevel: TurboKV.L3 }) === 'v', 'the value is returned');
+        ok(c.l1Size === 0 && c.get('r3') === undefined, 'nothing was stored locally');
+        c.close();
+    }
+
+    // 10. a miss and a failed read are both misses, and the read failure is
+    //     reported through the ONE listener path -- exactly once
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(await c.getAsync('absent') === undefined, 'a key L3 does not have is undefined');
+        ok(c.stats.l3Misses === 1, `the miss is counted (${c.stats.l3Misses})`);
+        c.close();
+    }
+    {
+        const f = makeFake();
+        f.fail.set('get', new Error('L3 read down'));
+        const errs = [];
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter,
+                                onL3Error: (e, op) => errs.push(op.kind) });
+        ok(await c.getAsync('r4') === undefined, 'a failed L3 read is a miss, not a throw');
+        ok(c.stats.l3Misses === 1, `the failed read is counted as a miss (${c.stats.l3Misses})`);
+        ok(errs.length === 1 && errs[0] === 'get',
+           `the read failure is reported once, as a get (${errs.join(',')})`);
+        ok(c.lastError === null, `a background L3 failure still does not touch lastError (${c.lastError})`);
+        c.close();
+    }
+
     console.log(fail ? `  ${fail} failed` : '  [l3-api] all passed');
     process.exit(fail ? 1 : 0);
 })();
