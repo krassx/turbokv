@@ -57,14 +57,33 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
     }
 
     // 5. minLevel L3 does not store locally, and a failed L3 write stores nothing
+    //
+    // "Does not store locally" means BOTH local tiers, not just L1. Asserting
+    // l1Size alone let a real defect through: the write path split
+    // `minLevel === 1` from everything else and then ran the L2 write
+    // unguarded, so the value landed in the shared arena while the adapter was
+    // told `willCache: false` -- a remote store registering no interest for a
+    // key this box is in fact holding, which is a permanent cross-box stale
+    // read. get() consults L1 and then L2, so with L1 empty it is exactly the
+    // L2 probe this was missing.
     {
         const f = makeFake();
         const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
         ok(await c.setAsync('k5', 'v5', { minLevel: TurboKV.L3 }) === true, 'minLevel L3 write succeeds');
         ok(c.l1Size === 0, 'nothing was put in L1');
+        ok(c.get('k5') === undefined, `and nothing in L2 either (${c.get('k5')})`);
         ok(f.store.get('k5').value === 'v5', 'the value is in L3');
         ok(f.calls.some(x => x[0] === 'set' && x[1] === 'k5' && x[2] === false),
            'the adapter is told willCache:false');
+        // A copy ALREADY resident has to go, for the same reason the L1 copy
+        // does: the caller asked for this value not to live here, and leaving
+        // the previous one behind would serve it as though it were current --
+        // this option would produce stale reads instead of misses.
+        await c.setAsync('k5b', 'old');
+        ok(c.get('k5b') === 'old', 'sanity: the ordinary write is resident locally');
+        ok(await c.setAsync('k5b', 'new', { minLevel: TurboKV.L3 }) === true, 'the L3-only overwrite succeeds');
+        ok(c.get('k5b') === undefined, `the resident copy is evicted, not left stale (${c.get('k5b')})`);
+        ok(f.store.get('k5b').value === 'new', 'and L3 holds the new value');
         c.close();
     }
 
@@ -320,6 +339,76 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         await p3;
         ok(f.calls.filter(x => x[0] === 'close').length === 1,
            'a third call, after resolution, still does not re-invoke the adapter');
+    }
+
+    // 23. l3FailTtlMs, the ABANDONED route. Decision 68: "on failure the value
+    //     is KEPT locally under a short TTL: serve through the outage,
+    //     converge afterwards". Without the cap a write L3 never accepted
+    //     disagrees with L3 for as long as its own TTL says -- forever for the
+    //     common ttlMs:0 -- which is the split brain the option exists to bound.
+    {
+        const f = makeFake();
+        f.fail.set('set', new Error('L3 down'));
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 10, l3FailTtlMs: 60 });
+        ok(await c.setAsync('ft1', 'v') === false, 'the write is abandoned and resolves false');
+        await delay(5);
+        ok(c.get('ft1') === 'v', 'and is still served locally: through the outage');
+        ok(c.stats.l3FailTtlApplied === 1, `the cap is applied and counted (${c.stats.l3FailTtlApplied})`);
+        await delay(140);
+        ok(c.get('ft1') === undefined,
+           `past l3FailTtlMs the local copy is gone, so the box converges on L3 (${c.get('ft1')})`);
+        c.close();
+    }
+
+    // 24. l3FailTtlMs, the SHED route. The spec's failure matrix says the same
+    //     thing for a write shed past l3QueueMaxBytes as for one abandoned past
+    //     l3RetryMs: "keep, capped at l3FailTtlMs". A shed write never reaches
+    //     the adapter at all, so it is the route most likely to be forgotten.
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3QueueMaxBytes: 1, l3FailTtlMs: 60 });
+        ok(await c.setAsync('ft2', 'v') === false, 'a write shed past l3QueueMaxBytes resolves false');
+        await delay(5);
+        ok(c.get('ft2') === 'v', 'and is still served locally');
+        ok(c.stats.l3FailTtlApplied === 1, `the cap is applied to a shed write too (${c.stats.l3FailTtlApplied})`);
+        ok(f.calls.filter(x => x[0] === 'set').length === 0, 'the shed write never reached the adapter');
+        await delay(140);
+        ok(c.get('ft2') === undefined, `a shed write reverts on the same schedule (${c.get('ft2')})`);
+        c.close();
+    }
+
+    // 24b. the cap SHORTENS and never lengthens, and it recognises a BINARY
+    //      value in L2 -- which comes back out of the arena as a different
+    //      Buffer object than the one that went in, so an identity comparison
+    //      would decide the arena no longer held our value and skip the cap for
+    //      every binary write there is.
+    {
+        const f = makeFake();
+        f.fail.set('set', new Error('L3 down'));
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3RetryMs: 10, l3FailTtlMs: 60 });
+        ok(await c.setAsync('ftb', Buffer.from('binary')) === false, 'the binary write is abandoned');
+        await delay(5);
+        ok(c.stats.l3FailTtlApplied === 1, `a binary value is recognised and capped (${c.stats.l3FailTtlApplied})`);
+        // A write whose own TTL is already shorter keeps it: the cap is a
+        // ceiling on the disagreement, not a floor on the lifetime.
+        ok(await c.setAsync('fts', 'v', { ttlMs: 20 }) === false, 'the short-TTL write is abandoned too');
+        await delay(60);
+        ok(c.get('fts') === undefined, `the shorter of the two deadlines wins (${c.get('fts')})`);
+        await delay(80);
+        ok(c.get('ftb') === undefined, `and the binary value reverts on schedule (${c.get('ftb')})`);
+        c.close();
+    }
+
+    // 25. a write whose L3 half SUCCEEDS is not capped: the cap is a failure
+    //     policy, not a ceiling on every write's lifetime.
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3FailTtlMs: 30 });
+        ok(await c.setAsync('ft3', 'v') === true, 'the write lands in L3');
+        await delay(90);
+        ok(c.get('ft3') === 'v', `a successful write keeps its own lifetime (${c.get('ft3')})`);
+        ok(c.stats.l3FailTtlApplied === undefined, 'and no cap was applied');
+        c.close();
     }
 
     // 27. a HUNG adapter read -- one that neither resolves nor rejects -- is a

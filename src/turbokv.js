@@ -192,6 +192,27 @@ const monoMs = () => performance.now();
 // that is not already a string.
 function isStringKey(k) { return typeof k === 'string'; }
 
+// Wire size of an encoded value, in BYTES. Not `.length`: that is UTF-16 units
+// for a string (so a multi-byte value undercounts) and `undefined` for a
+// bytes-mode number, boolean or bigint, which poisons any total it is added to.
+// 8 is what set() charges a scalar against the arena bound, and the two
+// measurements must agree or the same value is two different sizes depending on
+// which bound is asking.
+function encodedBytes(enc) {
+    if (typeof enc === 'string') return Buffer.byteLength(enc);
+    return Buffer.isBuffer(enc) ? enc.length : 8;
+}
+
+// Is the arena still holding exactly the value we wrote? Buffers compare by
+// content -- a binary value read back out of L2 is a different Buffer object
+// than the one that went in, so `===` would answer "no" for every binary value
+// and the caller would skip a step it should have taken.
+function sameStored(a, b) {
+    if (Buffer.isBuffer(a) || Buffer.isBuffer(b))
+        return Buffer.isBuffer(a) && Buffer.isBuffer(b) && a.equals(b);
+    return a === b;
+}
+
 // The storage presets. Anything else is a misconfiguration, not a mode.
 const STORAGE_MODES = ['bytes', 'direct', 'safe', 'primitives'];
 
@@ -1403,11 +1424,75 @@ class TurboKV {
     #queueSet(key, enc, ttlMs, level) {
         if (!this.#queue) return Promise.resolve(true);
         this.stats.l3Sets = (this.stats.l3Sets || 0) + 1;
-        return this.#queue.push({
+        const p = this.#queue.push({
             kind: 'set', key, value: enc, ttlMs,
             willCache: this.#willCacheWrite(level),
-            bytes: (typeof enc === 'string' ? enc.length : enc.length) + key.length + 48,
+            originId: this.#originId(),
+            // The same measurement set() makes for the arena bound, rather than
+            // a second one that disagrees with it. Both arms of the old
+            // expression were `enc.length`, so a multi-byte string undercounted
+            // -- and a bytes-mode number or boolean, which has no `.length` at
+            // all, made this NaN, and `NaN + op.bytes > maxBytes` is false
+            // forever: the queue's byte bound stopped existing for that op and
+            // for every op behind it.
+            bytes: encodedBytes(enc) + key.length + 48,
         });
+        // Decision 68 and the spec's failure matrix: a write L3 did not accept
+        // is KEPT locally, under a SHORT TTL -- serve through the outage, then
+        // converge. Without the cap, a write that failed once diverges from L3
+        // for as long as its own TTL says, which for the common `ttlMs: 0` is
+        // forever: exactly the split brain `l3FailTtlMs` was added to bound.
+        // Both abandonment routes settle false and so both land here: an op
+        // that outlived `l3RetryMs`, and one shed on the spot past
+        // `l3QueueMaxBytes`.
+        //
+        // Nothing to cap at level 3: nothing was written locally to begin with.
+        if (this.#l3FailTtlMs > 0 && level < 3) {
+            // `p` itself is what the caller gets; this is a branch off it, so
+            // the caller still observes the queue's own outcome unchanged.
+            p.then((landed) => { if (!landed) this.#capAfterL3Failure(key, enc, ttlMs); },
+                   () => { /* push() never rejects; this is belt and braces */ });
+        }
+        return p;
+    }
+
+    // Cap what the local tiers hold for `key` at `l3FailTtlMs`.
+    //
+    // SHORTENING ONLY. An entry that already expires sooner keeps its own
+    // deadline, and a key that is no longer resident is left alone rather than
+    // resurrected -- the point is to bound how long this box may disagree with
+    // L3, never to put anything back.
+    #capAfterL3Failure(key, enc, ttlMs) {
+        const cap = ttlMs > 0 ? Math.min(ttlMs, this.#l3FailTtlMs) : this.#l3FailTtlMs;
+        // Counted once per failed write that actually re-timed something, so
+        // the counter means "a local copy was capped", not "a write failed" --
+        // stats.l3SetFailed already says the latter.
+        let applied = false;
+        const e = this.#l1.get(key);
+        if (e !== undefined) {
+            const deadline = monoMs() + cap;
+            if (!e.exp || e.exp > deadline) { e.exp = deadline; applied = true; }
+        }
+        if (this.#capL2AfterL3Failure(key, enc, cap)) applied = true;
+        if (applied) this.stats.l3FailTtlApplied = (this.stats.l3FailTtlApplied || 0) + 1;
+    }
+
+    // L2 has no "retime this entry" operation, so the cap has to be applied by
+    // writing the value again -- which is only safe while the arena still holds
+    // THIS value. If a later write already superseded it, or a delete removed
+    // it, rewriting would resurrect an older value, and a stale value is the
+    // one failure mode this system does not accept. A local entry that outlives
+    // its cap because the compare missed costs a longer disagreement; getting
+    // it wrong the other way costs correctness.
+    #capL2AfterL3Failure(key, enc, cap) {
+        if (!storeReady || this.#primaryDead) return false;
+        if (this.#pendingDel.size && this.#pendingDel.has(key)) return false;
+        let cur;
+        try { cur = native.get(key); } catch { return false; }
+        if (cur === undefined || !sameStored(cur, enc)) return false;
+        if (this.#id === 0) return native.set(key, enc, 0, cap) === true;
+        if (this.#ringIdx >= 0 && native.submitSet(key, enc, cap)) { this.#ringDoorbell(); return true; }
+        return false;
     }
 
     // Local first, then L3. L3-first was rejected: when the remote is
@@ -1521,8 +1606,7 @@ class TurboKV {
         // and reported as success.
         // UTF-8 BYTES, not UTF-16 units: the old check accepted values the
         // primary then rejected, destroying the previous value silently.
-        const encLen = typeof enc === 'string' ? Buffer.byteLength(enc)
-            : (Buffer.isBuffer(enc) ? enc.length : 8);
+        const encLen = encodedBytes(enc);
         if (encLen + key.length + 48 > this.#maxValue) {
             this.stats.rejectedSize++;
             this.lastError = `value ${encLen}B exceeds the ${this.#maxValue}B arena limit`;
@@ -1557,6 +1641,32 @@ class TurboKV {
                 this.#pendingDel.add(key);
                 this.#pendingDelHash.set(native.hashKey(key), key);
             }
+        }
+        // `minLevel: L3` means NOTHING is written locally -- spec 5.2, and the
+        // read path has always agreed (`#fillFromL3` fills only at `level <= 2`).
+        // The write path did not: it split `minLevel === 1` from everything
+        // else and then ran the L2 write unguarded, so the value landed in the
+        // shared arena while the adapter was told `willCache: false`. That half
+        // is the dangerous one: a remote store registers no interest for a key
+        // this box is in fact holding, so it sends no invalidation for it and
+        // the stale read is permanent and cross-box.
+        //
+        // Any copy ALREADY in L2 has to go, for exactly the reason the L1 copy
+        // above does: the caller asked for this value not to live here, and
+        // leaving the previous one resident would serve it as though it were
+        // current -- this option would produce stale reads instead of misses.
+        if (minLevel === 3) {
+            if (this.#id === 0) {
+                native.del(key, 0);
+                TurboKV.#dropOthers(key, this);
+            } else if (!this.#primaryDead) {
+                // A worker already marked the key pendingDel above, so its own
+                // reads miss until the eviction comes back around the ring.
+                if (this.#ringIdx >= 0) { if (native.submitDel(key)) this.#ringDoorbell(); }
+                else { this.#outbox.push('d', key, null, 0); this.#schedule(key.length + 48); }
+            }
+            this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
+            return true;
         }
         if (this.#id === 0) {
             const ok = native.set(key, enc, 0, ttlMs) === true;
