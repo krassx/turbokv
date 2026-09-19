@@ -370,22 +370,38 @@ export interface CacheStats {
      *  bound. NOT a cap whose outcome is merely unknown either — that is
      *  `l3FailTtlUnconfirmed`, and keeping the two apart is the point.
      *
-     *  So every count here means a value L3 rejected is resident in the
-     *  shared arena with no expiry, visible to every process on the box. It
-     *  is a LOWER bound, never an inflated one: where the answer cannot be
-     *  established the count goes to `l3FailTtlUnconfirmed` instead. */
+     *  So every count here means **the cap did not land** — not, in general,
+     *  that anything is resident: on a degraded worker, or when the batch
+     *  that was shed carried the write itself beside the cap, there may be
+     *  nothing in the arena at all, or no arena. What it always means is that
+     *  `l3FailTtlMs` did not bound this key, so if L2 does hold the value L3
+     *  rejected, nothing is going to expire it.
+     *
+     *  A LOWER bound, never an inflated one: where the answer cannot be
+     *  established the count goes to `l3FailTtlUnconfirmed` instead — and on
+     *  a busy box that is most of them, because the invalidation ring laps
+     *  far faster than a cap's window. Watch both. */
     l3FailTtlUnapplied?: number;
     /** Caps that were handed to the primary and whose outcome this process
-     *  can no longer establish, counted once each. Three ways: the worker
+     *  can no longer establish, counted once each. Four ways: the worker
      *  degraded or closed before the read guard's window ran out; the
      *  invalidation ring had lapped past the cap's mark, so it cannot say
-     *  whether anybody rewrote the key; or no guard entry could be kept at
-     *  all, because more than 4096 caps were outstanding.
+     *  whether anybody rewrote the key; the only record for the key inside
+     *  the window carried this handle's own writer id, which a shared-memory
+     *  submission and an `'ipc'` worker's batch can both produce (ring slot
+     *  plus one, and the sender's id, are not separate spaces); or no guard
+     *  entry could be kept at all, because more than 4096 caps were
+     *  outstanding.
      *
      *  Each of these may have landed perfectly. It is counted because "this
-     *  process stopped being able to tell" is itself worth seeing — a rising
-     *  number here during an L3 outage means `l3FailTtlUnapplied` is
-     *  under-reporting, not that the box is healthy. */
+     *  process stopped being able to tell" is itself worth seeing.
+     *
+     *  **On a busy box this is the normal bucket**, not the exception: the
+     *  invalidation ring holds at most 65536 records — on the order of 100ms
+     *  of primary writes under load — against roughly 7s from a cap's mark to
+     *  its retirement at the default `l3FailTtlMs`. A rising number here
+     *  during an L3 outage means `l3FailTtlUnapplied` is under-reporting, not
+     *  that the box is healthy. */
     l3FailTtlUnconfirmed?: number;
     /** L3 hits returned to the caller but not promoted, because SOMEONE ELSE
      *  changed the key while the read was in flight, or the ring could not

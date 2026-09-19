@@ -155,9 +155,17 @@ scripts/                          build helpers
   for when an `l3` write fails all still travel as cluster messages and are
   applied nowhere else. Route the ring doorbell but not these and a value L3
   rejected stays in the shared arena with no expiry, for every process, until
-  something overwrites it — watch `stats.l3FailTtlUnapplied`, which is what
-  moves when it happens. Call `TurboKV.releaseWorker()` on `'exit'` and
+  something overwrites it. Call `TurboKV.releaseWorker()` on `'exit'` and
   `'disconnect'` for the same reason.
+- **Watching for that**: `stats.l3FailTtlUnapplied` counts caps *proven* not to
+  have landed, and `stats.l3FailTtlUnconfirmed` counts those whose outcome the
+  worker could not establish. **Watch both, and expect the second one.** The
+  proof needs the invalidation ring to still reach back to the moment the cap
+  was taken; the ring holds at most 65536 records, on the order of 100ms of
+  primary writes under load, against roughly 7 seconds from a cap's mark to its
+  retirement at the default `l3FailTtlMs`. So on a busy box `Unapplied` goes
+  quiet and `Unconfirmed` becomes the normal bucket — an operator watching only
+  the first would see nothing during exactly the outage this exists for.
 
 The full design, decision log and measurements — including what was built and
 rejected — are in [DESIGN.md](DESIGN.md).

@@ -268,34 +268,113 @@ if (process.env.TCR3_ROLE === 'lostcap') {
     (async () => {
         const f = makeFake();
         f.fail.set('set', new Error('l3 down'));
-        // A QUEUE THAT SHEDS EVERYTHING, so the L3 write is abandoned in a
-        // microtask -- before the ring doorbell has even fired, let alone been
-        // drained. The cap's ring mark is therefore taken BEFORE the record
-        // for this worker's own write exists, which is what makes the "skip my
-        // own writer id" half of the retirement oracle load-bearing: without
-        // it the worker's own write looks like somebody else's rewrite and
-        // suppresses the verdict on every cap it ever takes.
         const w = TurboKV.attachWorker(process.env.TCR3_ARENA, 1,
-            { storage: 'bytes', l3: f.adapter, l3QueueMaxBytes: 1, l3FailTtlMs: 100 });
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 200, l3FailTtlMs: 100 });
         ok(w.transport === 'shm', `the worker is on the shm transport (${w.transport})`);
-        ok(await w.setAsync('lost', 'REFUSED') === false, 'the L3 write failed');
-        // The parent drains the ring on the doorbell, so the WRITE lands --
-        // it is only the cap request it never applies.
+
+        // THE WRITE REACHES L2 BEFORE THE CAP IS TAKEN, deliberately: the
+        // cap's ring mark is then PAST this worker's own record for the key,
+        // so the retirement walk contains no record of ours at all and the
+        // verdict can be proven rather than merely suspected. The parent
+        // routes the ring doorbell, so this is one hop.
+        w.set('lost', 'REFUSED');
         for (let i = 0; i < 80 && native.get('lost') === undefined; i++) { await sleep(25); w.get('poke'); }
         ok(native.get('lost') === 'REFUSED', `the write reached the shared arena (${native.get('lost')})`);
-        ok(native.lastTtlRemainingMs() === 0,
-           `and sits there with no expiry, because the cap was never applied (${native.lastTtlRemainingMs()})`);
+        await w.drainL3();                       // the L3 write is abandoned; the cap is taken now
+        await sleep(50);
+        ok(w.__unsafeCapState().caps === 1, `a read guard is outstanding (${w.__unsafeCapState().caps})`);
+        ok(native.get('lost') === 'REFUSED' && native.lastTtlRemainingMs() === 0,
+           `and the arena still holds it with no expiry (${native.lastTtlRemainingMs()})`);
         ok((w.stats.l3FailTtlApplied || 0) >= 1,
            `the L1 half alone reports success (${w.stats.l3FailTtlApplied})`);
-        // ...which is exactly why the other side has to move too.
+
+        // ...which is exactly why the other side has to move too. The parent
+        // never calls applyBatch, so the request was sent and never applied.
         for (let i = 0; i < 240 && !(w.stats.l3FailTtlUnapplied > 0); i++) await sleep(25);
-        ok((w.stats.l3FailTtlUnapplied || 0) >= 1,
-           `the silence is counted, not silent (${w.stats.l3FailTtlUnapplied})`);
         ok((w.stats.l3FailTtlUnapplied || 0) === 1,
-           `and counted once (${w.stats.l3FailTtlUnapplied})`);
+           `the silence is counted, once (${w.stats.l3FailTtlUnapplied})`);
         ok((w.stats.l3FailTtlUnconfirmed || 0) === 0,
            `in the bucket that means PROVEN, not the unknowable one (${w.stats.l3FailTtlUnconfirmed})`);
+
+        // AND THE OTHER ORDERING IS NOT PROVEN, AND MUST NOT CLAIM TO BE. A
+        // queue that sheds everything abandons the write in a microtask, so
+        // the cap's mark is taken BEFORE this worker's own record for the key
+        // exists -- and a record bearing our own writer id cannot be told
+        // from one written by an ipc-transport worker whose id happens to
+        // equal our ring slot plus one. Unknowable, not proven.
+        const w2 = TurboKV.attachWorker(process.env.TCR3_ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3QueueMaxBytes: 1, l3FailTtlMs: 100 });
+        ok(await w2.setAsync('amb', 'REFUSED') === false, 'a shed L3 write');
+        for (let i = 0; i < 240 && !((w2.stats.l3FailTtlUnapplied || 0) + (w2.stats.l3FailTtlUnconfirmed || 0)); i++) {
+            await sleep(25); w2.get('poke');
+        }
+        ok((w2.stats.l3FailTtlUnconfirmed || 0) === 1,
+           `an own-writer record inside the window is unconfirmed (${w2.stats.l3FailTtlUnconfirmed})`);
+        ok((w2.stats.l3FailTtlUnapplied || 0) === 0,
+           `and never proven (${w2.stats.l3FailTtlUnapplied})`);
+        w2.close();
         done(w, 'lost-cap');
+    })();
+    return;
+}
+
+// -- the writer id cannot identify us, and must not be trusted to ---------
+// Shared-memory submissions are stamped with the RING SLOT plus one; an IPC
+// batch is stamped with the sender's WRITER ID; nothing keeps those two
+// spaces apart. A shm worker holding slot 0 compares against `mine = 1` and
+// cannot tell its own record from one written by a `transport: 'ipc'` worker
+// that was given id 1 -- so skipping "our own" record hid a genuine
+// cross-process rewrite and reported a proven loss about somebody else's
+// fresh write. Systematic in an oversubscribed or mixed-transport cluster.
+//
+// The worker here takes a cap that is never applied (the parent does not
+// route its batches); a SECOND PROCESS on the ipc transport, with id 1, then
+// writes byte-identical unbounded bytes. Nothing was lost -- someone rewrote
+// the key -- and the honest verdict is `unconfirmed`, never `unapplied`.
+if (process.env.TCR3_ROLE === 'collide') {
+    (async () => {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const w = TurboKV.attachWorker(process.env.TCR3_ARENA, 5,
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 200, l3FailTtlMs: 120 });
+        ok(w.transport === 'shm', `the worker is on the shm transport (${w.transport})`);
+        // Its own record lands BEFORE the mark (see the lostcap role), so the
+        // only record inside the window is the other process's.
+        w.set('col', 'SAME');
+        for (let i = 0; i < 80 && native.get('col') === undefined; i++) { await sleep(25); w.get('poke'); }
+        ok(native.get('col') === 'SAME', `the write reached the arena (${native.get('col')})`);
+        await w.drainL3();
+        await sleep(50);
+        ok(w.__unsafeCapState().caps === 1, `a read guard is outstanding (${w.__unsafeCapState().caps})`);
+
+        // The colliding writer: a different PROCESS, ipc transport, id 1 --
+        // which is this worker's ring slot (0) plus one.
+        process.send({ step: 'collide' }); await step('collided');
+        for (let i = 0; i < 80; i++) { await sleep(25); w.get('poke'); if (w.stats.invalidated > 0) break; }
+        ok(native.get('col') === 'SAME' && native.lastTtlRemainingMs() === 0,
+           `the rewrite is resident and unbounded, exactly as a lost cap looks ` +
+           `(${native.get('col')}/${native.lastTtlRemainingMs()})`);
+
+        await sleep(2400);                       // past deadline + L3_CAP_WINDOW_MS
+        ok((w.stats.l3FailTtlUnapplied || 0) === 0,
+           `a rewrite by a colliding writer id is never reported as proven (${w.stats.l3FailTtlUnapplied})`);
+        ok((w.stats.l3FailTtlUnconfirmed || 0) === 1,
+           `it is unknowable, and says so (${w.stats.l3FailTtlUnconfirmed})`);
+        done(w, 'writer-collision');
+    })();
+    return;
+}
+
+// A bare ipc-transport writer, forked by the parent for the role above. Its
+// writer id is what the primary stamps on the records applyBatch applies.
+if (process.env.TCR3_ROLE === 'ipcwriter') {
+    (async () => {
+        const w = TurboKV.attachWorker(process.env.TCR3_ARENA, 1, { storage: 'bytes', transport: 'ipc' });
+        w.set('col', 'SAME');
+        w.flush();
+        await sleep(200);
+        w.close();
+        process.exit(0);
     })();
     return;
 }
@@ -641,6 +720,20 @@ const drainAll = () => { let g = 0; while (TurboKV.drainSubmissions(8192) > 0 &&
     {
         const code = await runChild('capmax', ARENA + '8', {}, () => {}, undefined, false);
         ok(code === 0, `the cap-max cases passed (child exited ${code})`);
+    }
+    {
+        // `route: false` for the cap holder -- its request must never be
+        // applied -- while the colliding writer, forked below, IS routed, so
+        // its record really reaches the arena stamped with its own id.
+        const code = await runChild('collide', ARENA + '9', {}, (s, p, state, kid) => {
+            if (s !== 'collide') return;
+            const w2 = fork(__filename, [], {
+                env: { ...process.env, TCR3_ROLE: 'ipcwriter', TCR3_ARENA: ARENA + '9' }, stdio: 'inherit',
+            });
+            w2.on('message', (m) => { if (TurboKV.isCacheMessage(m)) TurboKV.applyBatch(m); });
+            w2.on('exit', () => kid.send({ step: 'collided' }));
+        }, undefined, false);
+        ok(code === 0, `the writer-collision cases passed (child exited ${code})`);
     }
     {
         const code = await runChild('oldrecord', ARENA + '5', {}, (s, p, state, kid) => {

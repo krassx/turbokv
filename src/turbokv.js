@@ -2322,36 +2322,63 @@ class TurboKV {
             let h;
             try { h = native.hashKey(key); } catch { h = undefined; }
             if (h === undefined) { this.#capEntryUnconfirmed(c); continue; }
-            if (touched.set.has(h)) continue;              // somebody wrote it; not lost
+            if (touched.other.has(h)) continue;            // somebody else wrote it; not lost
+            // A RECORD THAT COULD BE OURS, AND COULD BE SOMEBODY ELSE'S. See
+            // #ringWritersSince: the two writer-id spaces overlap, so this is
+            // the honest answer rather than a skip that would hide a real
+            // rewrite.
+            if (touched.mine.has(h)) { this.#capEntryUnconfirmed(c); continue; }
             this.#capUnapplied(key);
         }
     }
 
-    // Hashes written by SOMEONE OTHER THAN THIS HANDLE at or past `from`, or
-    // null when the ring cannot say (lapped, or detached mid-walk).
+    // Hashes written at or past `from`, split by whether the writer id on the
+    // record is ours. Null when the ring cannot say (lapped, or detached
+    // mid-walk).
     //
-    // Our own writer id is what the primary stamps on the records it applies
-    // from our submissions: the ring slot plus one for the shared-memory
-    // transport, our writer id for the IPC batch. The primary's own writes are
-    // 0, so a cap the primary applied -- and a rewrite by the primary -- both
-    // count as somebody else, which is correct.
+    // THE SPLIT IS NOT A SKIP, and that distinction is the whole of this
+    // method. The write being capped is one of OUR records and would suppress
+    // every verdict if it counted as "somebody wrote it" -- but a writer id
+    // cannot actually identify us. The primary stamps a shared-memory
+    // submission with its RING SLOT plus one and an IPC batch with the
+    // sender's WRITER ID, and nothing keeps those two spaces apart: a shm
+    // worker holding slot 0 (`mine` = 1) cannot tell its own record from one
+    // written by a `transport: 'ipc'` worker that happens to have been given
+    // id 1. Treating that as ours HIDES a genuine cross-process rewrite, which
+    // is the exact false fire this oracle was added to stop, reached one step
+    // further in. Treating it as somebody else's hides every real loss.
+    //
+    // So neither: a hash seen ONLY on records bearing our own id is reported
+    // as ambiguous, and the cap is counted `unconfirmed` rather than proven
+    // either way. It fails safe, which is what a counter whose whole value is
+    // being believed needs, and it costs the `unapplied` bucket only the cases
+    // where this worker's own write for the key landed INSIDE the cap's
+    // window -- everything drained before the mark is not in the walk at all.
+    //
+    // The alternatives were a transport tag on the record (a TCS_LAYOUT bump
+    // and a C++ change, for a diagnostic counter) or comparing on the pair
+    // (the same, since the pair is not in the record).
+    //
+    // BOUNDED, like #primaryInvalidate's walk: `wrapped` is the ordinary exit,
+    // but a producer faster than this loop could otherwise keep it going, and
+    // this runs on a timer with the event loop to itself.
     #ringWritersSince(from) {
         const mine = this.#ringIdx >= 0 ? this.#ringIdx + 1 : this.#id;
-        const set = new Set();
+        const other = new Set(), own = new Set();
         let cursor = from, all = false;
-        for (;;) {
+        for (let round = 0; round < 64; round++) {
             let r;
             try { r = native.ringRead(cursor, 1024); } catch { return null; }
             if (!r || r.wrapped) return null;
             for (let i = 0; i < r.hashes.length; i++) {
                 if (r.hashes[i] === 'ffffffffffffffff') { all = true; continue; }
-                if (r.writers[i] === mine) continue;       // the write being capped is ours
-                set.add(r.hashes[i]);
+                if (r.writers[i] === mine) own.add(r.hashes[i]);
+                else other.add(r.hashes[i]);
             }
             if (r.head <= cursor || r.head >= r.ringHead) break;
             cursor = r.head;
         }
-        return { set, all };
+        return { other, mine: own, all };
     }
 
     // Is the arena's copy of `key` one this worker has already asked to be
@@ -2406,9 +2433,13 @@ class TurboKV {
         // not the request reaches the primary: until the cap lands, this
         // worker must stop serving the uncapped L2 copy at the deadline.
         this.#noteCap(key, enc, cap);
-        if (this.#retimeOutbox(key, enc, cap)) return 'capped';
-        this.#capUnapplied(key);
-        return 'unable';
+        // QUEUED, NOT CONFIRMED, so there is no failure to report here: the
+        // push into the outbox cannot fail, and everything that can go wrong
+        // afterwards is counted by flush() or by the guard's retirement. This
+        // used to test a return value that was always true, so the branch
+        // under it was unreachable.
+        this.#retimeOutbox(key, enc, cap);
+        return 'capped';
     }
 
     // THE CONDITIONAL RE-TIME, and the only place a cap is ever written.
@@ -3767,11 +3798,12 @@ class TurboKV {
     // Like #publishOutbox this is queued rather than confirmed: flush() can
     // shed the batch under congestion, and a shed one is counted as
     // l3FailTtlUnapplied there rather than silently lost.
+    // No return value, deliberately: the push cannot fail, and saying so with
+    // an always-true boolean grew a branch that could never run.
     #retimeOutbox(key, enc, cap) {
         this.#outbox.push('r', key, enc, cap);
         (this.#outboxCapKeys || (this.#outboxCapKeys = [])).push(key);
         this.#schedule(encodedBytes(enc) + key.length + 48);
-        return true;
     }
 
     // The no-key form, for a clear: it removes EVERY key, so it supersedes
@@ -3784,6 +3816,18 @@ class TurboKV {
     // anyone will read, so there is no divergence to report. Counting here
     // would put ordinary write traffic into a number that is supposed to mean
     // "this box is holding something L3 rejected, unbounded".
+    //
+    // "SUPERSEDED" IS NOT ALWAYS TRUE, AND THE GAP IS DELIBERATE. #publishOutbox
+    // cancels on a write that is only QUEUED -- flush() can still shed that
+    // batch -- so a cap dropped here can turn out to have been superseded by
+    // nothing, leaving the value L3 refused resident and in neither bucket.
+    // That trade is decision 68's, made on the ranking this system is built
+    // on: a cap that arrives LATE re-publishes with a short deadline and
+    // bounds itself, while a cap that lands BEHIND a newer write puts an old
+    // value back, and a stale value is the failure this design does not
+    // accept. What is new here is only that the "moot" claim above must not
+    // be read as covering it: the counters cannot see this case, and the
+    // shed write that caused it is counted as `writesShed` instead.
     #cancelOwnCaps() { if (this.#l3Caps.size) { this.#l3Caps.clear(); this.#stopCapTimer(); } }
     #cancelCap(fullKey) { if (this.#l3Caps.size) this.#l3Caps.delete(fullKey); }
 
