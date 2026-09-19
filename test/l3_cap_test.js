@@ -168,14 +168,9 @@ if (process.env.TCC_ROLE === 'bulk') {
         // A PROMOTION IS A WRITE INTO THE RING, so it cancels an outstanding
         // cap exactly as set() does -- same mechanism, same consequence if it
         // does not (the cap lands behind the promotion and puts the value L3
-        // refused back over the value L3 holds). The window is narrower, and
-        // the route into it is this very design: the read guard is what makes
-        // a key with an outstanding cap miss locally, which is what sends the
-        // read to L3 to be promoted in the first place.
-        //
-        // Nothing drains here, so the write below never reaches L2 and its cap
-        // can never be submitted -- which is exactly the state the promotion
-        // has to cancel.
+        // refused back over the value L3 holds). The route into it is this
+        // very design: the read guard is what makes a key with an outstanding
+        // cap miss locally, which is what sends the read to L3 to be promoted.
         const f2 = makeFake();
         f2.fail.set('set', new Error('l3 down'));
         f2.store.set('promo', { value: 'L3VAL', expiresAt: 0 });
@@ -185,13 +180,33 @@ if (process.env.TCC_ROLE === 'bulk') {
         await w2.drainL3();
         await sleep(20);
         ok(w2.__unsafeCapState().caps === 1, `the failed write defers a cap (${w2.__unsafeCapState().caps})`);
-        await sleep(80);                          // past the 60ms cap
+        // Past the cap BEFORE the arena is told about the write: while the
+        // arena holds nothing for this key the poll cannot submit anything, so
+        // the cap is still outstanding when the drain below lands.
+        await sleep(80);
         ok(w2.__unsafeCapState().sent === 0,
-           `which cannot be submitted, because the write never reached L2 (${w2.__unsafeCapState().sent})`);
-        ok(w2.get('promo') === undefined, `so the key misses locally (${w2.get('promo')})`);
-        ok(await w2.getAsync('promo') === 'L3VAL', 'and reads through to L3');
+           `which cannot be submitted while the write is still in the ring (${w2.__unsafeCapState().sent})`);
+        process.send({ step: 'promo-written' });
+        await step('drained3');                   // arena now holds OURS, uncapped
+
+        // From here to the tick below there is no macrotask boundary: the fake
+        // adapter answers through microtasks, so the automatic poll cannot run
+        // in between. It MAY have run in the message turn above, which is why
+        // `sent` is reported rather than asserted -- the arena assertion at the
+        // end holds either way, and is the discriminating one when it is 0.
+        const raced = w2.__unsafeCapState().sent;
+        ok(w2.get('promo') === undefined,
+           `the read guard makes the key miss locally (${JSON.stringify(w2.get('promo'))})`);
+        ok(await w2.getAsync('promo') === 'L3VAL', 'so the read goes through to L3');
         ok(w2.__unsafeCapState().caps === 0,
-           `the promotion cancelled the outstanding cap (${w2.__unsafeCapState().caps})`);
+           `and the promotion cancelled the outstanding cap (${w2.__unsafeCapState().caps})`);
+        w2.__unsafeRunCaps();
+        process.send({ step: 'promoted' });
+        await step('drained4');
+        ok(native.get('promo') === 'L3VAL',
+           `the arena holds what L3 holds, not the value it refused ` +
+           `(${native.get('promo')}; poll had claimed ${raced} before the promotion)`);
+        ok(w2.get('promo') === 'L3VAL', `and the worker reads it (${w2.get('promo')})`);
         w2.close();
 
         w.close();
@@ -347,6 +362,12 @@ if (process.env.TCC_ROLE === 'slow') {
                 } else if (m && m.step === 'capped') {
                     TurboKV.drainSubmissions(20000);
                     kid.send({ step: 'drained2' });
+                } else if (m && m.step === 'promo-written') {
+                    TurboKV.drainSubmissions(20000);
+                    kid.send({ step: 'drained3' });
+                } else if (m && m.step === 'promoted') {
+                    TurboKV.drainSubmissions(20000);
+                    kid.send({ step: 'drained4' });
                 }
             });
             kid.on('exit', (c) => resolve(c));

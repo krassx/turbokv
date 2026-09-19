@@ -113,6 +113,7 @@ if (process.env.TCR_ROLE === 'worker') {
 if (process.env.TCR_ROLE === 'wrap') {
     (async () => {
         const f = makeFake();
+        for (let i = 0; i < 200; i++) f.store.set('many' + i, { value: 'L3MANY', expiresAt: 0 });
         const w = TurboKV.attachWorker(process.env.TCR_ARENA, 1, { storage: 'bytes', l3: f.adapter });
         const step = (want) => new Promise((r) => {
             const h = (m) => { if (m && m.step === want) { process.off('message', h); r(); } };
@@ -162,6 +163,34 @@ if (process.env.TCR_ROLE === 'wrap') {
         ok(f.calls.filter(x => x[0] === 'get' && x[1] === 'pend').length > askedBefore,
            'and the adapter was actually asked, rather than refused locally');
         ok(await w.hasAsync('pend') === true, 'hasAsync agrees');
+
+        // AND THE RECONCILIATION IS BUDGETED. #drain() runs from get() AND
+        // has(), and a ring that keeps lapping between reads makes every read
+        // wrap again -- so an unbudgeted pass over the 4096-mark bound, at
+        // 0.28ms, would be paid per read. A slice per drain, and the remainder
+        // carried forward rather than dropped, which is what stops the budget
+        // from reintroducing the leak it is bounding.
+        for (let i = 0; i < 200; i++) ok(w.delete('many' + i) === true || true, '');
+        fail = 0;                                  // the loop above asserts nothing
+        ok(w.__unsafeMarkState().pending === 200,
+           `200 marks outstanding (${w.__unsafeMarkState().pending})`);
+        process.send({ step: 'apply-and-wrap' });
+        await step('wrapped2');
+        w.get('poke');                             // the drain that finds the wrap
+        const afterOne = w.__unsafeMarkState();
+        ok(afterOne.pending === 200 - 64,
+           `one drain reconciles a slice, not all of them (${afterOne.pending} left of 200)`);
+        ok(afterOne.owed === 200 - 64, `and carries the remainder (${afterOne.owed})`);
+        for (let i = 0; i < 4; i++) w.get('poke');
+        const afterAll = w.__unsafeMarkState();
+        ok(afterAll.pending === 0, `later drains finish the job (${afterAll.pending} left)`);
+        ok(afterAll.owed === 0, `with nothing still owed (${afterAll.owed})`);
+        // The deletes went to L3 too, so put one back the way another process
+        // would -- otherwise this reads undefined for the honest reason.
+        await w.drainL3();
+        f.store.set('many199', { value: 'L3MANY', expiresAt: 0 });
+        const g = await w.getAsync('many199');
+        ok(g === 'L3MANY', `and the last of them is readable again (${JSON.stringify(g)})`);
 
         w.close();
         console.log(fail ? `  ${fail} failed (wrap)` : '  [l3-removal] wrapped-ring cases passed');
@@ -389,6 +418,7 @@ if (process.env.TCR_ROLE === 'shed') {
             { storage: 'bytes', maintenance: false });
         primary.set('pend', 'L2V');
         primary.set('keeper', 'K');
+        for (let i = 0; i < 200; i++) primary.set('many' + i, 'v');
         const code = await new Promise((resolve) => {
             const kid = fork(__filename, [], {
                 env: { ...process.env, TCR_ROLE: 'wrap', TCR_ARENA: ARENA + 'w' }, stdio: 'inherit',
@@ -401,9 +431,9 @@ if (process.env.TCR_ROLE === 'shed') {
                     for (let i = 0; i < 10000; i++) primary.set('noise' + i, 'x');
                     kid.send({ step: 'wrapped' });
                 } else if (m && m.step === 'apply-and-wrap') {
-                    // Now apply it, and lap the ring again -- so the record
-                    // that would have cleared the worker's mark is the one it
-                    // can never see.
+                    // Now apply them, and lap the ring again -- so the records
+                    // that would have cleared the worker's marks are the ones
+                    // it can never see.
                     TurboKV.drainSubmissions(20000);
                     for (let i = 0; i < 10000; i++) primary.set('more' + i, 'x');
                     kid.send({ step: 'wrapped2' });
@@ -455,6 +485,23 @@ if (process.env.TCR_ROLE === 'shed') {
            `a wrapped ring does not make the primary forget its own delete (${JSON.stringify(got)})`);
         ok(native.get('wrapdel') === undefined,
            `and nothing was written back into the arena (${native.get('wrapdel')})`);
+        await primary.close();
+    }
+
+    // L. #deletedAt EVICTS THE OLDEST RATHER THAN WIPING. It is the guard that
+    //    stops a caller being handed a value it deleted, and its bound used to
+    //    be a wholesale clear -- fine while entries arrived one delete at a
+    //    time, and not fine once a wrapped-ring reconciliation could push a
+    //    whole PENDING_DEL_MAX of them in at once. Ring positions are
+    //    monotonic, so the oldest entry is the least useful one to lose.
+    {
+        const f = makeFake();
+        const primary = TurboKV.createPrimary(ARENA + 'l', 8 << 20, 1 << 14,
+            { storage: 'bytes', maintenance: false, l3: f.adapter });
+        for (let i = 0; i < 4100; i++) primary.delete('gone' + i);
+        const st = primary.__unsafeMarkState();
+        ok(st.deletedAt === 4096,
+           `the guard stays full rather than being wiped at the bound (${st.deletedAt})`);
         await primary.close();
     }
 

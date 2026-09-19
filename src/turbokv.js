@@ -267,6 +267,14 @@ const L3_CAP_MAX = 4096;
 // because a wrapped ring no longer clears either of them (see #drain) and the
 // bound is now the only thing keeping them finite.
 const PENDING_DEL_MAX = 4096;
+// How many of those marks one drain may check against the arena after a wrapped
+// ring. A check is a has(), which copies no value, but #drain() runs from every
+// get() and has(), and a ring that keeps lapping between reads makes every read
+// wrap again -- so a full pass over the bound (measured at 0.28ms) would be
+// paid per read, ~28% of a core at 1k reads/s. Same shape and the same
+// reasoning as L3_CAP_SCAN, and the remainder is carried to the next drain
+// rather than dropped.
+const PENDING_DEL_SCAN = 64;
 let storeReady = false;
 let submitName = null;    // primary: the segment it created, null = IPC transport
 let submitReady = null;   // worker: the segment name it successfully opened
@@ -347,6 +355,11 @@ class TurboKV {
     // Populated only when an adapter is attached: with no L3 there is nothing
     // to promote and nothing to guard.
     #deletedAt = new Map();
+    // Marks a wrapped ring left this process unable to account for, still to be
+    // reconciled against the arena. A count rather than a flag, because the
+    // reconciliation is budgeted and has to resume across drains. See
+    // #reconcilePendingDel.
+    #reconcileOwed = 0;
     #doorbellPending = false;           // retained FIFO cursor into #l1; see #oldestEntry
     #l1Max;
     #outbox = [];
@@ -991,6 +1004,12 @@ class TurboKV {
     // Test-only, and named to say so: whether this handle is still polling for
     // an L2 cap is not otherwise observable, and "a closed cache owns no timer"
     // is a claim that should be checked rather than asserted in a comment.
+    // Test-only: the bookkeeping a wrapped ring leaves behind. None of it is
+    // observable from outside, and "the marks reconcile, a slice at a time" is
+    // a claim that should be checked rather than asserted in a comment.
+    __unsafeMarkState() {
+        return { pending: this.#pendingDel.size, owed: this.#reconcileOwed, deletedAt: this.#deletedAt.size };
+    }
     __unsafeCapState() {
         let sent = 0;
         for (const c of this.#l3Caps.values()) if (c.sent) sent++;
@@ -1319,6 +1338,10 @@ class TurboKV {
         // is ~21ns against the native ringHead() call this function already
         // makes, so the check is free at any call rate.
         if (this.#checkPrimary()) return;          // just degraded; the arena is unmapped
+        // Before the early-out below, not after it: a reconciliation left over
+        // from a wrap has to make progress even on the drains that find the
+        // ring quiet, which is most of them.
+        if (this.#reconcileOwed > 0) this.#reconcilePendingDel(this.#cursor);
         if (native.ringHead() === this.#cursor) return;
         const r = native.ringRead(this.#cursor, 512);
         if (!r) return;                            // detached mid-drain
@@ -1363,7 +1386,8 @@ class TurboKV {
             // the second resolves against the arena on its own timer, which a
             // wrap tells it nothing about.
             this.#dropCachedValues();
-            if (this.#pendingDel.size) this.#reconcilePendingDel(r.head);
+            this.#reconcileOwed = this.#pendingDel.size;
+            if (this.#reconcileOwed) this.#reconcilePendingDel(r.head);
             this.#cursor = r.head;
             return;
         }
@@ -1629,16 +1653,39 @@ class TurboKV {
     // justifies, and hands the rest to #deletedAt so a read already in flight
     // cannot promote what they were protecting.
     #reconcilePendingDel(head) {
-        // Iterated over a COPY: the loop deletes from the set it is walking,
-        // and a Set iterator is live.
-        for (const key of [...this.#pendingDel]) {
+        // A BUDGETED SLICE, resumed on later drains. #drain() runs from get()
+        // AND has(), and a ring that keeps lapping between reads makes every
+        // read wrap again -- so an unbudgeted pass over PENDING_DEL_MAX marks,
+        // measured at 0.28ms, would be paid PER READ: ~28% of a core at 1k
+        // reads/s. This is the only unbudgeted arena loop left, and #runCaps
+        // already established the shape.
+        //
+        // A mark examined and KEPT is moved to the back of the set (delete then
+        // add, which is what re-insertion means for a Set), so the next slice
+        // continues where this one stopped rather than re-examining the same
+        // head. `#reconcileOwed` carries the remaining count across drains: the
+        // record that would have cleared these marks is the one the wrap threw
+        // away, so stopping at the budget and never coming back would leave the
+        // rest leaked exactly as before.
+        let budget = PENDING_DEL_SCAN;
+        const slice = [];
+        for (const key of this.#pendingDel) {
+            slice.push(key);
+            if (slice.length >= budget) break;
+        }
+        for (const key of slice) {
+            this.#reconcileOwed--;
             let held;
-            try { held = native.has(key); } catch { return; }   // detached mid-reconcile
-            if (held) continue;                                 // not applied yet: still ours to hold
+            try { held = native.has(key); } catch { this.#reconcileOwed = 0; return; }
+            if (held) {                             // not applied yet: still ours to hold
+                this.#pendingDel.delete(key); this.#pendingDel.add(key);
+                continue;
+            }
             this.#pendingDel.delete(key);
             this.#pendingDelHash.delete(native.hashKey(key));
             this.#noteDeleted(key, head);
         }
+        if (this.#reconcileOwed < 0 || this.#pendingDel.size === 0) this.#reconcileOwed = 0;
     }
 
     // Record that `key` was removed, and where on the invalidation ring that
@@ -1648,7 +1695,18 @@ class TurboKV {
     // passed it.
     #noteDeleted(key, at) {
         if (this.#queue === null) return;        // no adapter: nothing promotes, nothing to guard
-        if (this.#deletedAt.size >= PENDING_DEL_MAX) this.#deletedAt.clear();
+        // EVICT THE OLDEST, never wipe. These entries DO have a useful order --
+        // ring positions are monotonic, so the oldest is the one most likely to
+        // be behind every live read's mark already and so the least useful --
+        // and a wholesale clear at the bound would throw away the guard that
+        // stops a caller being handed a value it deleted. That was reachable in
+        // one step once a wrapped-ring reconcile could push up to
+        // PENDING_DEL_MAX entries in at once. Map iteration is insertion order,
+        // so the first key is the oldest.
+        if (this.#deletedAt.size >= PENDING_DEL_MAX) {
+            const oldest = this.#deletedAt.keys().next();
+            if (!oldest.done) this.#deletedAt.delete(oldest.value);
+        }
         this.#deletedAt.set(key, at);
     }
 
@@ -2203,22 +2261,6 @@ class TurboKV {
         if (this.#codec && this.#freeze) TurboKV.deepFreeze(l1Value);
         const keyHash = native.hashKey(key);
         this.#pendingDel.delete(key); this.#pendingDelHash.delete(keyHash);   // a write supersedes our pending delete
-        // AND IT SUPERSEDES OUR OUTSTANDING CAP, which is not the same
-        // statement and is load-bearing on a worker. A deferred cap decides by
-        // comparing against the ARENA, but this write is going into the
-        // submission RING, and between the two there is a window in which the
-        // arena still holds the old value while the ring already holds the new
-        // one. A cap submitted in that window is ordered BEHIND the new write
-        // and re-applies the old value on top of it -- the exact resurrection
-        // the compare exists to prevent, arrived at through our own ring rather
-        // than through someone else's. Cancelled for every instance in this
-        // process, not only this one: the caps are per-instance and the ring is
-        // per-process, so a sibling's cap is ordered behind this write exactly
-        // as ours is. Another PROCESS's write is caught by the arena compare
-        // only when it comes from the PRIMARY, which writes the arena
-        // synchronously; another worker's write sits in a ring of its own and
-        // nothing on this side can see it.
-        TurboKV.#cancelCaps(key);
         // set() reports whether the pipeline ACCEPTED, serialised and queued the
         // value - not that it is durably in L2. A worker's write is applied by
         // the primary a tick later, so the size must be checked here; otherwise
@@ -2284,6 +2326,7 @@ class TurboKV {
         if (minLevel === 3) {
             if (this.#id === 0) {
                 native.del(key, 0);
+                TurboKV.#cancelCaps(key);
                 TurboKV.#dropOthers(key, this);
             } else if (!this.#primaryDead) {
                 // MARKED ONLY WHEN THE EVICTION IS ACTUALLY SUBMITTED. The mark
@@ -2294,7 +2337,10 @@ class TurboKV {
                 // can clear -- and a marked key is unreadable from every tier,
                 // L3 included, for the life of the worker.
                 if (this.#ringIdx >= 0) {
-                    if (native.submitDel(key)) { this.#markPendingDel(key, keyHash); this.#ringDoorbell(); }
+                    if (native.submitDel(key)) {
+                        TurboKV.#cancelCaps(key);
+                        this.#markPendingDel(key, keyHash); this.#ringDoorbell();
+                    }
                     else {
                         this.stats.writesShed = (this.stats.writesShed || 0) + 1;
                         this.lastError = 'submission ring full; L2 eviction shed';
@@ -2312,7 +2358,7 @@ class TurboKV {
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
             // Our own ring record is skipped on the primary, so nothing else
             // invalidates the copies other instances in THIS process hold.
-            else TurboKV.#dropOthers(key, this);
+            else { TurboKV.#cancelCaps(key); TurboKV.#dropOthers(key, this); }
             if (ok) this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return ok;
         }
@@ -2327,6 +2373,7 @@ class TurboKV {
         }
         if (this.#ringIdx >= 0) {
             if (native.submitSet(key, enc, ttlMs)) {
+                TurboKV.#cancelCaps(key);
                 this.stats.sent++; this.#ringDoorbell();
                 this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
                 return true;
@@ -2442,6 +2489,7 @@ class TurboKV {
         if (this.#id === 0) {
             const had = native.del(key, 0);
             this.#l1Drop(key);
+            TurboKV.#cancelCaps(key);
             TurboKV.#dropOthers(key, this);
             // The removal is applied to the arena synchronously here, so its
             // ring position is exactly the head that follows it -- and that is
@@ -2469,10 +2517,6 @@ class TurboKV {
         // deletes, dropping the record only costs us a stale read, whereas
         // growing without bound costs the process.
         const keyHash = native.hashKey(key);
-        // A removal supersedes an outstanding cap for the same reason a write
-        // does, and more obviously: re-applying the value would undo it. Every
-        // instance, for the reason #cancelCaps gives.
-        TurboKV.#cancelCaps(key);
         // MARKED ONLY WHEN SOMETHING WILL ACTUALLY PUBLISH THE REMOVAL. A
         // DEGRADED worker submits nothing -- the arena is unmapped and the
         // primary that would apply it is gone -- so the mark would be one
@@ -2494,7 +2538,7 @@ class TurboKV {
             ? this.#queue.push({ kind: 'delete', key, originId: this.#originId(), bytes: key.length + 48 })
             : null;
         if (this.#ringIdx >= 0) {
-            if (native.submitDel(key)) this.#ringDoorbell();
+            if (native.submitDel(key)) { TurboKV.#cancelCaps(key); this.#ringDoorbell(); }
             else {
                 this.stats.writesShed = (this.stats.writesShed || 0) + 1;
                 this.lastError = 'submission ring full; L2 delete shed';
@@ -2601,6 +2645,14 @@ class TurboKV {
             TurboKV.#clearOthers(this);
             return;
         }
+        // A WORKER'S CLEAR CANCELS EVERY INSTANCE'S CAPS, not just this one's.
+        // clearLocal() above dropped ours; a sibling's cap is a submitSet still
+        // to come, and the primary drains the rings before it applies a `c`
+        // (see applyBatch), so a cap landing in that gap is written into an
+        // arena the clear has just emptied. Narrow, and the same one-line shape
+        // as every other site in this family -- the primary branch above gets
+        // it through #clearOthers, which reaches each sibling's clearLocal().
+        TurboKV.#cancelAllCaps();
         this.#outbox.push('c', '', null, 0);
         this.#schedule(48);
     }
@@ -3175,6 +3227,16 @@ class TurboKV {
     // wrote itself, so a write through one instance leaves the others holding
     // the old value. `instances` is normally a set of one, so this costs a
     // branch per write in the common case.
+    // CALLED ONLY WHERE A WRITE HAS ACTUALLY REACHED THE ARENA OR THE RING.
+    // A cancel is a claim that something newer now exists for this key; a
+    // rejected write is not newer, it is nothing. Cancelling before the size
+    // checks and before the ring-full shed branch -- which is where this used
+    // to sit -- meant a sibling's oversized set(), which writes nothing at all
+    // and returns false, threw away a cap that was about to bound a value L3
+    // had refused, and the arena then held it with no expiry. That is the very
+    // failure the cap exists to prevent, reintroduced by the fix for the one
+    // below it.
+    //
     // A NEW VALUE FOR `fullKey` IS ON ITS WAY INTO THE SUBMISSION RING, so no
     // outstanding cap for that key may still be submitted: the cap decides by
     // comparing against the ARENA, and between the arena and the ring there is
@@ -3192,6 +3254,12 @@ class TurboKV {
     static #cancelCaps(fullKey) {
         for (const c of instances) c.#cancelCap(fullKey);
     }
+    // The no-key form, for a clear: it removes EVERY key, so it supersedes
+    // every outstanding cap. See clearAll().
+    static #cancelAllCaps() {
+        for (const c of instances) c.#cancelOwnCaps();
+    }
+    #cancelOwnCaps() { if (this.#l3Caps.size) { this.#l3Caps.clear(); this.#stopCapTimer(); } }
     #cancelCap(fullKey) { if (this.#l3Caps.size) this.#l3Caps.delete(fullKey); }
 
     static #dropOthers(fullKey, self) {
