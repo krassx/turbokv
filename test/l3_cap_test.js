@@ -118,6 +118,19 @@ if (process.env.TCC_ROLE === 'bulk') {
         ok(w.__unsafeCapState().sent === 0, `and none could be applied yet (${w.__unsafeCapState().sent})`);
         process.send({ step: 'written' });
         await step('drained');
+
+        // A LOCAL WRITE CANCELS ITS CAP, and this is where that matters. The
+        // cap decides by comparing against the ARENA, but a write goes into the
+        // submission RING, so between the two there is a window where the arena
+        // still holds the old value and the ring already holds the new one. A
+        // cap submitted in that window is ordered BEHIND the new write and
+        // re-applies the old value on top of it. Deterministic here: the parent
+        // has drained exactly once, so 'bulk0' is in L2 while the write below
+        // is only in the ring.
+        w.set('bulk0', 'NEWER');
+        ok(w.__unsafeCapState().caps === N - 1,
+           `a local write drops that key's cap (${w.__unsafeCapState().caps} of ${N})`);
+
         w.__unsafeRunCaps();
         const one = w.__unsafeCapState().sent;
         ok(one > 0, `one tick makes progress (${one})`);
@@ -126,10 +139,16 @@ if (process.env.TCC_ROLE === 'bulk') {
         ok(one <= 128, `and reaches the arena for a bounded slice, not all ${N} (${one})`);
         // The bound must not cost convergence: ten slices, so eleven more ticks.
         for (let i = 0; i < 12; i++) w.__unsafeRunCaps();
-        ok(w.__unsafeCapState().sent === N,
-           `every cap is applied within ceil(N/64) ticks (${w.__unsafeCapState().sent} of ${N})`);
+        // N - 1, because the local write above cancelled one of them.
+        ok(w.__unsafeCapState().sent === N - 1,
+           `every remaining cap is applied within ceil(N/64) ticks (${w.__unsafeCapState().sent} of ${N - 1})`);
         ok((w.stats.l3FailTtlUnapplied || 0) === 0,
            `and none is abandoned (${w.stats.l3FailTtlUnapplied || 0})`);
+        process.send({ step: 'capped' });
+        await step('drained2');
+        ok(native.get('bulk0') === 'NEWER',
+           `and no cap was ordered behind the newer write (${native.get('bulk0')})`);
+        ok(w.get('bulk0') === 'NEWER', `the worker reads it (${w.get('bulk0')})`);
         w.close();
         console.log(fail ? `  ${fail} failed (bulk)` : '  [l3-cap] bulk-poll cases passed');
         process.exit(fail ? 1 : 0);
@@ -280,6 +299,9 @@ if (process.env.TCC_ROLE === 'slow') {
                 if (m && m.step === 'written') {
                     TurboKV.drainSubmissions(20000);
                     kid.send({ step: 'drained' });
+                } else if (m && m.step === 'capped') {
+                    TurboKV.drainSubmissions(20000);
+                    kid.send({ step: 'drained2' });
                 }
             });
             kid.on('exit', (c) => resolve(c));

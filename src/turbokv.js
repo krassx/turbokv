@@ -2156,6 +2156,18 @@ class TurboKV {
         if (this.#codec && this.#freeze) TurboKV.deepFreeze(l1Value);
         const keyHash = native.hashKey(key);
         this.#pendingDel.delete(key); this.#pendingDelHash.delete(keyHash);   // a write supersedes our pending delete
+        // AND IT SUPERSEDES OUR OUTSTANDING CAP, which is not the same
+        // statement and is load-bearing on a worker. A deferred cap decides by
+        // comparing against the ARENA, but this write is going into the
+        // submission RING, and between the two there is a window in which the
+        // arena still holds the old value while the ring already holds the new
+        // one. A cap submitted in that window is ordered BEHIND the new write
+        // and re-applies the old value on top of it -- the exact resurrection
+        // the compare exists to prevent, arrived at through our own ring rather
+        // than through someone else's. Our own writes are the half we can be
+        // sure about, so we cancel on them; another process's write is still
+        // caught by the arena compare, which is the best answer available.
+        if (this.#l3Caps.size) this.#l3Caps.delete(key);
         // set() reports whether the pipeline ACCEPTED, serialised and queued the
         // value - not that it is durably in L2. A worker's write is applied by
         // the primary a tick later, so the size must be checked here; otherwise
@@ -2406,6 +2418,9 @@ class TurboKV {
         // deletes, dropping the record only costs us a stale read, whereas
         // growing without bound costs the process.
         const keyHash = native.hashKey(key);
+        // A removal supersedes an outstanding cap for the same reason a write
+        // does, and more obviously: re-applying the value would undo it.
+        if (this.#l3Caps.size) this.#l3Caps.delete(key);
         // MARKED ONLY WHEN SOMETHING WILL ACTUALLY PUBLISH THE REMOVAL. A
         // DEGRADED worker submits nothing -- the arena is unmapped and the
         // primary that would apply it is gone -- so the mark would be one
