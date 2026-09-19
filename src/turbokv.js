@@ -1428,6 +1428,23 @@ class TurboKV {
             return undefined;
         }
         if (rec === undefined || rec === null) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
+        // DECODED BEFORE ANYTHING IS STORED. The arena took whatever bytes the
+        // adapter handed over and the decode ran afterwards, on the way back to
+        // the caller -- so an adapter returning a value this cache cannot
+        // represent (a Buffer where the codec expects its own encoding, say)
+        // left those bytes in the SHARED L2 and then threw. Every later
+        // synchronous `get` of that key, in every process on the box, threw the
+        // decode error, and went on throwing until the entry aged out. Validate
+        // first: an unusable value is an L3 miss, reported through the same
+        // listener as any other adapter failure, and nothing is written.
+        let accepted;
+        try { accepted = this.#acceptFromL3(rec.value); }
+        catch (e) {
+            this.stats.l3Misses = (this.stats.l3Misses || 0) + 1;
+            this.stats.l3BadValues = (this.stats.l3BadValues || 0) + 1;
+            this.#reportL3(e, { kind: 'get', key });
+            return undefined;
+        }
         this.stats.l3Hits = (this.stats.l3Hits || 0) + 1;
         const why = this.#promotionBlock(key, mark, clearMark);
         if (why) {
@@ -1451,10 +1468,10 @@ class TurboKV {
             // with what L3 returned -- blocking changes only what is stored
             // locally, never what this caller observes.
             if (why === 'l3DeletedWhileReading' || why === 'l3ClearedWhileReading') return undefined;
-            return this.#decodeFromL3(rec.value);
+            return this.#handOut(accepted.value);
         }
-        this.#fillFromL3(key, rec, level);
-        return this.#decodeFromL3(rec.value);
+        this.#fillFromL3(key, rec, level, accepted);
+        return this.#handOut(accepted.value);
     }
 
     // Is this process still holding an L3 operation for `key` that L3 has not
@@ -1619,22 +1636,90 @@ class TurboKV {
     // Fill downward per minLevel. A worker cannot write L2 directly, so its
     // promotion goes through the submission ring like any other write; a full
     // ring sheds it, and "no promotion" is a benign failure.
-    #fillFromL3(key, rec, level) {
-        const cap = this.#l3TtlMs > 0
-            ? (rec.ttlMs ? Math.min(rec.ttlMs, this.#l3TtlMs) : this.#l3TtlMs)
-            : (rec.ttlMs || 0);
+    #fillFromL3(key, rec, level, accepted) {
+        const cap = this.#l3Ttl(rec);
         if (level <= 2) {
-            if (this.#id === 0) native.set(key, rec.value, 0, cap);
-            else if (this.#ringIdx >= 0) { if (native.submitSet(key, rec.value, cap)) this.#ringDoorbell(); }
+            if (this.#id === 0) {
+                // The primary skips the ring records it writes itself, so
+                // nothing else drops the copies other instances in THIS
+                // process are holding -- decision 64's family, of which this
+                // is the third call site. A sibling instance went on serving
+                // its own stale L1 copy indefinitely after a promotion.
+                if (native.set(key, accepted.enc, 0, cap) === true) TurboKV.#dropOthers(key, this);
+            }
+            else if (this.#ringIdx >= 0) { if (native.submitSet(key, accepted.enc, cap)) this.#ringDoorbell(); }
         }
         if (level === 1) {
-            const v = this.#codec && !this.#l1Decoded ? rec.value : this.#decodeFromL3(rec.value);
-            this.#l1Put(key, v, native.hashKey(key), this.#noCodec ? 0 : rec.value.length,
+            const v = this.#codec && !this.#l1Decoded ? accepted.enc : accepted.value;
+            this.#l1Put(key, v, native.hashKey(key), this.#noCodec ? 0 : accepted.enc.length,
                         cap ? monoMs() + cap : 0);
         }
     }
 
-    #decodeFromL3(enc) { return this.#codec ? this.#codec.decode(enc) : enc; }
+    // How long a value from L3 may live locally.
+    //
+    // `rec.ttlMs` is the adapter's, so it is untrusted input like any other
+    // option this class takes. A naive `PTTL` passthrough returns -1 for "no
+    // expiry" and -2 for "no key", and the old expression took -1 as truthy,
+    // min'd it against l3TtlMs to -1, and handed that to the arena -- which
+    // stored the entry with NO expiry at all, so the one bound that exists to
+    // stop an L3 value outliving its provider was bypassed by the very reply
+    // it was meant to bound. Anything that is not a positive finite number
+    // means "L3 named no deadline", which is what l3TtlMs is for. The upper
+    // clamp is set()'s: uint32 milliseconds from the arena epoch.
+    #l3Ttl(rec) {
+        const t = rec.ttlMs;
+        const recTtl = typeof t === 'number' && t > 0 && t <= 0x7fffffff ? t
+            : (typeof t === 'number' && t > 0x7fffffff ? 0x7fffffff : 0);
+        return this.#l3TtlMs > 0
+            ? (recTtl ? Math.min(recTtl, this.#l3TtlMs) : this.#l3TtlMs)
+            : recTtl;
+    }
+
+    // Turn an adapter's value into the pair this cache actually uses: `enc` is
+    // what L2 stores, `value` is what a caller is handed. THROWS if the value
+    // cannot be stored at all -- see the call site in #fetchFromL3 for why that
+    // has to happen before anything is written.
+    //
+    // This is also where decisions 7 and 26 are honoured on the read-through
+    // path. `get()` has always obeyed them at its L1 and L2 returns; getAsync
+    // handed back the object it had just put in L1, so a Buffer was shared with
+    // both the cache and the adapter's own store (mutating the result corrupted
+    // both), and a `direct`-mode object came back unfrozen while the same value
+    // read synchronously a moment later was frozen. Two forms of one operation
+    // cannot differ in whether the caller may mutate the result.
+    #acceptFromL3(raw) {
+        if (!this.#codec) {
+            // bytes mode stores the value directly, so what is acceptable here
+            // is exactly what set() accepts -- and binary is COPIED, because it
+            // is mutable and the adapter still holds its own reference to it.
+            if (ArrayBuffer.isView(raw) || raw instanceof ArrayBuffer) {
+                const b = Buffer.from(ArrayBuffer.isView(raw)
+                    ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+                    : new Uint8Array(raw));
+                return { enc: b, value: b };
+            }
+            const t = typeof raw;
+            if (t !== 'string' && t !== 'number' && t !== 'boolean' && t !== 'bigint' && raw !== null)
+                throw new TypeError(`turbokv: the l3 adapter returned a ${t}; bytes mode accepts ` +
+                    `string/number/boolean/bigint/null or binary (Buffer/TypedArray/ArrayBuffer/DataView)`);
+            return { enc: raw, value: raw };
+        }
+        if (typeof raw !== 'string')
+            throw new TypeError(`turbokv: the l3 adapter returned a ${typeof raw}, but this cache ` +
+                `stores codec-encoded values, which are strings`);
+        const value = this.#codec.decode(raw);
+        // Same rule as get()'s L2 return: the decoded object is the cache's,
+        // shared with whatever goes into L1, so it is frozen before anyone can
+        // reach it. In `safe` mode L1 keeps the encoded form and every read
+        // decodes afresh, so there is nothing shared to protect.
+        if (this.#l1Decoded && this.#freeze) TurboKV.deepFreeze(value);
+        return { enc: raw, value };
+    }
+
+    // A caller never receives the object L1 holds. Strings and frozen objects
+    // are safe to share; a Buffer is not (decision 7).
+    #handOut(v) { return Buffer.isBuffer(v) ? Buffer.from(v) : v; }
 
     // The single reporting path for a background L3 failure. The listener is
     // the caller's, so it can throw; that is not our failure to propagate.
@@ -1713,7 +1798,15 @@ class TurboKV {
         let cur;
         try { cur = native.get(key); } catch { return false; }
         if (cur === undefined || !sameStored(cur, enc)) return false;
-        if (this.#id === 0) return native.set(key, enc, 0, cap) === true;
+        if (this.#id === 0) {
+            if (native.set(key, enc, 0, cap) !== true) return false;
+            // Decision 64's family again: the primary skips its own ring
+            // records, so a sibling instance keeps an L1 copy carrying the
+            // expiry this call just SHORTENED -- and goes on serving, past the
+            // cap, the very value L3 refused.
+            TurboKV.#dropOthers(key, this);
+            return true;
+        }
         if (this.#ringIdx >= 0 && native.submitSet(key, enc, cap)) { this.#ringDoorbell(); return true; }
         return false;
     }
