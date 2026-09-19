@@ -141,6 +141,28 @@ if (process.env.TCR_ROLE === 'wrap') {
         ok(w.get('pend') === undefined,
            `a wrapped ring does not resurrect this worker's pending delete (${JSON.stringify(w.get('pend'))})`);
         ok(w.has('pend') === false, `has() agrees (${w.has('pend')})`);
+
+        // AND THE MARK MUST STILL BE ABLE TO CLEAR. The record that clears a
+        // mark is exactly what a wrap discards, so keeping marks across one
+        // without reconciling them is the other half of the same mistake: the
+        // delete gets applied, the ring laps again, and the key answers
+        // undefined from every tier including L3 -- with the adapter never
+        // asked -- for the life of the worker. A wrap means this process
+        // cannot know what changed, so it asks the arena, which a wrap does
+        // not destroy: a key the arena no longer holds is a removal that HAS
+        // been applied.
+        process.send({ step: 'apply-and-wrap' });
+        await step('wrapped2');
+        ok(native.get('pend') === undefined, `the delete has now been applied (${native.get('pend')})`);
+        f.store.set('pend', { value: 'L3NEW', expiresAt: 0 });   // written again elsewhere
+        const askedBefore = f.calls.filter(x => x[0] === 'get' && x[1] === 'pend').length;
+        w.get('poke');                            // drains, wraps again, reconciles
+        const back = await w.getAsync('pend');
+        ok(back === 'L3NEW', `the key is readable again after the wrap (${JSON.stringify(back)})`);
+        ok(f.calls.filter(x => x[0] === 'get' && x[1] === 'pend').length > askedBefore,
+           'and the adapter was actually asked, rather than refused locally');
+        ok(await w.hasAsync('pend') === true, 'hasAsync agrees');
+
         w.close();
         console.log(fail ? `  ${fail} failed (wrap)` : '  [l3-removal] wrapped-ring cases passed');
         process.exit(fail ? 1 : 0);
@@ -378,6 +400,13 @@ if (process.env.TCR_ROLE === 'shed') {
                     // delete is still pending. The ring holds 8192 records.
                     for (let i = 0; i < 10000; i++) primary.set('noise' + i, 'x');
                     kid.send({ step: 'wrapped' });
+                } else if (m && m.step === 'apply-and-wrap') {
+                    // Now apply it, and lap the ring again -- so the record
+                    // that would have cleared the worker's mark is the one it
+                    // can never see.
+                    TurboKV.drainSubmissions(20000);
+                    for (let i = 0; i < 10000; i++) primary.set('more' + i, 'x');
+                    kid.send({ step: 'wrapped2' });
                 }
             });
             kid.on('exit', (c) => resolve(c));
@@ -403,7 +432,8 @@ if (process.env.TCR_ROLE === 'shed') {
         // 4MB for the 8192-record ring floor, as above.
         const primary = TurboKV.createPrimary(ARENA + 'k', 4 << 20, 1 << 14,
             { storage: 'bytes', maintenance: false, l3: adapter });
-        const read = primary.getAsync('wrapdel');
+        let settled = false;
+        const read = primary.getAsync('wrapdel').then((v) => { settled = true; return v; });
         await sleep(10);
         await primary.deleteAsync('wrapdel');        // settles long before the read
         const code = await new Promise((resolve) => {
@@ -415,6 +445,11 @@ if (process.env.TCR_ROLE === 'shed') {
         ok(code === 0, `the filler worker ran (exited ${code})`);
         const applied = TurboKV.drainSubmissions(20000);
         ok(applied > 8192, `enough records to lap the primary's cursor (${applied})`);
+        // NON-VACUOUS: the whole case is about a read that is still in flight
+        // when the ring laps. A fork plus 10k writes slower than the adapter's
+        // 250ms would make every assertion below pass without testing
+        // anything.
+        ok(settled === false, 'the read was still in flight when the ring lapped');
         const got = await read;
         ok(got === undefined,
            `a wrapped ring does not make the primary forget its own delete (${JSON.stringify(got)})`);

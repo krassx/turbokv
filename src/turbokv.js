@@ -1323,26 +1323,47 @@ class TurboKV {
         const r = native.ringRead(this.#cursor, 512);
         if (!r) return;                            // detached mid-drain
         if (r.wrapped) {                       // fell too far behind: flush wholesale
-            // CACHED VALUES ONLY. A wrapped ring means "I do not know what
-            // changed", which is a reason to drop what this process is
-            // HOLDING -- and emphatically not a reason to forget what this
-            // process itself REMOVED, or still owes the arena. Clearing
-            // #pendingDel here handed a worker whose own delete was still
-            // pending straight back to L2's copy of that key: a stale value,
-            // which is the one failure mode this design does not accept, and
-            // reachable now that an absent-key delete appends a record too --
-            // a fan-out invalidation workload takes an idle worker from zero
-            // ring traffic to full rate, and ~0.33s of that wraps a 16MB
-            // arena's ring.
+            // CACHED VALUES ONLY, and then RECONCILE what this process owes.
             //
-            // Keeping them costs bounded memory (all three are capped) and
-            // some extra misses until the marks are resolved on their own
-            // terms, which is the direction this project chooses every time.
-            // #deletedAt's positions are monotonic and #promotionBlock refuses
-            // every promotion while the ring is wrapped anyway, so a stale
-            // position there costs nothing; the caps resolve against the arena
-            // rather than against the ring, so a wrap tells them nothing.
+            // A wrapped ring means "I do not know what changed", which is a
+            // reason to drop what this process is HOLDING and not a reason to
+            // forget what it itself REMOVED: clearing #pendingDel here handed a
+            // worker whose own delete was still pending straight back to L2's
+            // copy of that key, which is a stale value -- the one failure mode
+            // this design does not accept, and reachable now that an absent-key
+            // delete appends a record too, since a fan-out invalidation
+            // workload takes an idle worker from zero ring traffic to full rate
+            // and ~0.33s of that laps a 16MB arena's ring.
+            //
+            // But KEEPING them blindly is the other half of the same mistake,
+            // because the record that would have cleared a mark is exactly what
+            // the wrap discarded: a delete the primary HAD applied stayed
+            // marked forever, and that key then answered undefined from every
+            // tier, L3 included, with the adapter never asked -- F5 again,
+            // through a different door, and more reachable than before for the
+            // same reason.
+            //
+            // So ask the arena, which is the one authority a wrap does not
+            // destroy. A key it no longer holds is a removal that HAS been
+            // applied: drop the mark, and record where it landed so a read
+            // already in flight is still refused (see #deletedAt). A key it
+            // still holds is a removal still outstanding: keep the mark. Costs
+            // one has() -- which copies no value -- per mark, bounded by
+            // PENDING_DEL_MAX, on an event that is rare by construction.
+            //
+            // The residue is narrow and in the safe direction: a key deleted,
+            // applied, and then RECREATED by someone else inside the wrapped
+            // region reads as "still held", so its mark survives and this
+            // worker misses on it until the next record for that key. A miss,
+            // never a stale value.
+            //
+            // #deletedAt and #l3Caps need no reconciliation: the first is
+            // compared against ring POSITIONS, which are monotonic and which
+            // #promotionBlock refuses outright while the ring is wrapped, and
+            // the second resolves against the arena on its own timer, which a
+            // wrap tells it nothing about.
             this.#dropCachedValues();
+            if (this.#pendingDel.size) this.#reconcilePendingDel(r.head);
             this.#cursor = r.head;
             return;
         }
@@ -1604,6 +1625,22 @@ class TurboKV {
         this.#pendingDelHash.set(keyHash, key);
     }
 
+    // See the wrapped branch of #drain. Keeps only the marks the arena still
+    // justifies, and hands the rest to #deletedAt so a read already in flight
+    // cannot promote what they were protecting.
+    #reconcilePendingDel(head) {
+        // Iterated over a COPY: the loop deletes from the set it is walking,
+        // and a Set iterator is live.
+        for (const key of [...this.#pendingDel]) {
+            let held;
+            try { held = native.has(key); } catch { return; }   // detached mid-reconcile
+            if (held) continue;                                 // not applied yet: still ours to hold
+            this.#pendingDel.delete(key);
+            this.#pendingDelHash.delete(native.hashKey(key));
+            this.#noteDeleted(key, head);
+        }
+    }
+
     // Record that `key` was removed, and where on the invalidation ring that
     // removal became visible. See #deletedAt. Same wholesale-flush bound and
     // the same reasoning: a dropped entry costs one blocked promotion, not
@@ -1759,7 +1796,17 @@ class TurboKV {
                 // its own stale L1 copy indefinitely after a promotion.
                 if (native.set(key, accepted.enc, 0, cap) === true) TurboKV.#dropOthers(key, this);
             }
-            else if (this.#ringIdx >= 0) { if (native.submitSet(key, accepted.enc, cap)) this.#ringDoorbell(); }
+            else if (this.#ringIdx >= 0) {
+                // A PROMOTION IS A WRITE INTO THE RING, so it cancels
+                // outstanding caps exactly as set() does. Narrower window -- a
+                // key being promoted was a local miss, so a cap outstanding for
+                // it means the arena is holding something this process wrote
+                // and L3 refused -- but the same shape, and the same outcome if
+                // it fires: the cap lands behind the promotion and puts the
+                // refused value back over it.
+                TurboKV.#cancelCaps(key);
+                if (native.submitSet(key, accepted.enc, cap)) this.#ringDoorbell();
+            }
         }
         if (level === 1) {
             const v = this.#codec && !this.#l1Decoded ? accepted.enc : accepted.value;
@@ -2164,10 +2211,14 @@ class TurboKV {
         // one. A cap submitted in that window is ordered BEHIND the new write
         // and re-applies the old value on top of it -- the exact resurrection
         // the compare exists to prevent, arrived at through our own ring rather
-        // than through someone else's. Our own writes are the half we can be
-        // sure about, so we cancel on them; another process's write is still
-        // caught by the arena compare, which is the best answer available.
-        if (this.#l3Caps.size) this.#l3Caps.delete(key);
+        // than through someone else's. Cancelled for every instance in this
+        // process, not only this one: the caps are per-instance and the ring is
+        // per-process, so a sibling's cap is ordered behind this write exactly
+        // as ours is. Another PROCESS's write is caught by the arena compare
+        // only when it comes from the PRIMARY, which writes the arena
+        // synchronously; another worker's write sits in a ring of its own and
+        // nothing on this side can see it.
+        TurboKV.#cancelCaps(key);
         // set() reports whether the pipeline ACCEPTED, serialised and queued the
         // value - not that it is durably in L2. A worker's write is applied by
         // the primary a tick later, so the size must be checked here; otherwise
@@ -2419,8 +2470,9 @@ class TurboKV {
         // growing without bound costs the process.
         const keyHash = native.hashKey(key);
         // A removal supersedes an outstanding cap for the same reason a write
-        // does, and more obviously: re-applying the value would undo it.
-        if (this.#l3Caps.size) this.#l3Caps.delete(key);
+        // does, and more obviously: re-applying the value would undo it. Every
+        // instance, for the reason #cancelCaps gives.
+        TurboKV.#cancelCaps(key);
         // MARKED ONLY WHEN SOMETHING WILL ACTUALLY PUBLISH THE REMOVAL. A
         // DEGRADED worker submits nothing -- the arena is unmapped and the
         // primary that would apply it is gone -- so the mark would be one
@@ -3123,6 +3175,25 @@ class TurboKV {
     // wrote itself, so a write through one instance leaves the others holding
     // the old value. `instances` is normally a set of one, so this costs a
     // branch per write in the common case.
+    // A NEW VALUE FOR `fullKey` IS ON ITS WAY INTO THE SUBMISSION RING, so no
+    // outstanding cap for that key may still be submitted: the cap decides by
+    // comparing against the ARENA, and between the arena and the ring there is
+    // a window in which the arena still holds the old value while the ring
+    // already holds the new one -- a cap submitted there is ordered BEHIND the
+    // new value and re-applies the old one on top of it.
+    //
+    // ACROSS EVERY INSTANCE IN THIS PROCESS, which is decision 64's family
+    // again and the same shape as #dropOthers. The caps are per-instance and
+    // the submission ring is per-process, so instance A's cap for `k` is
+    // ordered behind sibling B's write to `k` exactly as it would be behind
+    // A's own -- and instance-scoped cancelling left the arena holding the
+    // capped old value for a full l3FailTtlMs. `instances` is normally a set
+    // of one, so this costs a branch per write in the common case.
+    static #cancelCaps(fullKey) {
+        for (const c of instances) c.#cancelCap(fullKey);
+    }
+    #cancelCap(fullKey) { if (this.#l3Caps.size) this.#l3Caps.delete(fullKey); }
+
     static #dropOthers(fullKey, self) {
         if (instances.size < 2) return;
         for (const c of instances) if (c !== self) c.#l1Drop(fullKey);

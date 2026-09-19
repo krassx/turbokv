@@ -131,6 +131,18 @@ if (process.env.TCC_ROLE === 'bulk') {
         ok(w.__unsafeCapState().caps === N - 1,
            `a local write drops that key's cap (${w.__unsafeCapState().caps} of ${N})`);
 
+        // AND A SIBLING'S WRITE DOES TOO. The caps are per-instance and the
+        // submission ring is per-PROCESS, so instance A's cap for a key is
+        // ordered behind instance B's write to it exactly as it would be
+        // behind A's own -- decision 64's family, and the same sweep across
+        // `instances` that #dropOthers does. Cancelling only on the writing
+        // instance left the arena holding the capped old value for a full
+        // l3FailTtlMs.
+        const sib = TurboKV.attachWorker(process.env.TCC_ARENA, 1, { storage: 'bytes' });
+        sib.set('bulk1', 'SIBLING');
+        ok(w.__unsafeCapState().caps === N - 2,
+           `a sibling instance's write drops it too (${w.__unsafeCapState().caps} of ${N})`);
+
         w.__unsafeRunCaps();
         const one = w.__unsafeCapState().sent;
         ok(one > 0, `one tick makes progress (${one})`);
@@ -139,9 +151,9 @@ if (process.env.TCC_ROLE === 'bulk') {
         ok(one <= 128, `and reaches the arena for a bounded slice, not all ${N} (${one})`);
         // The bound must not cost convergence: ten slices, so eleven more ticks.
         for (let i = 0; i < 12; i++) w.__unsafeRunCaps();
-        // N - 1, because the local write above cancelled one of them.
-        ok(w.__unsafeCapState().sent === N - 1,
-           `every remaining cap is applied within ceil(N/64) ticks (${w.__unsafeCapState().sent} of ${N - 1})`);
+        // N - 2, because the two writes above cancelled one cap each.
+        ok(w.__unsafeCapState().sent === N - 2,
+           `every remaining cap is applied within ceil(N/64) ticks (${w.__unsafeCapState().sent} of ${N - 2})`);
         ok((w.stats.l3FailTtlUnapplied || 0) === 0,
            `and none is abandoned (${w.stats.l3FailTtlUnapplied || 0})`);
         process.send({ step: 'capped' });
@@ -149,6 +161,39 @@ if (process.env.TCC_ROLE === 'bulk') {
         ok(native.get('bulk0') === 'NEWER',
            `and no cap was ordered behind the newer write (${native.get('bulk0')})`);
         ok(w.get('bulk0') === 'NEWER', `the worker reads it (${w.get('bulk0')})`);
+        ok(native.get('bulk1') === 'SIBLING',
+           `nor behind a sibling instance's write (${native.get('bulk1')})`);
+        sib.close();
+
+        // A PROMOTION IS A WRITE INTO THE RING, so it cancels an outstanding
+        // cap exactly as set() does -- same mechanism, same consequence if it
+        // does not (the cap lands behind the promotion and puts the value L3
+        // refused back over the value L3 holds). The window is narrower, and
+        // the route into it is this very design: the read guard is what makes
+        // a key with an outstanding cap miss locally, which is what sends the
+        // read to L3 to be promoted in the first place.
+        //
+        // Nothing drains here, so the write below never reaches L2 and its cap
+        // can never be submitted -- which is exactly the state the promotion
+        // has to cancel.
+        const f2 = makeFake();
+        f2.fail.set('set', new Error('l3 down'));
+        f2.store.set('promo', { value: 'L3VAL', expiresAt: 0 });
+        const w2 = TurboKV.attachWorker(process.env.TCC_ARENA, 1,
+            { storage: 'bytes', l3: f2.adapter, l3RetryMs: 5, l3FailTtlMs: 60 });
+        w2.set('promo', 'OURS');
+        await w2.drainL3();
+        await sleep(20);
+        ok(w2.__unsafeCapState().caps === 1, `the failed write defers a cap (${w2.__unsafeCapState().caps})`);
+        await sleep(80);                          // past the 60ms cap
+        ok(w2.__unsafeCapState().sent === 0,
+           `which cannot be submitted, because the write never reached L2 (${w2.__unsafeCapState().sent})`);
+        ok(w2.get('promo') === undefined, `so the key misses locally (${w2.get('promo')})`);
+        ok(await w2.getAsync('promo') === 'L3VAL', 'and reads through to L3');
+        ok(w2.__unsafeCapState().caps === 0,
+           `the promotion cancelled the outstanding cap (${w2.__unsafeCapState().caps})`);
+        w2.close();
+
         w.close();
         console.log(fail ? `  ${fail} failed (bulk)` : '  [l3-cap] bulk-poll cases passed');
         process.exit(fail ? 1 : 0);
