@@ -193,7 +193,17 @@ export interface CacheOptions<T = unknown> {
      *  Default 8MB. */
     l3QueueMaxBytes?: number;
     /** Time budget, per queued L3 operation, before it is abandoned and
-     *  `onL3Error` fires. A `clear` ignores this and retries indefinitely.
+     *  `onL3Error` fires — and, separately, the bound on EACH individual
+     *  adapter call, so a call that neither resolves nor rejects is treated
+     *  as a failure rather than hanging its caller forever. A `clear`
+     *  ignores the retry budget and retries indefinitely, but each of its
+     *  attempts is still bounded by this.
+     *
+     *  Must be a POSITIVE number; a non-positive or non-finite value throws
+     *  at construction. It would otherwise remove the per-attempt bound
+     *  altogether, and a hung `adapter.clear()` would then never settle —
+     *  leaving every process sharing the arena serving L3 misses for every
+     *  key. `0` means "wait without a bound" for `l3CloseTimeoutMs` only.
      *  Default 2000ms. */
     l3RetryMs?: number;
     /** Called once per abandoned background L3 operation (a queued op past
@@ -313,13 +323,19 @@ export interface CacheStats {
      *  not a cumulative counter: it goes up and down as writes and deletes
      *  are sent and settle. */
     l3QueueBytes?: number;
-    /** Failed L3 writes whose local copy was re-timed to `l3FailTtlMs`. */
+    /** Failed L3 writes whose local copy was re-timed to `l3FailTtlMs`. The
+     *  cap only ever SHORTENS: an entry whose own TTL already expires sooner
+     *  keeps it, and a key the arena no longer holds is left alone rather
+     *  than resurrected. On a worker the L2 half is a request the primary
+     *  applies conditionally -- a worker never writes L2 itself. */
     l3FailTtlApplied?: number;
-    /** A worker's attempt to re-time its local copy to `l3FailTtlMs` that
-     *  never confirmed landing in the arena within the retry window -- the
-     *  submission it depends on was itself shed or never drained. The value
-     *  it was capping is left with whatever expiry it already had, which may
-     *  be none. */
+    /** The L2 half of a cap that could not be applied OR handed over at all:
+     *  no arena to write (a degraded worker), or the batch carrying a
+     *  worker's cap request was shed by a congested IPC channel. NOT a cap
+     *  the primary refused -- a cap for a value something newer superseded,
+     *  or one whose entry already expires sooner, has nothing left to bound
+     *  and is not counted here. The value it was capping is left with
+     *  whatever expiry it already had, which may be none. */
     l3FailTtlUnapplied?: number;
     /** L3 hits returned to the caller but not promoted, because SOMEONE ELSE
      *  changed the key while the read was in flight, or the ring could not
@@ -332,7 +348,12 @@ export interface CacheStats {
     /** L3 hits returned to the caller but not promoted, because THIS process
      *  itself still had a write for the key queued or in flight to L3 when
      *  the read completed -- L3 was still serving the value that write
-     *  supersedes. This is why `get()` and `getAsync()` can disagree about a
+     *  supersedes -- or, on a worker, because the key holds a write of this
+     *  worker's own that the primary has not applied yet. That second case
+     *  covers a write L3 has already ACKNOWLEDGED: the queue has let go of
+     *  it and the invalidation ring has no record for it, so without the
+     *  mark an overlapping read answered from the pre-write value put the
+     *  old value back over a write the caller had been told succeeded. This is why `get()` and `getAsync()` can disagree about a
      *  key: while a `minLevel: L3` write for it is outstanding, `get()`
      *  returns `undefined` (nothing is stored locally) while `getAsync()`
      *  returns whatever L3 still holds. Deliberate; see the `LevelOption`
@@ -511,7 +532,15 @@ export declare class TurboKV<T = unknown> {
      *  attached this also clears L3 — the tiers are one cache, so clearing
      *  only the local ones would be undone by the next read. Until the L3
      *  clear lands, L3 reads in this process serve misses rather than the
-     *  values the clear was meant to remove. */
+     *  values the clear was meant to remove.
+     *
+     *  **On a WORKER only this handle's own L1 is emptied synchronously.**
+     *  A worker cannot write L2, so the wipe travels to the primary as an
+     *  op in the IPC batch and the arena — and every other process's L1,
+     *  and any sibling instance's L1 in this one — is emptied when the
+     *  primary applies it, typically the next event-loop turn. Between the
+     *  call and that moment a sibling handle can still serve a value this
+     *  clear is removing. On the primary the wipe is synchronous. */
     clearAll(): void;
     /** `clearAll`, then L3 (if an adapter is attached), resolving once the L3
      *  clear has landed. A clear is never shed by the L3 queue and retries
