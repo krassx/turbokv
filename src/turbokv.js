@@ -11,7 +11,7 @@ const v8 = require('v8');
 const v8ser = require('v8');
 const { callArgCounts } = require('./fastpath');
 const { assertAdapter } = require('./l3/adapter');
-const { L3Queue, withDeadline } = require('./l3/queue');
+const { L3Queue } = require('./l3/queue');
 
 // An unpaired surrogate encodes to U+FFFD in UTF-8, so '\uD800', '\uDC00' and
 // '\uFFFD' all became ONE key in the arena and returned each other's values --
@@ -1430,7 +1430,7 @@ class TurboKV {
         // key in this process would be handed the same dead promise even after
         // L3 came back. A hang is the same outage as a throw; it takes the same
         // path.
-        try { rec = await withDeadline(this.#l3.get(key, { willCache: this.#willCacheRead(level) }), this.#l3RetryMs, 'get'); }
+        try { rec = await this.#queue.deadline(this.#l3.get(key, { willCache: this.#willCacheRead(level) }), this.#l3RetryMs, 'get'); }
         catch (e) {
             this.stats.l3Misses = (this.stats.l3Misses || 0) + 1;
             this.#reportL3(e, { kind: 'get', key });
@@ -2134,11 +2134,11 @@ class TurboKV {
         // answer "not here" within the operation budget rather than never.
         try {
             if (typeof this.#l3.has === 'function')
-                return await withDeadline(this.#l3.has(key), this.#l3RetryMs, 'has') === true;
+                return await this.#queue.deadline(this.#l3.has(key), this.#l3RetryMs, 'has') === true;
             // No has() on the adapter: fall back to a read. Correct, and it
             // transfers the value needlessly -- which is why has() is in the
             // contract as an optional member at all.
-            const rec = await withDeadline(this.#l3.get(key, { willCache: false }), this.#l3RetryMs, 'get');
+            const rec = await this.#queue.deadline(this.#l3.get(key, { willCache: false }), this.#l3RetryMs, 'get');
             return rec !== undefined && rec !== null;
         } catch (e) { this.#reportL3(e, { kind: 'has', key }); return false; }
     }

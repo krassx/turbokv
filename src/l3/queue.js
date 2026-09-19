@@ -20,6 +20,38 @@
 // chain rather than mixing it into any particular key's chain.
 const CLEAR_ID = Symbol('l3-clear');
 
+// Timers that must hold the event loop OPEN while the cache is in service, and
+// must stop holding it the instant close() begins.
+//
+// Both halves are load-bearing and neither substitutes for the other. A timer
+// unref'd at creation lets the process exit out from under the work it was
+// timing: with nothing else ref'd, `await setAsync(k, v)` against a dead L3
+// never settles and the caller is gone before it could have been told. A timer
+// left ref'd after close() becomes the reason a process that asked to shut down
+// cannot -- which is the failure decision 71 exists to prevent.
+//
+// So: ref'd while armed, unref'd wholesale at close, and any timer armed after
+// close is unref'd on arrival.
+class ServiceTimers {
+    #armed = new Set();
+    #closed = false;
+    arm(t) {
+        if (this.#closed) { if (t.unref) t.unref(); return t; }
+        this.#armed.add(t);
+        return t;
+    }
+    disarm(t) { this.#armed.delete(t); }
+    close() {
+        this.#closed = true;
+        for (const t of this.#armed) { if (t.unref) t.unref(); }
+        this.#armed.clear();
+    }
+    get closed() { return this.#closed; }
+    // Test-only: lets a test prove a deadline is holding the loop rather than
+    // inferring it from an exit code.
+    get armed() { return this.#armed.size; }
+}
+
 // Races `promise` against a bound, REJECTING when the bound wins.
 //
 // An adapter is user code talking to a network. "Threw" and "never settled" are
@@ -32,21 +64,38 @@ const CLEAR_ID = Symbol('l3-clear');
 // back on the existing retry-and-abandon path, which already knows what to do
 // with a failed operation.
 //
-// The timer is unref'd: a bound that exists to stop a hang from wedging the
-// process must not itself become the reason the process cannot exit.
-function withDeadline(promise, ms, what) {
+// THE TIMER IS REF'D WHILE IT IS IN SERVICE. It used to be unref'd
+// unconditionally, with the rationale that a bound against a hang must not
+// itself stop the process exiting. That is the right goal and the wrong
+// mechanism, and decision 71 had already measured the difference for the retry
+// backoff and called it a defect: against a hung adapter with nothing else
+// ref'd, the process exits BEFORE ITS OWN DEADLINE -- 37ms into a 300ms bound
+// -- so `await setAsync` never settles, never prints, and exits 0 as though it
+// had succeeded. The backoff's treatment is the model: `timers` keeps the timer
+// ref'd while the queue is in service and unrefs every one of them at close(),
+// so shutdown still cannot be detained. A caller that passes no registry gets
+// the old unref'd behaviour, which is right for a one-off with no lifecycle
+// behind it.
+function withDeadline(promise, ms, what, timers) {
     if (!(ms > 0)) return Promise.resolve(promise);
     return new Promise((resolve, reject) => {
         let done = false;
         const timer = setTimeout(() => {
             if (done) return;
             done = true;
+            if (timers) timers.disarm(timer);
             reject(new Error(`turbokv: the l3 adapter's ${what}() did not settle within ${ms}ms`));
         }, ms);
-        if (timer.unref) timer.unref();
-        Promise.resolve(promise).then(
-            (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } },
-            (e) => { if (!done) { done = true; clearTimeout(timer); reject(e); } });
+        if (timers) timers.arm(timer);
+        else if (timer.unref) timer.unref();
+        const finish = (fn) => (v) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            if (timers) timers.disarm(timer);
+            fn(v);
+        };
+        Promise.resolve(promise).then(finish(resolve), finish(reject));
     });
 }
 
@@ -63,7 +112,11 @@ class L3Queue {
     #count = 0;
     #idle = [];
     #closed = false;
-    #backoffs = new Set();        // retry timers currently sleeping; see close()
+    // Every timer this queue owns -- the sleeping retry backoffs and the
+    // per-attempt deadlines -- in one registry, because they answer the same
+    // question: may this timer hold the process open right now? See
+    // ServiceTimers and close().
+    #timers = new ServiceTimers();
     // The clear barrier. `#clears` counts clears pushed and not yet settled;
     // `#clearGate` is non-null exactly while that count is above zero, and every
     // non-clear dispatch waits on it. See #pushClear.
@@ -103,9 +156,17 @@ class L3Queue {
     // not theoretical -- it exits 0 in the middle of a test's assertions.
     close() {
         this.#closed = true;
-        for (const t of this.#backoffs) { if (t.unref) t.unref(); }
-        this.#backoffs.clear();
+        this.#timers.close();
     }
+
+    // The deadline helper, bound to this queue's lifecycle. The read path lives
+    // in turbokv.js and has no queue chain to hold its operation, but it has
+    // the same obligation: a bounded wait must hold the loop while it is
+    // waiting and let go the moment the cache closes.
+    deadline(promise, ms, what) { return withDeadline(promise, ms, what, this.#timers); }
+
+    // Test-only: deadlines and backoffs currently holding the event loop.
+    get armedTimers() { return this.#timers.armed; }
 
     get pending() { return this.#count; }
     // Bytes currently OUTSTANDING -- queued PLUS in flight, not merely
@@ -334,7 +395,7 @@ class L3Queue {
                     // before an op is abandoned, and a call that has not
                     // settled within it has already exhausted that budget, so a
                     // second knob would only let the two disagree.
-                    try { await withDeadline(this.#apply(op), this.#retryMs, op.kind); outcome = true; break; }
+                    try { await this.deadline(this.#apply(op), this.#retryMs, op.kind); outcome = true; break; }
                     catch (e) {
                         // A clear retries past the budget on purpose: flushing
                         // twice is harmless, and until it lands this process
@@ -358,10 +419,9 @@ class L3Queue {
                         // moment close begins, so it cannot be the reason a
                         // closed process stays alive. See close().
                         await new Promise((r) => {
-                            const t = setTimeout(() => { this.#backoffs.delete(t); r(); },
+                            const t = setTimeout(() => { this.#timers.disarm(t); r(); },
                                                  Math.min(50 * (attempt + 1), 200));
-                            if (this.#closed) { if (t.unref) t.unref(); }
-                            else this.#backoffs.add(t);
+                            this.#timers.arm(t);
                         });
                     }
                 }
@@ -403,4 +463,4 @@ class L3Queue {
 
     drain() { return this.#count === 0 ? Promise.resolve() : new Promise(r => this.#idle.push(r)); }
 }
-module.exports = { L3Queue, withDeadline };
+module.exports = { L3Queue, withDeadline, ServiceTimers };
