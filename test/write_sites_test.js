@@ -47,7 +47,7 @@ const ALLOWED = new Set([
     '#publishArenaSet', '#publishArenaDel', '#publishArenaClear',
     '#publishRingSet', '#publishRingDel',
     '#publishOutbox', '#publishOutboxOp',
-    '#retimeArena', '#retimeRing', '#retimeOutbox',
+    '#retimeArena', '#retimeOutbox',
 ]);
 
 // A class member declaration at the top level of the class body: four spaces,
@@ -88,9 +88,11 @@ ok(strays.length === 0,
 // pass the check above while reopening every defect it exists to close.
 const text = fs.readFileSync(SRC, 'utf8');
 const bodyOf = (name) => {
-    const at = text.indexOf(`\n    ${name}(`) >= 0
-        ? text.indexOf(`\n    ${name}(`)
-        : text.indexOf(`\n    static ${name}(`);
+    let at = -1;
+    for (const prefix of ['', 'static ', 'async ', 'static async ']) {
+        at = text.indexOf(`\n    ${prefix}${name}(`);
+        if (at >= 0) break;
+    }
     if (at < 0) return null;
     // To the next member declaration at class-body indentation.
     const rest = text.slice(at + 1);
@@ -102,6 +104,66 @@ for (const name of ALLOWED) {
     const cancels = body !== null && /#cancelCaps\(|#cancelAllCaps\(/.test(body);
     if (name.startsWith('#publish')) ok(cancels, `${name}() cancels`);
     else ok(!cancels, `${name}() deliberately does not cancel`);
+}
+
+// A helper that is listed must exist. bodyOf() returns null for a name that is
+// gone, and `!cancels` is then vacuously true -- so a retime member deleted in
+// a refactor would go on "passing" its own check forever.
+for (const name of ALLOWED) ok(bodyOf(name) !== null, `${name}() exists`);
+
+// --- L3-DERIVED DATA REACHES THE ARENA THROUGH EXACTLY ONE PROCESS -------
+//
+// Only the primary may write L2 with a value that came from L3. A worker that
+// reads through to L3 fills its own L1 and stops there.
+//
+// Two rounds of review each closed one instance of a worker writing L3-derived
+// data into the shared arena through the submission ring -- a promotion landing
+// over the worker's own acked write, and a failure cap re-writing an old value
+// a hop later -- and each time the next round found another door into the same
+// room. The rule closes the room. This section is what keeps it closed: the
+// behaviours are tested elsewhere, but the behaviours were tested each round
+// too, and each round the next uncovered site was a different behaviour.
+//
+// The write primitives above plus the publish and retime families: anything
+// that puts bytes into the arena, now or a hop later.
+const L3_FORBIDDEN = PRIMITIVES.concat([...ALLOWED].map(n => n + '('));
+// The ONE route L3-derived data may take, and the methods that handle it.
+const L3_ROUTE = '#publishL3Derived(';
+const L3_METHODS = ['#fillFromL3', '#fetchFromL3', '#acceptFromL3'];
+
+for (const m of L3_METHODS) {
+    const body = bodyOf(m);
+    ok(body !== null, `${m}() exists`);
+    if (body === null) continue;
+    const code = body.split('\n').map(l => l.replace(/^\s*\/\/.*$/, '')).join('\n');
+    const strayed = L3_FORBIDDEN.filter(p => code.includes(p));
+    ok(strayed.length === 0,
+       strayed.length === 0
+           ? `${m}() writes the arena through nothing but ${L3_ROUTE.slice(0, -1)}()`
+           : `${m}() reaches the arena directly: ${strayed.join(', ')}`);
+}
+
+// Non-vacuity: the route is actually taken, so the check above is not passing
+// because the promotion stopped writing L2 altogether.
+{
+    const body = bodyOf('#fillFromL3');
+    ok(body !== null && body.includes(L3_ROUTE),
+       `#fillFromL3() does promote, through ${L3_ROUTE.slice(0, -1)}()`);
+}
+
+// And the route itself refuses anyone but the primary. Without this the
+// section above would pass for a helper that had quietly become a passthrough.
+{
+    const body = bodyOf('#publishL3Derived');
+    ok(body !== null, '#publishL3Derived() exists');
+    ok(body !== null && /#id\s*!==\s*0/.test(body),
+       '#publishL3Derived() refuses a caller that is not the primary');
+    // It is reached from ONE place. A second caller is not wrong in itself,
+    // but it is exactly how "the organising rule" decays back into a list of
+    // special cases, so it has to be a deliberate edit here.
+    const calls = text.split('\n')
+        .filter(l => !/^\s*\/\//.test(l) && l.includes(L3_ROUTE) && !l.includes('static #publishL3Derived'));
+    ok(calls.length === 1, `#publishL3Derived() has exactly one call site (${calls.length})`);
 }
 
 console.log(fail ? `  ${fail} FAILURES` : '  [write-sites] all passed');

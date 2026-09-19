@@ -225,37 +225,28 @@ const L1_SECOND_CHANCE_BUDGET = 16;
 // THE WORKER'S HALF OF `l3FailTtlMs`.
 //
 // A write L3 rejected is kept locally under a short TTL, so the box serves
-// through the outage and then converges (decision 68). On the PRIMARY that cap
-// is applied to L2 on the spot. A WORKER cannot write L2: its write is still in
-// the submission ring when the L3 outcome arrives a microtask later, so the
-// compare that keeps the cap safe -- "is the arena still holding exactly the
-// value I wrote" -- finds the PREVIOUS value, or nothing at all, and refuses.
-// The cap was then never applied to L2 at all: the value L3 refused sat in the
-// shared arena with no expiry, forever, for every process on the box.
+// through the outage and then converges (decision 68). The L2 half of that cap
+// is applied by the PRIMARY in both cases -- on its own behalf, or on a
+// worker's behalf through the conditional 'r' op (see #capArena). What stays
+// on the worker is its OWN READS: between the moment the cap falls due and the
+// moment the primary applies it, the capped L1 entry has expired and a read
+// falls straight through to the uncapped L2 copy, so the worker would serve
+// the value L3 refused past its own deadline. #l3Caps is that guard, and the
+// two numbers below bound it.
 //
-// So the worker retries the compare until it is meaningful. The two numbers:
+//   POLL is how promptly a retired entry stops costing anything. It is a
+//   timestamp compare per entry -- no arena work at all since the cap became a
+//   conditional op -- and the timer only exists while an entry is outstanding.
 //
-//   POLL is how promptly the cap lands once the primary has applied the write.
-//   The divergence this bounds is measured in seconds (`l3FailTtlMs` defaults
-//   to 5000), so 20ms adds 0.4% to that bound, and the timer only exists while
-//   a cap is outstanding.
-//
-//   WINDOW is how long a cap can still be worth applying. A submitted write
-//   reaches L2 either on the doorbell -- immediately -- or, if that is lost, on
-//   the primary's maintenance backstop, which defaults to 500ms. Two hops are
-//   needed (apply the write, then apply the cap), so the window is four such
-//   intervals: enough for both hops to miss their doorbell on a loaded primary,
-//   and short enough that a write which is never going to land stops being
-//   retried.
+//   WINDOW is how long PAST its deadline an entry is kept. Before the deadline
+//   the capped L1 entry answers and the guard is not consulted; after it, the
+//   question is whether the primary has applied the cap yet. A cap sent in the
+//   ordinary IPC batch is applied on the primary's next turn, or -- if that
+//   batch was shed -- never; four maintenance backstop intervals (500ms each)
+//   is long enough for a loaded primary and short enough that a guard for a
+//   cap that is never coming stops making the key miss.
 const L3_CAP_POLL_MS = 20;
 const L3_CAP_WINDOW_MS = 2000;
-//   SCAN is how many caps one tick may examine. A tick that finds the key
-//   present copies its value out of the arena to compare it, and a full pass
-//   over the 4096 bound below was measured at 1.69ms for 8KB values -- an
-//   event-loop stall every 20ms, on a hot worker, for the length of the
-//   outage. 64 holds that at ~26us, 0.13% of the interval, and a full pass
-//   still completes in 64 ticks (1.28s), inside one window.
-const L3_CAP_SCAN = 64;
 // Bound on outstanding caps, for the same reason #pendingDel has one: a worker
 // writing hard against a dead L3 must not grow a map without limit. Dropping
 // one costs a longer local disagreement, which is what this whole mechanism is
@@ -271,9 +262,9 @@ const PENDING_DEL_MAX = 4096;
 // ring. A check is a has(), which copies no value, but #drain() runs from every
 // get() and has(), and a ring that keeps lapping between reads makes every read
 // wrap again -- so a full pass over the bound (measured at 0.28ms) would be
-// paid per read, ~28% of a core at 1k reads/s. Same shape and the same
-// reasoning as L3_CAP_SCAN, and the remainder is carried to the next drain
-// rather than dropped.
+// paid per read, ~28% of a core at 1k reads/s. A budgeted slice with the
+// remainder carried to the next drain rather than dropped -- the shape the
+// cap poll used to share, before the cap stopped touching the arena at all.
 const PENDING_DEL_SCAN = 64;
 let storeReady = false;
 let submitName = null;    // primary: the segment it created, null = IPC transport
@@ -1037,18 +1028,14 @@ class TurboKV {
         };
     }
     __unsafeCapState() {
-        let sent = 0;
-        for (const c of this.#l3Caps.values()) if (c.sent) sent++;
-        return { caps: this.#l3Caps.size, sent, timer: this.#capTimer !== null };
+        return { caps: this.#l3Caps.size, timer: this.#capTimer !== null };
     }
-    // Test-only: runs exactly one poll tick. The per-tick bound is a property
-    // of one tick, and sampling it from a loaded event loop measures however
-    // many ticks the sample happened to span -- which made the obvious timing
-    // test flaky in both directions.
+    // Test-only: runs exactly one retire tick, so a test can drive the guard
+    // rather than wait on a 20ms interval it does not control.
     __unsafeRunCaps() { this.#runCaps(); }
     // Test-only: stops the automatic poll so a test can drive it a tick at a
-    // time with nothing racing it. Only #deferCap re-arms the timer, so a test
-    // that defers nothing after this call keeps it stopped.
+    // time with nothing racing it. Only #noteCap re-arms the timer, so a test
+    // that caps nothing after this call keeps it stopped.
     __unsafePauseCaps() { this.#stopCapTimer(); }
     // Test-only: the ring position recorded for one key's removal. See
     // #deletedAt -- the position is the whole content of that guard, and a
@@ -1918,27 +1905,12 @@ class TurboKV {
         }
     }
 
-    // Fill downward per minLevel. A worker cannot write L2 directly, so its
-    // promotion goes through the submission ring like any other write; a full
-    // ring sheds it, and "no promotion" is a benign failure.
+    // Fill downward per minLevel. The L2 half goes through #publishL3Derived,
+    // which is the ONE route L3-derived data takes into the arena and refuses
+    // to take it from anyone but the primary -- see that method.
     #fillFromL3(key, rec, level, accepted) {
         const cap = this.#l3Ttl(rec);
-        if (level <= 2) {
-            if (this.#id === 0) {
-                // The primary skips the ring records it writes itself, so
-                // nothing else drops the copies other instances in THIS
-                // process are holding -- decision 64's family, of which this
-                // is the third call site. A sibling instance went on serving
-                // its own stale L1 copy indefinitely after a promotion.
-                if (TurboKV.#publishArenaSet(key, accepted.enc, 0, cap)) TurboKV.#dropOthers(key, this);
-            }
-            // A promotion is a write like any other, so it supersedes an
-            // outstanding cap -- but only if the ring takes it. Cancelling
-            // before the push, which is where this sat, threw the cap away for
-            // a promotion that was shed, and the arena then held the value L3
-            // refused with no expiry at all.
-            else if (this.#ringIdx >= 0) this.#publishRingSet(key, accepted.enc, cap);
-        }
+        if (level <= 2) TurboKV.#publishL3Derived(key, accepted.enc, cap, this);
         if (level === 1) {
             const v = this.#codec && !this.#l1Decoded ? accepted.enc : accepted.value;
             this.#l1Put(key, v, native.hashKey(key), this.#noCodec ? 0 : accepted.enc.length,
@@ -2056,10 +2028,11 @@ class TurboKV {
 
     // Cap what the local tiers hold for `key` at `l3FailTtlMs`.
     //
-    // SHORTENING ONLY. An entry that already expires sooner keeps its own
-    // deadline, and a key that is no longer resident is left alone rather than
-    // resurrected -- the point is to bound how long this box may disagree with
-    // L3, never to put anything back.
+    // SHORTENING ONLY, IN BOTH TIERS. An entry that already expires sooner
+    // keeps its own deadline, and a key that is no longer resident is left
+    // alone rather than resurrected -- the point is to bound how long this box
+    // may disagree with L3, never to put anything back and never to give
+    // anything a longer life than its caller asked for.
     #capAfterL3Failure(key, enc, ttlMs) {
         const cap = ttlMs > 0 ? Math.min(ttlMs, this.#l3FailTtlMs) : this.#l3FailTtlMs;
         // Counted once per failed write that actually re-timed something, so
@@ -2071,28 +2044,30 @@ class TurboKV {
             const deadline = monoMs() + cap;
             if (!e.exp || e.exp > deadline) { e.exp = deadline; applied = true; }
         }
-        if (this.#capL2AfterL3Failure(key, enc, cap)) applied = true;
-        // A WORKER's write is still in the submission ring at this point --
-        // this runs a microtask after set() returned, and the primary has not
-        // drained yet -- so the compare above looked at the arena's PREVIOUS
-        // value and correctly refused. Correct, and it left the value L3
-        // rejected sitting in the SHARED arena with no expiry, forever. The
-        // compare is right; it was asked too early. Retry it until it is
-        // meaningful, or until the write is plainly never going to land.
-        //
-        // The primary needs none of this: its own write is already in the
-        // arena, so a refusal there means the value really was superseded.
-        else if (this.#id !== 0 && storeReady && !this.#primaryDead && cap > 0) {
-            this.#deferCap(key, enc, cap);
-        }
+        const l2 = this.#capL2AfterL3Failure(key, enc, cap);
+        if (l2 === 'capped') applied = true;
+        // 'moot' is not a failure: the arena no longer holds the value this
+        // cap was taken against, or already expires it sooner, so there is
+        // nothing left to bound. Only 'unable' -- no arena to write, no
+        // primary to ask -- leaves the box possibly disagreeing with L3 for
+        // longer than l3FailTtlMs, which is what this counter is for.
+        else if (l2 === 'unable') this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + 1;
         if (applied) this.stats.l3FailTtlApplied = (this.stats.l3FailTtlApplied || 0) + 1;
     }
 
-    // Remember a cap that could not be applied yet, and make sure something
-    // comes back to it. The timer is unref'd -- a cap is convergence, not work
-    // a process should be kept alive for -- and only runs while a cap is
-    // outstanding.
-    #deferCap(key, enc, cap) {
+    // Remember a cap for THIS WORKER'S OWN READS, and make sure something comes
+    // back to retire it.
+    //
+    // This map is no longer a queue of work: the cap itself has already been
+    // handed to the primary by the time this is called. What it holds is the
+    // read guard -- between the moment the cap falls due and the moment the
+    // primary applies it, the capped L1 entry has expired and a read would
+    // fall straight through to the uncapped L2 copy, so the worker would serve
+    // the value L3 refused past its own deadline. See #capExpired.
+    //
+    // The timer is unref'd -- convergence is not work a process should be kept
+    // alive for -- and only runs while an entry is outstanding.
+    #noteCap(key, enc, cap) {
         // A failed write's promise can settle AFTER close(): the queue keeps
         // retrying until it is told to stop, and #closeL3 tells it only after a
         // bounded drain. Arming a timer then is low harm -- it is unref'd and
@@ -2101,7 +2076,11 @@ class TurboKV {
         if (this.#closePromise !== null) return;
         if (this.#l3Caps.size >= L3_CAP_MAX) return;
         const now = monoMs();
-        this.#l3Caps.set(key, { enc, cap, deadline: now + cap, until: now + L3_CAP_WINDOW_MS });
+        // Retired one window PAST the deadline, which is the only stretch in
+        // which the guard can bite: before it the capped L1 entry answers, and
+        // by the end of it the primary has either applied the cap it was sent
+        // or is not coming back.
+        this.#l3Caps.set(key, { enc, cap, deadline: now + cap, until: now + cap + L3_CAP_WINDOW_MS });
         if (this.#capTimer !== null) return;
         this.#capTimer = setInterval(() => this.#runCaps(), L3_CAP_POLL_MS);
         if (this.#capTimer.unref) this.#capTimer.unref();
@@ -2112,81 +2091,19 @@ class TurboKV {
         clearInterval(this.#capTimer); this.#capTimer = null;
     }
 
-    // One pass over the outstanding caps.
+    // One pass over the outstanding read-guard entries: retire the ones whose
+    // window has closed, and stop the timer once none is left.
     //
-    // An entry is finished when the arena no longer needs it: the key is gone,
-    // a newer value superseded ours, or the entry now carries a deadline no
-    // later than the one the cap asked for. Otherwise the cap is (re)submitted
-    // while there is still budget, and abandoned once there is not -- a write
-    // that has not reached L2 within the window is not going to, so there is
-    // nothing left to re-time.
+    // This used to be where the cap was retried against the arena until the
+    // compare became meaningful, at up to 64 entries a tick because each one
+    // COPIED A VALUE OUT of the arena. The cap is a conditional operation the
+    // primary applies now (see #capArena), so there is nothing to retry and no
+    // arena work here at all -- only a timestamp compare.
     #runCaps() {
         if (!storeReady || this.#primaryDead) { this.#l3Caps.clear(); this.#stopCapTimer(); return; }
         const now = monoMs();
-        // A BOUNDED SLICE OF THE ARENA WORK. Deciding whether a cap can be
-        // applied means asking the arena, and that COPIES A VALUE OUT of it:
-        // measured at 1.69ms for 4096 entries of 8KB, which is an event-loop
-        // stall every 20ms on a hot worker for the length of an L3 outage. So
-        // at most L3_CAP_SCAN caps reach the arena per tick.
-        //
-        // A cap that has already been SUBMITTED costs nothing here and is
-        // deliberately outside the budget: it is kept only so this worker's own
-        // reads stay honest until its deadline, which is a timestamp compare.
-        // Letting those consume the slice would starve the caps that still have
-        // work to do.
-        let budget = L3_CAP_SCAN;
-        const rotate = [];
-        for (const [key, c] of this.#l3Caps) {
-            if (c.sent) {
-                // Kept PAST its deadline, which is the only time the read guard
-                // can bite: before it the capped L1 entry answers, and after it
-                // the question is whether the arena has applied the cap yet.
-                // One more window is the bound -- by then the primary has
-                // either applied a submission it accepted or is not coming
-                // back. No arena work either way, just a timestamp.
-                if (now >= c.deadline + L3_CAP_WINDOW_MS) this.#l3Caps.delete(key);
-                continue;
-            }
-            if (budget <= 0) continue;
-            budget--;
-            if (this.#stepCap(key, c, now)) rotate.push(key);
-            else this.#l3Caps.delete(key);
-        }
-        // Oldest first, so the next tick starts where this one stopped: Map
-        // iteration is insertion order, and re-inserting moves an entry to the
-        // back. Done after the loop rather than inside it, because re-inserting
-        // during iteration would let the same entry be visited twice.
-        for (const key of rotate) {
-            const c = this.#l3Caps.get(key);
-            if (c === undefined) continue;
-            this.#l3Caps.delete(key); this.#l3Caps.set(key, c);
-        }
+        for (const [key, c] of this.#l3Caps) if (now >= c.until) this.#l3Caps.delete(key);
         if (this.#l3Caps.size === 0) this.#stopCapTimer();
-    }
-
-    // One not-yet-submitted cap, one tick. Returns whether it is still worth
-    // keeping. THERE IS NO CONFIRMATION PHASE: once the cap has been submitted
-    // the arena has nothing left to tell us, because either it applies it -- in
-    // which case the entry expires on its own and this worker's reads converge
-    // through the ordinary TTL -- or it does not, in which case the read guard
-    // below is what converges them, and it needs no help from the arena to do
-    // that. Watching for the confirmation instead cost a copy per entry per
-    // tick and, on a near-full map, reported caps that HAD been applied as
-    // unapplied because the confirmation had not come round yet.
-    #stepCap(key, c, now) {
-        // ABSENT IS NOT FINISHED, on a worker: the write being re-timed may
-        // simply still be in the submission ring, which is the entire reason
-        // this map exists. #capL2AfterL3Failure answers both questions at once
-        // -- is it there, and is it still mine -- and the window is what ends
-        // the wait when the answer stays no.
-        if (this.#capL2AfterL3Failure(key, c.enc, c.cap)) {
-            c.sent = true;
-            this.stats.l3FailTtlApplied = (this.stats.l3FailTtlApplied || 0) + 1;
-            return true;                      // kept for the read guard only
-        }
-        if (now < c.until) return true;
-        this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + 1;
-        return false;
     }
 
     // Is the arena's copy of `key` one this worker has already asked to be
@@ -2204,30 +2121,66 @@ class TurboKV {
         return c !== undefined && monoMs() >= c.deadline && sameStored(raw, c.enc);
     }
 
-    // L2 has no "retime this entry" operation, so the cap has to be applied by
-    // writing the value again -- which is only safe while the arena still holds
-    // THIS value. If a later write already superseded it, or a delete removed
-    // it, rewriting would resurrect an older value, and a stale value is the
-    // one failure mode this system does not accept. A local entry that outlives
-    // its cap because the compare missed costs a longer disagreement; getting
-    // it wrong the other way costs correctness.
+    // The L2 half of the cap. Returns 'capped', 'moot' (nothing left to bound)
+    // or 'unable' (no way to bound it) -- see #capAfterL3Failure.
+    //
+    // A WORKER NEVER WRITES L2 HERE, OR ANYWHERE. It used to: it compared the
+    // arena itself and then submitted a re-write of the old value through the
+    // ring or the outbox, and the compare and the write were separated by a
+    // hop. Anything the primary applied inside that hop -- a newer write, a
+    // delete -- was overwritten by the cap when it landed, resurrecting a
+    // deleted key or replacing a newer value box-wide for l3FailTtlMs. The
+    // compare was never wrong; it was asked in the wrong PROCESS. So the
+    // worker asks the primary to apply the cap CONDITIONALLY, and the primary
+    // -- which writes the arena synchronously -- compares and writes with
+    // nothing in between. See #capArena and applyBatch's 'r'.
     #capL2AfterL3Failure(key, enc, cap) {
-        if (!storeReady || this.#primaryDead) return false;
-        if (this.#pendingDel.size && this.#pendingDel.has(key)) return false;
-        let cur;
-        try { cur = native.get(key); } catch { return false; }
-        if (cur === undefined || !sameStored(cur, enc)) return false;
+        if (!storeReady || this.#primaryDead) return 'unable';
+        // Our own delete is on its way to the arena. There is nothing left to
+        // re-time and rewriting the value would resurrect it.
+        if (this.#pendingDel.size && this.#pendingDel.has(key)) return 'moot';
         if (this.#id === 0) {
-            if (!TurboKV.#retimeArena(key, enc, cap)) return false;
-            // Decision 64's family again: the primary skips its own ring
-            // records, so a sibling instance keeps an L1 copy carrying the
-            // expiry this call just SHORTENED -- and goes on serving, past the
-            // cap, the very value L3 refused.
-            TurboKV.#dropOthers(key, this);
-            return true;
+            const r = TurboKV.#capArena(key, enc, cap);
+            // Decision 64's family: the primary skips its own ring records, so
+            // a sibling instance keeps an L1 copy carrying the expiry this
+            // call just SHORTENED -- and goes on serving, past the cap, the
+            // very value L3 refused.
+            if (r === 'capped') TurboKV.#dropOthers(key, this);
+            return r;
         }
-        if (this.#ringIdx >= 0) return this.#retimeRing(key, enc, cap);
-        return this.#retimeOutbox(key, enc, cap);
+        // The read guard is this worker's own half and is recorded whether or
+        // not the request reaches the primary: until the cap lands, this
+        // worker must stop serving the uncapped L2 copy at the deadline.
+        this.#noteCap(key, enc, cap);
+        return this.#retimeOutbox(key, enc, cap) ? 'capped' : 'unable';
+    }
+
+    // THE CONDITIONAL RE-TIME, and the only place a cap is ever written.
+    //
+    // Runs ON THE PRIMARY -- either for its own failed write or on behalf of a
+    // worker (applyBatch's 'r') -- because only there are the compare and the
+    // write one synchronous step with nothing able to land between them.
+    //
+    // Two conditions, and both are load-bearing:
+    //
+    //   - the arena must still hold the value the cap was taken against. A
+    //     later write superseded it, or a delete removed it: re-writing would
+    //     put an older value back, and a stale value is the one failure mode
+    //     this system does not accept.
+    //   - the entry's REMAINING LIFE must be longer than the cap. The cap is a
+    //     CEILING on how long this box may disagree with L3, not a new lease:
+    //     a blind rewrite with `ttlMs = cap` measured from now EXTENDED an
+    //     entry whose own TTL expired sooner, so `set(k, v, {ttlMs: 2000})`
+    //     whose L3 write failed at 1513ms had its remaining life jump back to
+    //     5000ms and outlived what the caller asked for. The remaining life is
+    //     readable here, synchronously, right after the compare's own get().
+    static #capArena(key, enc, cap) {
+        let cur;
+        try { cur = native.get(key); } catch { return 'unable'; }
+        if (cur === undefined || !sameStored(cur, enc)) return 'moot';
+        const rem = native.lastTtlRemainingMs();
+        if (rem > 0 && rem <= cap) return 'moot';
+        return TurboKV.#retimeArena(key, enc, cap) ? 'capped' : 'unable';
     }
 
     // Local first, then L3. L3-first was rejected: when the remote is
@@ -3263,6 +3216,17 @@ class TurboKV {
             const op = b[i], key = b[i + 1];
             if (op === 's') { TurboKV.#publishArenaSet(key, b[i + 2], msg.id, b[i + 3]); TurboKV.#localDrop(key); }
             else if (op === 'd') { TurboKV.#publishArenaDel(key, msg.id); TurboKV.#localDrop(key); }
+            // A WORKER'S CONDITIONAL RE-TIME (decision 68). The worker cannot
+            // write L2 at all, so it names the value its cap was taken against
+            // and the primary applies the short TTL only if the arena still
+            // holds exactly that -- compare and write in one synchronous step,
+            // here, with nothing able to land between them. Every submission
+            // ring was drained to empty above, so the worker's own write for
+            // this key has already been applied and a 'moot' answer means it
+            // really was superseded rather than merely not arrived.
+            else if (op === 'r') {
+                if (TurboKV.#capArena(key, b[i + 2], b[i + 3]) === 'capped') TurboKV.#localDrop(key);
+            }
             else if (op === 'c') { TurboKV.#publishArenaClear(msg.id); for (const c of instances) c.clearLocal(); }
             // The two halves of a WORKER's L3 clear generation. The worker
             // cannot write the header itself (PROT_READ; a store there is a
@@ -3306,20 +3270,24 @@ class TurboKV {
     // failure the cap exists to prevent, reintroduced by the fix for the one
     // below it.
     //
-    // A NEW VALUE FOR `fullKey` IS ON ITS WAY INTO THE SUBMISSION RING, so no
-    // outstanding cap for that key may still be submitted: the cap decides by
-    // comparing against the ARENA, and between the arena and the ring there is
-    // a window in which the arena still holds the old value while the ring
-    // already holds the new one -- a cap submitted there is ordered BEHIND the
-    // new value and re-applies the old one on top of it.
+    // A NEW VALUE FOR `fullKey` HAS BEEN PUBLISHED, so the read guard held for
+    // that key is finished: it exists to make this worker MISS on the value
+    // L3 refused, and that value is no longer the one anybody is going to
+    // read. Leaving the entry would make the key miss locally past the cap's
+    // deadline even though a newer value is on its way.
+    //
+    // This cancel used to carry a second, heavier job -- stopping a cap that
+    // would otherwise be SUBMITTED behind the new write and re-apply the old
+    // value on top of it. That hazard is gone: a cap is a conditional
+    // operation the primary applies, and a primary that no longer holds the
+    // capped value refuses it (see #capArena). The cancel stays for the read
+    // guard, which is per-instance.
     //
     // ACROSS EVERY INSTANCE IN THIS PROCESS, which is decision 64's family
-    // again and the same shape as #dropOthers. The caps are per-instance and
-    // the submission ring is per-process, so instance A's cap for `k` is
-    // ordered behind sibling B's write to `k` exactly as it would be behind
-    // A's own -- and instance-scoped cancelling left the arena holding the
-    // capped old value for a full l3FailTtlMs. `instances` is normally a set
-    // of one, so this costs a branch per write in the common case.
+    // again and the same shape as #dropOthers: sibling B's write to `k` makes
+    // instance A's guard for `k` just as obsolete as A's own write would.
+    // `instances` is normally a set of one, so this costs a branch per write
+    // in the common case.
     static #cancelCaps(fullKey) {
         for (const c of instances) c.#cancelCap(fullKey);
     }
@@ -3361,6 +3329,48 @@ class TurboKV {
     static #publishArenaClear(writerId) {
         native.clearAll(writerId);
         TurboKV.#cancelAllCaps();
+    }
+    // --- L3-DERIVED DATA REACHES THE ARENA THROUGH EXACTLY ONE PROCESS ----
+    //
+    // ONLY THE PRIMARY MAY WRITE L2 WITH A VALUE THAT CAME FROM L3. A worker
+    // that reads through to L3 fills its OWN L1 and stops there.
+    //
+    // This is an organising rule, not a special case, and it exists because a
+    // whole family of defects lives at the seam between an L3 read and the
+    // submission ring's asynchrony. A worker's write is NOT in the arena when
+    // the call returns, and nothing orders it against the other work that
+    // writes the arena -- so a promotion pushed into the ring is ordered
+    // against the primary's synchronous writes, against every other worker's
+    // ring, and against this worker's own earlier records by nothing at all.
+    // Two rounds of review each closed one instance of that (a promotion over
+    // an acked write, a cap re-writing an old value a hop later) and each time
+    // the next round found another door into the same room. The primary writes
+    // the arena synchronously, so a promotion it makes is ordered against
+    // everything else it does; making it the only writer of L3-derived data
+    // closes the room rather than one more door.
+    //
+    // THE COSTS ARE KNOWN AND ACCEPTED. Each worker pays its own L3 read for
+    // the same key -- bounded by the worker count, which is the same bound the
+    // thundering-herd design (decision 69's #inflight sharing) already
+    // accepts. And while the primary is down nothing is promoted at all, which
+    // is a MISS: the failure mode this system is built around, unlike the
+    // stale and resurrected values the rule removes.
+    //
+    // Returns whether the arena took it. `false` on a worker is not a failure
+    // to report: nothing was lost, the value is in that worker's L1 and in L3.
+    //
+    // test/write_sites_test.js is what keeps this true: it fails if any write
+    // primitive or publish helper other than this one appears in #fillFromL3,
+    // and if this method ever stops refusing a non-primary caller.
+    static #publishL3Derived(key, enc, ttlMs, by) {
+        if (by.#id !== 0) return false;
+        if (!TurboKV.#publishArenaSet(key, enc, 0, ttlMs)) return false;
+        // The primary skips the ring records it writes itself, so nothing else
+        // drops the copies other instances in THIS process are holding --
+        // decision 64's family. A sibling instance went on serving its own
+        // stale L1 copy indefinitely after a promotion.
+        TurboKV.#dropOthers(key, by);
+        return true;
     }
     #publishRingSet(key, enc, ttlMs) {
         if (!native.submitSet(key, enc, ttlMs)) return false;
@@ -3404,28 +3414,24 @@ class TurboKV {
     // The cap's own write: the SAME value, with a shorter deadline. Named
     // apart from the publish family because it is the one write that must not
     // cancel -- doing so would drop the entry the read guard still needs, and
-    // #stepCap is what retires it instead.
+    // #runCaps is what retires that instead. Reached only through #capArena,
+    // which is what makes the write conditional.
     static #retimeArena(key, enc, cap) { return native.set(key, enc, 0, cap) === true; }
-    #retimeRing(key, enc, cap) {
-        if (!native.submitSet(key, enc, cap)) return false;
-        this.#ringDoorbell();
-        return true;
-    }
-    // ONE MEMBER PER TRANSPORT, which is the whole point of naming the family.
-    // The publish family had an arena route, a ring route and an IPC route;
-    // the retime family had only the first two, so on a `transport: 'ipc'`
-    // worker the cap had nowhere to go and `l3FailTtlMs` simply did not exist:
-    // a value L3 had explicitly refused sat in the SHARED arena with no expiry,
-    // forever, and the only trace was an l3FailTtlUnapplied counter. That is
-    // the same convergence promise decision 68 makes, unkept on one transport.
+    // THE WORKER'S ONLY ROUTE, on both transports. There used to be a ring
+    // member here as well, which made the cap a blind re-write ordered against
+    // the primary's own work by nothing (see #capL2AfterL3Failure); now the
+    // worker sends the primary a REQUEST and the primary decides. `r` carries
+    // the value the cap was taken against, which is exactly what the primary's
+    // compare needs, and it travels in the ordinary IPC batch -- which
+    // applyBatch drains every submission ring to empty before applying, so
+    // this worker's own write for the key has provably landed by the time the
+    // compare runs.
     //
-    // Like #publishOutbox, this one is queued rather than confirmed -- flush()
-    // can shed the batch -- so #stepCap's `sent` means "handed over" here
-    // rather than "accepted by the ring". A shed retime leaves the entry to
-    // time out on its window, which is the same outcome as before this route
-    // existed, for the subset of cases where the batch is dropped.
+    // Like #publishOutbox this is queued rather than confirmed: flush() can
+    // shed the batch under congestion, and a shed one is counted as
+    // l3FailTtlUnapplied there rather than silently lost.
     #retimeOutbox(key, enc, cap) {
-        this.#outbox.push('s', key, enc, cap);
+        this.#outbox.push('r', key, enc, cap);
         this.#schedule(encodedBytes(enc) + key.length + 48);
         return true;
     }

@@ -35,9 +35,10 @@ if (process.env.TCG_ROLE === 'worker') {
         f.store.set('never-local', { value: 'L3VALUE', expiresAt: 0 });
         const w = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l3: f.adapter });
 
-        // 0. the ordinary worker promotion, first: a worker cannot write L2
-        //    directly, so its promotion goes through the submission ring like
-        //    any other write. The parent checks L2 afterwards.
+        // 0. the ordinary worker promotion, first: the worker reads through to
+        //    L3 and fills its OWN L1, and STOPS THERE. Only the primary may
+        //    write L2 with L3-derived data -- see #publishL3Derived. The
+        //    parent checks that L2 was left alone afterwards.
         f.store.set('promote', { value: 'L3VALUE', expiresAt: 0 });
         const p = await w.getAsync('promote');
         ok(p === 'L3VALUE', `the worker reads through to L3 (${p})`);
@@ -300,6 +301,10 @@ if (process.env.TCG_ROLE === 'worker') {
     {
         const primary = TurboKV.createPrimary(ARENA, 16 << 20, 1 << 14, { storage: 'bytes' });
         primary.set('gone', 'L2VALUE');
+        // A second handle on the same arena WITH an adapter, used at the very
+        // end as the control for the worker's refusal above.
+        const f2 = makeFake();
+        const primary2 = new TurboKV({ storage: 'bytes', l3: f2.adapter });
         const code = await new Promise((resolve) => {
             const kid = fork(__filename, [], {
                 env: { ...process.env, TCG_ROLE: 'worker', TCG_ARENA: ARENA }, stdio: 'inherit',
@@ -317,8 +322,24 @@ if (process.env.TCG_ROLE === 'worker') {
         TurboKV.drainSubmissions(8192);
         ok(primary.get('gone') === undefined,
            `the worker's delete still stands in L2 afterwards (${primary.get('gone')})`);
-        ok(primary.get('promote') === 'L3VALUE',
-           `a worker's legitimate promotion did reach L2 through the ring (${primary.get('promote')})`);
+        // AND THE WORKER'S PROMOTION DID NOT REACH L2 AT ALL. That is the
+        // architectural rule, not an accident of timing: L3-derived data
+        // reaches the shared arena through exactly one process, and the ring
+        // was drained above, so a value that was going to arrive has arrived.
+        // The cost is named and accepted -- every worker pays its own L3 read
+        // for the key, bounded by the worker count -- and it buys the removal
+        // of a whole family of orderings between an L3 reply and the ring.
+        ok(primary.get('promote') === undefined,
+           `a worker's promotion never reaches L2 (${primary.get('promote')})`);
+        ok(native.get('promote') === undefined,
+           `not through the ring, not through the outbox (${native.get('promote')})`);
+        // And the primary's own promotion still does, so the check above is
+        // not passing because promotion stopped working.
+        f2.store.set('promote', { value: 'L3VALUE', expiresAt: 0 });
+        ok(await primary2.getAsync('promote') === 'L3VALUE', 'the primary still reads through to L3');
+        ok(native.get('promote') === 'L3VALUE',
+           `and ITS promotion does reach L2 (${native.get('promote')})`);
+        primary2.close();
         primary.close();
     }
 

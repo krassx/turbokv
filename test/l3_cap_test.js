@@ -2,25 +2,28 @@
 // "SERVE THROUGH THE OUTAGE, THEN CONVERGE" -- ON A WORKER.
 //
 // Decision 68 keeps a write L3 rejected in the local tiers under a short TTL,
-// so the box goes on serving while L3 is unreachable and then converges. On the
-// PRIMARY the cap is applied to L2 on the spot. A WORKER cannot write L2: its
-// write is still sitting in the submission ring when the L3 outcome arrives a
-// microtask later, so the compare that keeps the cap safe -- "is the arena
-// still holding exactly the value I wrote" -- looked at the PREVIOUS value, or
-// at nothing, and refused.
+// so the box goes on serving while L3 is unreachable and then converges. A
+// WORKER MAY NOT WRITE L2 AT ALL, so the cap is a CONDITIONAL OPERATION IT
+// ASKS THE PRIMARY TO APPLY: the request names the value the cap was taken
+// against, and the primary -- the arena's only writer, and synchronous --
+// re-times the entry only if that is still what it holds.
 //
-// The compare is right and was asked too early, so it is now retried until it
-// is meaningful. Two things have to hold afterwards:
+// The shape before this was a blind re-write submitted by the worker after its
+// own compare, with a hop in between: anything the primary applied inside that
+// hop was overwritten when the cap landed, resurrecting a deleted key or
+// putting an older value back box-wide for l3FailTtlMs. The compare was never
+// wrong; it was asked in the wrong process.
+//
+// Three things have to hold:
 //
 //   - the value L3 refused no longer sits in the SHARED arena with no expiry,
 //     where every process on the box reads it forever;
-//   - and this worker's own reads stop serving it AT the deadline, rather than
+//   - this worker's own reads stop serving it AT the deadline, rather than
 //     whenever the primary gets around to applying the cap -- otherwise the
 //     capped L1 entry expires and the read falls straight through to the
-//     uncapped L2 copy.
-//
-// The compare must still refuse when it should: a value another writer
-// superseded must never be put back by a cap.
+//     uncapped L2 copy;
+//   - and the cap only ever SHORTENS. A value another writer superseded is
+//     never put back, and an entry whose own TTL expires sooner keeps it.
 const { fork } = require('child_process');
 const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
@@ -49,18 +52,32 @@ if (process.env.TCC_ROLE === 'worker') {
            `the worker converges at the cap rather than falling through to L2 (${JSON.stringify(w.get('shed'))})`);
         ok(await w.hasAsync('shed') === false,
            'hasAsync agrees, rather than reporting a value get() calls gone');
+        ok(w.stats.l3FailTtlApplied >= 1,
+           `the local copy was capped (${w.stats.l3FailTtlApplied})`);
 
-        // And the SHARED arena gets the deadline, which is the half other
-        // processes depend on. The primary drains on its maintenance timer.
-        let capped = false;
-        for (let i = 0; i < 60 && !capped; i++) {
+        // AND THE SHARED ARENA GETS THE DEADLINE, which is the half every
+        // other process on the box depends on.
+        //
+        // A SECOND HANDLE with a long cap, deliberately: on the 250ms one the
+        // capped entry is usually gone before anything here can sample it, and
+        // "the key is absent" was accepted as convergence -- which made this
+        // assertion pass for a write that never reached L2 at all. That
+        // false positive is exactly how this file failed on one CI platform
+        // and nowhere else. Here the entry must be PRESENT and carry a
+        // deadline: absent proves nothing and is not accepted.
+        const wl = TurboKV.attachWorker(ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3QueueMaxBytes: 1, l3FailTtlMs: 4000 });
+        ok(await wl.setAsync('capped', 'V') === false, 'a second shed write, with a long cap');
+        let rem = 0;
+        for (let i = 0; i < 80 && rem <= 0; i++) {
             await sleep(25);
-            if (native.get('shed') !== undefined && native.lastTtlRemainingMs() > 0) capped = true;
-            if (native.get('shed') === undefined) capped = true;   // already expired: also converged
+            if (native.get('capped') !== undefined) rem = native.lastTtlRemainingMs();
         }
-        ok(capped, 'the arena entry ends up with a deadline instead of living forever');
-        ok(w.stats.l3FailTtlApplied >= 2,
-           `both tiers were capped, not just L1 (${w.stats.l3FailTtlApplied})`);
+        ok(rem > 0, `the arena entry ends up with a deadline instead of living forever (${rem})`);
+        ok(rem <= 4000, `and it is the cap, not a life of its own (${rem})`);
+        ok((wl.stats.l3FailTtlUnapplied || 0) === 0,
+           `nothing was abandoned (${wl.stats.l3FailTtlUnapplied || 0})`);
+        wl.close();
 
         // A SUPERSEDED VALUE IS NEVER PUT BACK. The cap is a rewrite, so if
         // anything replaced the value in the meantime the compare has to
@@ -135,9 +152,9 @@ if (process.env.TCC_ROLE === 'ipc') {
 }
 
 // ------------------------------------------------- worker, shed and ipc ----
-// A SHED WRITE MUST NOT CANCEL A CAP, and an IPC write MUST. Both are one
-// branch inside one publish helper now, which is the point of the refactor --
-// but a branch is still a branch, and the source-level test in
+// A SHED WRITE MUST NOT DROP A CAP'S READ GUARD, and an IPC write MUST. Both
+// are one branch inside one publish helper, which is the point of that
+// refactor -- but a branch is still a branch, and the source-level test in
 // write_sites_test.js cannot see which side of it the cancel sits on.
 if (process.env.TCC_ROLE === 'shed') {
     (async () => {
@@ -159,14 +176,15 @@ if (process.env.TCC_ROLE === 'shed') {
         a.set('capped', 'NEWER');               // shed: nothing reaches the ring
         ok(a.stats.writesShed > before, 'the write to the capped key is shed too');
         ok(a.__unsafeHasCap('capped'), 'a shed write does not cancel the cap');
-        // A SHED PROMOTION, actually issued. The promotion path shares
-        // #publishRingSet, so it shares the branch above -- but an assertion
-        // that only seeds the fake L3 and never reads claims something it does
-        // not test, and stayed green with the fix reverted.
+        // A PROMOTION, actually issued, from a WORKER. It publishes nothing at
+        // all now -- L3-derived data reaches the arena through the primary and
+        // nowhere else -- so there is nothing for it to cancel, whether or not
+        // the ring would have taken it. An assertion that only seeds the fake
+        // L3 and never reads claims something it does not test, and stayed
+        // green with the old fix reverted, so the read is made here.
         //
         // Its own instance, with a cap short enough that the read guard makes
-        // the key miss locally; the ring is already saturated, so the
-        // promotion that follows is shed.
+        // the key miss locally, which is what sends the read to L3.
         const p2 = TurboKV.attachWorker(process.env.TCC_ARENA, 1,
             { storage: 'bytes', l3: f.adapter, l3RetryMs: 5, l3FailTtlMs: 40 });
         p2.set('shedpromo', 'OURS');
@@ -179,14 +197,15 @@ if (process.env.TCC_ROLE === 'shed') {
         f.store.set('shedpromo', { value: 'L3VAL', expiresAt: 0 });
         const promoted = await p2.getAsync('shedpromo');
         ok(promoted === 'L3VAL', `the read goes through to L3 (${promoted})`);
-        ok(p2.stats.writesShed > 0 || a.stats.writesShed > 0, 'the ring is still full, so that promotion was shed');
-        ok(p2.__unsafeHasCap('shedpromo'), 'a shed promotion does not cancel the cap either');
+        ok(p2.__unsafeHasCap('shedpromo'), 'a worker promotion does not cancel the cap either');
+        ok(native.get('shedpromo') !== 'L3VAL',
+           `and the shared arena never saw it (${JSON.stringify(native.get('shedpromo'))})`);
         p2.close();
 
-        // THE IPC FALLBACK, from a sibling instance. Those writes reach the
-        // arena through applyBatch, on a channel with no ordering against the
-        // submission ring -- so the cap has to go, or it lands behind that
-        // write on the next drain and puts the old value back over it.
+        // THE IPC FALLBACK, from a sibling instance. That write really is
+        // published, so the guard it supersedes has to go -- otherwise the key
+        // goes on missing locally past a deadline belonging to a value nobody
+        // will read again.
         const ipc = TurboKV.attachWorker(process.env.TCC_ARENA, 1,
             { storage: 'bytes', transport: 'ipc' });
         ok(ipc.transport === 'ipc', `the sibling negotiated the ipc transport (${ipc.transport})`);
@@ -201,16 +220,19 @@ if (process.env.TCC_ROLE === 'shed') {
     return;
 }
 
-// ---------------------------------------------------- worker, bulk poll ----
-// THE POLL IS BOUNDED. Deciding whether a cap can be applied means asking the
-// arena, and that copies a value out of it: a full pass over the 4096-entry
-// bound was measured at 1.69ms for 8KB values -- an event-loop stall every 20ms
-// for the length of an outage. So a tick reaches the arena for at most 64 caps.
+// -------------------------------------------------- worker, cap bookkeeping ----
+// The caps a worker keeps are a READ GUARD, not a queue of work: the cap
+// itself has already been handed to the primary as a conditional 'r'. What is
+// left here is "this worker must stop serving the value L3 refused at the
+// deadline, rather than whenever the primary gets round to it".
 //
-// Driven a tick at a time against a primary that drains only on request, rather
-// than timed: the bound is a property of ONE tick, and a count sampled from a
-// loaded event loop is a count of however many ticks the sample spanned, which
-// made the obvious timing version flaky in both directions.
+// So the bookkeeping has to hold: one guard entry per failed write, dropped
+// again the moment anything in this PROCESS publishes a newer value for the
+// key -- otherwise the key goes on missing locally past a deadline that no
+// longer applies to anything.
+//
+// Driven against a primary that drains only on request, so the orderings are
+// decided by this file rather than by a timer.
 if (process.env.TCC_ROLE === 'bulk') {
     (async () => {
         const f = makeFake();
@@ -221,71 +243,55 @@ if (process.env.TCC_ROLE === 'bulk') {
             const h = (m) => { if (m && m.step === want) { process.off('message', h); r(); } };
             process.on('message', h);
         });
-        const N = 640;                         // ten slices
+        const N = 200;
         for (let i = 0; i < N; i++) w.set('bulk' + i, 'V');
         await w.drainL3();
         await sleep(20);                       // the cap handlers run off the settled promises
         ok(w.__unsafeCapState().caps === N,
-           `every failed write deferred a cap (${w.__unsafeCapState().caps} of ${N})`);
-        // Nothing has landed in L2 yet, so every tick so far has correctly done
-        // nothing -- which is what makes the first tick after the drain the one
-        // the bound is measured on.
-        ok(w.__unsafeCapState().sent === 0, `and none could be applied yet (${w.__unsafeCapState().sent})`);
+           `every failed write records a read guard (${w.__unsafeCapState().caps} of ${N})`);
+        ok(w.__unsafeCapState().timer === true, 'and the retire poll is armed');
+        ok((w.stats.l3FailTtlUnapplied || 0) === 0,
+           `and every cap was handed over (${w.stats.l3FailTtlUnapplied || 0})`);
         process.send({ step: 'written' });
         await step('drained');
 
-        // A LOCAL WRITE CANCELS ITS CAP, and this is where that matters. The
-        // cap decides by comparing against the ARENA, but a write goes into the
-        // submission RING, so between the two there is a window where the arena
-        // still holds the old value and the ring already holds the new one. A
-        // cap submitted in that window is ordered BEHIND the new write and
-        // re-applies the old value on top of it. Deterministic here: the parent
-        // has drained exactly once, so 'bulk0' is in L2 while the write below
-        // is only in the ring.
+        // A LOCAL WRITE DROPS ITS GUARD. The guard exists to make this worker
+        // MISS on the value L3 refused; a newer value for the key is on its
+        // way, so leaving the entry would make the key miss past a deadline
+        // that belongs to a value nobody will read again.
         w.set('bulk0', 'NEWER');
         ok(w.__unsafeCapState().caps === N - 1,
-           `a local write drops that key's cap (${w.__unsafeCapState().caps} of ${N})`);
+           `a local write drops that key's guard (${w.__unsafeCapState().caps} of ${N})`);
 
-        // AND A SIBLING'S WRITE DOES TOO. The caps are per-instance and the
-        // submission ring is per-PROCESS, so instance A's cap for a key is
-        // ordered behind instance B's write to it exactly as it would be
-        // behind A's own -- decision 64's family, and the same sweep across
-        // `instances` that #dropOthers does. Cancelling only on the writing
-        // instance left the arena holding the capped old value for a full
-        // l3FailTtlMs.
+        // AND A SIBLING'S WRITE DOES TOO. The guards are per-instance and the
+        // submission ring is per-PROCESS -- decision 64's family, and the same
+        // sweep across `instances` that #dropOthers does.
         const sib = TurboKV.attachWorker(process.env.TCC_ARENA, 1, { storage: 'bytes' });
         sib.set('bulk1', 'SIBLING');
         ok(w.__unsafeCapState().caps === N - 2,
            `a sibling instance's write drops it too (${w.__unsafeCapState().caps} of ${N})`);
 
-        w.__unsafeRunCaps();
-        const one = w.__unsafeCapState().sent;
-        ok(one > 0, `one tick makes progress (${one})`);
-        // 2x the slice, so a real interval tick slipping into the message turn
-        // cannot fail this. Either way it is nowhere near ${N}.
-        ok(one <= 128, `and reaches the arena for a bounded slice, not all ${N} (${one})`);
-        // The bound must not cost convergence: ten slices, so eleven more ticks.
-        for (let i = 0; i < 12; i++) w.__unsafeRunCaps();
-        // N - 2, because the two writes above cancelled one cap each.
-        ok(w.__unsafeCapState().sent === N - 2,
-           `every remaining cap is applied within ceil(N/64) ticks (${w.__unsafeCapState().sent} of ${N - 2})`);
-        ok((w.stats.l3FailTtlUnapplied || 0) === 0,
-           `and none is abandoned (${w.stats.l3FailTtlUnapplied || 0})`);
         process.send({ step: 'capped' });
         await step('drained2');
+        // THE CAP IS CONDITIONAL, so the newer value stands. The primary
+        // compared before it wrote, in the same synchronous step, and refused.
         ok(native.get('bulk0') === 'NEWER',
-           `and no cap was ordered behind the newer write (${native.get('bulk0')})`);
+           `no cap was ordered behind the newer write (${native.get('bulk0')})`);
         ok(w.get('bulk0') === 'NEWER', `the worker reads it (${w.get('bulk0')})`);
         ok(native.get('bulk1') === 'SIBLING',
            `nor behind a sibling instance's write (${native.get('bulk1')})`);
+        // ...while a key nothing superseded DID get the deadline, so the
+        // refusals above are refusals and not a cap that simply never ran.
+        ok(native.get('bulk2') === 'V' && native.lastTtlRemainingMs() > 0,
+           `an untouched key was capped (${native.get('bulk2')}/${native.lastTtlRemainingMs()})`);
         sib.close();
 
-        // A PROMOTION IS A WRITE INTO THE RING, so it cancels an outstanding
-        // cap exactly as set() does -- same mechanism, same consequence if it
-        // does not (the cap lands behind the promotion and puts the value L3
-        // refused back over the value L3 holds). The route into it is this
-        // very design: the read guard is what makes a key with an outstanding
-        // cap miss locally, which is what sends the read to L3 to be promoted.
+        // A PROMOTION FROM A WORKER TOUCHES L2 AT ALL. It fills this worker's
+        // own L1 and stops there, so it neither cancels the guard nor writes
+        // the arena -- the architectural rule, seen from inside the one path
+        // that used to be the exception. The route in is this design's own:
+        // the read guard makes a capped key miss locally, which is what sends
+        // the read to L3.
         const f2 = makeFake();
         f2.fail.set('set', new Error('l3 down'));
         f2.store.set('promo', { value: 'L3VAL', expiresAt: 0 });
@@ -294,42 +300,29 @@ if (process.env.TCC_ROLE === 'bulk') {
         w2.set('promo', 'OURS');
         await w2.drainL3();
         await sleep(20);
-        ok(w2.__unsafeCapState().caps === 1, `the failed write defers a cap (${w2.__unsafeCapState().caps})`);
-        // Past the cap BEFORE the arena is told about the write: while the
-        // arena holds nothing for this key the poll cannot submit anything, so
-        // the cap is still outstanding when the drain below lands.
-        await sleep(80);
-        ok(w2.__unsafeCapState().sent === 0,
-           `which cannot be submitted while the write is still in the ring (${w2.__unsafeCapState().sent})`);
-        // Stop the automatic poll BEFORE the arena is told about the write, so
-        // there is no turn in which it could claim the cap. Only #deferCap
-        // re-arms the timer and nothing defers after this point, so the
-        // outcome below is deterministic rather than "discriminating whenever
-        // the poll has not got there first".
-        w2.__unsafePauseCaps();
+        ok(w2.__unsafeCapState().caps === 1, `the failed write records a guard (${w2.__unsafeCapState().caps})`);
+        await sleep(80);                       // past the 60ms cap
+        w2.__unsafePauseCaps();                // nothing retires the guard under the assertions
         process.send({ step: 'promo-written' });
-        await step('drained3');                   // arena now holds OURS, uncapped
-        ok(w2.__unsafeCapState().sent === 0,
-           `the poll is stopped, so the cap is untouched (${w2.__unsafeCapState().sent})`);
+        await step('drained3');                // arena now holds OURS
         ok(w2.get('promo') === undefined,
            `the read guard makes the key miss locally (${JSON.stringify(w2.get('promo'))})`);
         ok(await w2.getAsync('promo') === 'L3VAL', 'so the read goes through to L3');
-        ok(w2.__unsafeCapState().caps === 0,
-           `and the promotion cancelled the outstanding cap (${w2.__unsafeCapState().caps})`);
-        w2.__unsafeRunCaps();
+        ok(w2.__unsafeCapState().caps === 1,
+           `and the promotion cancelled nothing, because it published nothing (${w2.__unsafeCapState().caps})`);
         process.send({ step: 'promoted' });
         await step('drained4');
-        ok(native.get('promo') === 'L3VAL',
-           `the arena holds what L3 holds, not the value it refused (${native.get('promo')})`);
-        ok(w2.get('promo') === 'L3VAL', `and the worker reads it (${w2.get('promo')})`);
+        ok(native.get('promo') !== 'L3VAL',
+           `the worker's promotion never reached the shared arena (${native.get('promo')})`);
         w2.close();
 
         w.close();
-        console.log(fail ? `  ${fail} failed (bulk)` : '  [l3-cap] bulk-poll cases passed');
+        console.log(fail ? `  ${fail} failed (bulk)` : '  [l3-cap] cap-bookkeeping cases passed');
         process.exit(fail ? 1 : 0);
     })();
     return;
 }
+
 
 // ----------------------------------------------------- worker, one drain ----
 // The deferred cap closes the SHARED arena's half. This half is the worker's
@@ -401,6 +394,11 @@ if (process.env.TCC_ROLE === 'slow') {
             const kid = fork(__filename, [], {
                 env: { ...process.env, TCC_ROLE: 'worker', TCC_ARENA: ARENA }, stdio: 'inherit',
             });
+            // A worker's cap is a REQUEST to the primary now, and it travels in
+            // the ordinary IPC batch -- the same channel clearAll's generation
+            // ops already use. This is a plain fork, not a cluster, so the
+            // parent routes it by hand exactly as install() would.
+            kid.on('message', (m) => { if (TurboKV.isCacheMessage(m)) TurboKV.applyBatch(m); });
             kid.on('exit', (c) => resolve(c));
         });
         ok(code === 0, `the worker cases passed (child exited ${code})`);
@@ -471,6 +469,11 @@ if (process.env.TCC_ROLE === 'slow') {
                 env: { ...process.env, TCC_ROLE: 'bulk', TCC_ARENA: arena }, stdio: 'inherit',
             });
             kid.on('message', (m) => {
+                // The caps travel over IPC; applyBatch drains every submission
+                // ring to empty before it applies them, which is what puts the
+                // worker's own write for a key provably ahead of the cap that
+                // names it.
+                if (TurboKV.isCacheMessage(m)) { TurboKV.applyBatch(m); return; }
                 if (m && m.step === 'written') {
                     TurboKV.drainSubmissions(20000);
                     kid.send({ step: 'drained' });
@@ -487,7 +490,7 @@ if (process.env.TCC_ROLE === 'slow') {
             });
             kid.on('exit', (c) => resolve(c));
         });
-        ok(code === 0, `the bulk-poll cases passed (child exited ${code})`);
+        ok(code === 0, `the cap-bookkeeping cases passed (child exited ${code})`);
         await primary.close();
     }
 
