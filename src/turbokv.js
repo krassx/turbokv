@@ -1382,6 +1382,29 @@ class TurboKV {
         // `minLevel: L3` read promoting into L1 because someone else asked
         // first, or the reverse. ` ` cannot appear in a level, so the two
         // parts cannot run together into an ambiguous id.
+        // A clear -- from THIS instance or a sibling sharing the same arena
+        // (decision 64) -- is on its way to L3 but has not landed yet. Reading
+        // through would hand back, and promote into the SHARED L2, exactly the
+        // value the clear was meant to remove, and every instance in the
+        // process would see the resurrection, not only the one that happened
+        // to read it. Miss instead; that is the failure mode this system is
+        // built around, a resurrected value is not. Process-wide, not
+        // per-instance: see l3ClearsInFlight -- and CLUSTER-wide, via the
+        // arena's clear generation, because the arena this would promote into
+        // is shared with processes whose own counter says nothing about a
+        // clear issued over here.
+        //
+        // ASKED BEFORE THE HERD SHARING BELOW, and not inside #fetchFromL3.
+        // Sharing hands this caller a promise created for an EARLIER read,
+        // whose own guard ran before the clear was issued -- so a getAsync
+        // issued AFTER clearAll() joined a read issued before it and was
+        // answered with the pre-clear value, while `get` for the same key
+        // answered undefined. Decision 70's "until it lands this process
+        // serves misses" has no exception for a caller that happened to
+        // arrive while someone else was already asking.
+        if (l3ClearsInFlight > 0 || this.#sharedClearsInFlight() > 0) {
+            this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined;
+        }
         const shareId = level + ' ' + key;
         const shared = this.#inflight.get(shareId);
         if (shared !== undefined) return shared;
@@ -1392,20 +1415,6 @@ class TurboKV {
     }
 
     async #fetchFromL3(key, level) {
-        // A clear -- from THIS instance or a sibling sharing the same arena
-        // (decision 64) -- is on its way to L3 but has not landed yet.
-        // Reading through here would hand back -- and promote into the
-        // SHARED L2 -- exactly the value the clear was meant to remove, and
-        // every instance in the process would see the resurrection, not
-        // only the one that happened to read it. Miss instead; that is the
-        // failure mode this system is built around, a resurrected value is
-        // not. Process-wide, not per-instance: see l3ClearsInFlight -- and
-        // CLUSTER-wide, via the arena's clear generation, because the arena
-        // this would promote into is shared with processes whose own counter
-        // says nothing about a clear issued over here.
-        if (l3ClearsInFlight > 0 || this.#sharedClearsInFlight() > 0) {
-            this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined;
-        }
         // Marked BEFORE the await: everything appended to the invalidation ring
         // from here on happened while this read was in flight.
         const mark = storeReady && !this.#primaryDead ? native.ringHead() : -1;
@@ -1580,6 +1589,15 @@ class TurboKV {
             if (at !== undefined && at > mark) return 'l3DeletedWhileReading';
         }
         if (owed === 'set') return 'l3PromotionsBlocked';
+        // A CLEAR THIS PROCESS ISSUED, asked before the degraded bail-out
+        // below rather than after it. l3ClearsInFlight needs no arena, and on
+        // a degraded worker it is the ONLY clear guard left -- decision 70
+        // says so in as many words -- but it sat under a bail-out that answers
+        // 'l3PromotionsBlocked', which blocks the PLACEMENT and still hands
+        // the caller what L3 returned. So a degraded worker's in-flight read
+        // answered with the value its own clearAll() was erasing, and every
+        // later read of that key joined the same answer through the herd map.
+        if (l3ClearsInFlight > 0) return 'l3ClearedWhileReading';
         // A degraded worker has no arena to read the ring from, so it cannot
         // know what happened and must refuse. Refusing costs a promotion, not
         // correctness.
@@ -1605,7 +1623,7 @@ class TurboKV {
         // own clear is erasing -- no resurrection into the arena, but a direct
         // contradiction of "no exception for reads that started first", and of
         // the entry guard, which has been answering misses since the call.
-        if (l3ClearsInFlight > 0 || this.#sharedClearsInFlight() > 0 ||
+        if (this.#sharedClearsInFlight() > 0 ||
             native.l3ClearGen() !== clearMark) return 'l3ClearedWhileReading';
         const h = native.hashKey(key);
         // A key the arena cannot even hash -- a lone surrogate -- has no ring
