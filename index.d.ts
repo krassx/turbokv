@@ -438,11 +438,18 @@ export declare class TurboKV<T = unknown> {
     hasAsync(key: string): Promise<boolean>;
     /** Returns whether the key was present at call time. */
     delete(key: string): boolean;
-    /** `delete`, then L3 (if an adapter is attached), resolving once the L3
-     *  delete has settled. Identical effects to `delete`; the only
-     *  difference is what the caller can wait for. If L3 is unreachable the
-     *  local delete still stands for the whole outage — there is no local
-     *  tombstone to revert from the way a failed `setAsync` has one. */
+    /** `delete`, then L3 (if an adapter is attached). Identical effects to
+     *  `delete`; the only difference is what the caller can wait for.
+     *
+     *  Resolves the **L3 outcome** — whether the remote delete landed — not
+     *  whether the key happened to be present locally, which `delete` already
+     *  returned synchronously. If L3 is unreachable the local delete still
+     *  stands for the whole outage, and there is no local tombstone to inspect
+     *  afterwards the way a failed `setAsync` has a short-TTL revert, so this
+     *  promise is the only signal that the remote half failed.
+     *
+     *  With no adapter attached there is no remote half, and this resolves
+     *  whether the key was present, exactly as `delete` reports. */
     deleteAsync(key: string): Promise<boolean>;
     /** Drop this process's L1. The arena is untouched. */
     clearLocal(): void;

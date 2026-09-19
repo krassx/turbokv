@@ -2195,6 +2195,18 @@ class TurboKV {
     // tombstone to fall back on the way a set() has a short-TTL revert. The
     // only case where the old value returns is reads succeeding while the
     // DEL failed, and the caller resolved false and knows it.
+    //
+    // WHICH IS WHY THIS RESOLVES THE L3 OUTCOME, not local presence. Spec 9 and
+    // 5.4 and decision 70 all rest on "the caller resolved false and knows it",
+    // and this promise is the only signal the design offers: there IS no local
+    // tombstone to inspect afterwards, and `delete` already returned the local
+    // answer synchronously to anyone who wanted it. Resolving on presence made
+    // the one guarantee false in both directions -- a failed L3 delete resolved
+    // `true` while L3 still held the key, and an L3-only key whose delete
+    // succeeded everywhere resolved `false`.
+    //
+    // With no adapter there is no outcome to report and nothing changes: the
+    // local answer is the whole answer, exactly as before.
     async deleteAsync(key) {
         // A rejected key (delete() returns early, before touching #lastQueued)
         // must not fall through to reading it below: #lastQueued would then
@@ -2204,8 +2216,8 @@ class TurboKV {
         const had = this.delete(key);
         const p = this.#lastQueued;
         this.#lastQueued = null;
-        if (p) await p;
-        return had;
+        if (!p) return had;
+        return await p === true;
     }
 
     // Drops only this process's L1. The shared arena is untouched, so the next

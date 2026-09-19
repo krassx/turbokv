@@ -229,6 +229,60 @@ if (process.env.TCR_ROLE === 'shed') {
         await primary.close();
     }
 
+    // G. WHAT deleteAsync RESOLVES.
+    //
+    // There is no local tombstone once a delete has been applied, so this
+    // promise is the only signal the design offers that the REMOTE half failed
+    // -- spec 9, spec 5.4 and decision 70 all rest on "the caller resolved
+    // false and knows it". Resolving on local presence made that guarantee
+    // false in both directions.
+    {
+        const f = makeFake();
+        const primary = TurboKV.createPrimary(ARENA + 'h', 4 << 20, 1 << 12,
+            { storage: 'bytes', maintenance: false, l3: f.adapter, l3RetryMs: 30 });
+        // (i) present locally, but the L3 delete fails.
+        await primary.setAsync('present', 'v');
+        f.fail.set('delete', new Error('l3 down'));
+        const r1 = await primary.deleteAsync('present');
+        ok(r1 === false, `a failed L3 delete resolves false (${r1})`);
+        ok(f.store.has('present') === true, 'L3 still holds the key, which is what false means');
+        ok(primary.stats.l3DeleteFailed === 1, `and the failure is counted (${primary.stats.l3DeleteFailed})`);
+        ok(primary.delete('present') === false,
+           'the synchronous form still answers local presence, for a caller that wants it');
+        // (ii) absent locally, and the L3 delete succeeds.
+        f.fail.delete('delete');
+        f.store.set('l3only', { value: 'v', expiresAt: 0 });
+        const r2 = await primary.deleteAsync('l3only');
+        ok(r2 === true, `an L3-only key whose delete landed resolves true (${r2})`);
+        ok(f.store.has('l3only') === false, 'and it really is gone from L3');
+        // (iii) a shed delete: the queue refused it, so it never reached L3.
+        await primary.close();
+    }
+
+    // H. A shed L3 delete resolves false too: the byte bound refused it, so L3
+    //    still holds the key and the caller has to know.
+    {
+        const f = makeFake();
+        f.latency.set('delete', 200);
+        const primary = TurboKV.createPrimary(ARENA + 'i', 4 << 20, 1 << 12,
+            { storage: 'bytes', maintenance: false, l3: f.adapter, l3QueueMaxBytes: 1 });
+        f.store.set('shed', { value: 'v', expiresAt: 0 });
+        const r = await primary.deleteAsync('shed');
+        ok(r === false, `a shed L3 delete resolves false (${r})`);
+        ok(f.store.has('shed') === true, 'L3 was never asked, so it still holds the key');
+        await primary.close();
+    }
+
+    // I. WITH NO ADAPTER the answer is the local one, exactly as before.
+    {
+        const primary = TurboKV.createPrimary(ARENA + 'j', 4 << 20, 1 << 12, { storage: 'bytes', maintenance: false });
+        primary.set('k', 'v');
+        ok(await primary.deleteAsync('k') === true, 'deleteAsync reports a key that was present');
+        ok(await primary.deleteAsync('k') === false, 'and one that was not');
+        ok(await primary.deleteAsync(42) === false, 'a non-string key is still refused');
+        primary.close();
+    }
+
     console.log(fail ? `  ${fail} failed` : '  [l3-removal] all passed');
     process.exit(fail ? 1 : 0);
 })();
