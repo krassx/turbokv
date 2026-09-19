@@ -127,6 +127,16 @@ class L3Queue {
     stats = { shed: 0, failed: 0, retried: 0, coalesced: 0 };
 
     constructor(adapter, { maxBytes = 8 << 20, retryMs = 2000, onError = null, onShed = null, now = Date.now } = {}) {
+        // withDeadline treats anything <= 0 as "no bound", so a non-positive
+        // retryMs removes the per-attempt deadline from every operation --
+        // including `clear`, which retries indefinitely, so a hung adapter
+        // then keeps the cluster's clear generation open forever. The cache
+        // rejects it at its own boundary too; this is the one that also covers
+        // a queue constructed directly.
+        if (!(typeof retryMs === 'number' && retryMs > 0 && Number.isFinite(retryMs)))
+            throw new Error(`turbokv: the l3 queue's retryMs must be a positive number of ` +
+                            `milliseconds, got ${JSON.stringify(retryMs)}; a non-positive value ` +
+                            `leaves each adapter call unbounded`);
         this.#adapter = adapter; this.#maxBytes = maxBytes; this.#retryMs = retryMs;
         this.#onError = onError; this.#onShed = onShed; this.#now = now;
     }

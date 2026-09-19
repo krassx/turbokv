@@ -329,10 +329,13 @@ class TurboKV {
     #ringMaxValue = 0;        // largest value one ring record can carry
     #transportOpt = 'shm';
     #pendingDel = new Set();  // keys this worker deleted but the primary has not applied yet
-    #pendingDelHash = new Map();   // hash -> key, so the invalidation record can clear it:
+    #pendingDelHash = new Map();   // hash -> { key, at }, so the invalidation record can clear it:
                                    // #l1Drop already removed the #byHash entry, so without this
                                    // a deleted key stayed suppressed even after another worker
-                                   // recreated it
+                                   // recreated it. `at` is the ring head when the mark was taken:
+                                   // only a record AT OR PAST it can be our own removal, and a
+                                   // hash match alone let an older record clear it -- see
+                                   // #markPendingDel
     // Keys THIS instance removed, with the invalidation-ring position at which
     // the removal became visible. #pendingDel answers "has my removal been
     // applied yet"; this answers the different question the promotion guard
@@ -431,6 +434,24 @@ class TurboKV {
         // it. A hung `get` is the same outage as a failed one and has to be
         // bounded by the same number, or the two halves of the adapter contract
         // would give up at different times.
+        // A POSITIVE NUMBER, ALWAYS. This is the per-attempt deadline as well
+        // as the retry budget, and the deadline helper treats anything <= 0 as
+        // "no bound at all" (src/l3/queue.js) -- so `l3RetryMs: 0` silently
+        // removed every bound this option exists to impose. The worst of them
+        // is `clear`, which retries indefinitely by design: a hung
+        // `adapter.clear()` then never settled, the clear generation stayed
+        // open, and EVERY process sharing the arena served L3 misses for every
+        // key until the worker exited. `0` is documented as a value only for
+        // `l3CloseTimeoutMs`, where it means "wait without a bound" and where
+        // that is a choice a caller can sensibly make. Here it is not one, so
+        // say so rather than substituting a default the caller did not ask for.
+        if (this.#l3 && opts.l3RetryMs !== undefined &&
+            !(typeof opts.l3RetryMs === 'number' && opts.l3RetryMs > 0 && Number.isFinite(opts.l3RetryMs)))
+            throw new Error(`turbokv: l3RetryMs must be a positive number of milliseconds, got ` +
+                            `${JSON.stringify(opts.l3RetryMs)}. It bounds EACH adapter call as well as ` +
+                            `the retry budget, so a non-positive value leaves a hung adapter unbounded -- ` +
+                            `and a hung clear() leaves every process on this arena serving L3 misses. ` +
+                            `Only l3CloseTimeoutMs takes 0, where it means "wait without a bound".`);
         this.#l3RetryMs = opts.l3RetryMs ?? 2000;
         // One place holds the listener. It used to be read out of `opts` from
         // inside the queue's callback, which meant a second reporting path grew
@@ -1222,7 +1243,18 @@ class TurboKV {
     }
 
     // --- L1 --------------------------------------------------------------
-    #l1Put(key, v, hash, encodedLen, expiresAt = 0) {
+    // `own` marks an entry this WORKER wrote and whose submission the primary
+    // has not applied yet. See #promotionBlock: it is the self-mark for an
+    // ordinary set, symmetric with what #pendingDel already does for a delete,
+    // and it lives ON THE ENTRY deliberately. The mark exists only to stop an
+    // overlapping L3 read overwriting this value, so it is worth exactly as
+    // long as the value is: the invalidation record for our own write drops
+    // the entry (#drain does not skip our own records) and takes the mark with
+    // it, an eviction or an expiry takes it too -- and in both of those cases
+    // there is no longer anything of ours to protect. A separate map would
+    // outlive the value and, for a write the ring then shed, would outlive it
+    // forever, blocking every later promotion of that key in this worker.
+    #l1Put(key, v, hash, encodedLen, expiresAt = 0, own = false) {
         // In primitives mode the cost is known exactly; otherwise it is the
         // encoded length scaled by heapFactor, which is only an estimate.
         const bytes = this.#noCodec
@@ -1230,7 +1262,7 @@ class TurboKV {
             : (key.length + encodedLen + 64) * this.#heapFactor;
         const prev = this.#l1.get(key);
         if (prev) this.#l1Bytes -= prev.bytes;
-        this.#l1.set(key, { v, bytes, hits: 1, exp: expiresAt, hash });
+        this.#l1.set(key, { v, bytes, hits: 1, exp: expiresAt, hash, own });
         this.#byHash.set(hash, key);
         this.#l1Bytes += bytes;
 
@@ -1432,7 +1464,12 @@ class TurboKV {
             // between queuing and apply - a worker that deleted a key then read
             // it in the same tick kept serving the deleted value forever. The
             // cost of dropping our own entry is one L2 refetch.
-            const pk = this.#pendingDelHash.get(r.hashes[i]);
+            // AT OR PAST THE POSITION THE MARK WAS TAKEN AT. A record earlier
+            // than that cannot be our removal -- it was already on the ring
+            // when we marked -- and clearing on it served the deleted value.
+            // See #markPendingDel.
+            const pd = this.#pendingDelHash.get(r.hashes[i]);
+            const pk = pd !== undefined && this.#cursor + i >= pd.at ? pd.key : undefined;
             if (pk !== undefined) {              // the primary applied our delete; L2 is authoritative
                 this.#pendingDel.delete(pk); this.#pendingDelHash.delete(r.hashes[i]);
                 // The mark stops answering here, so the promotion guard needs
@@ -1682,7 +1719,24 @@ class TurboKV {
     //
     // Delete before add, for the reason #noteDeleted gives: re-marking a key
     // must refresh its place in the order, not leave it in an old slot.
+    // AND IT RECORDS WHERE THE RING WAS. The mark used to be matched by hash
+    // alone, so ANY record for that hash cleared it -- including one written
+    // BEFORE the delete and not yet drained by this worker. The primary sets
+    // `k`, this worker deletes `k` and reads it back in the same tick: the
+    // drain that read runs finds the primary's older record, clears the mark
+    // on a hash match, and serves -- and promotes -- the value this worker
+    // has just been told is deleted. A ring position is the only thing that
+    // tells the primary's earlier write apart from our own removal, and
+    // positions are monotonic, so "at or past the head I saw when I marked"
+    // is the whole test. See the record loop in #drain.
+    //
+    // Zero when the head cannot be read (degraded, detached): every record
+    // then clears the mark, which is the behaviour this replaces and the safe
+    // direction -- a mark dropped early costs one possible stale read, a mark
+    // never dropped makes the key unreadable from every tier.
     #markPendingDel(key, keyHash) {
+        let at = 0;
+        if (storeReady && !this.#primaryDead) { try { at = native.ringHead(); } catch { at = 0; } }
         this.#pendingDel.delete(key);
         if (this.#pendingDel.size >= PENDING_DEL_MAX) {
             const oldest = this.#pendingDel.values().next();
@@ -1692,7 +1746,7 @@ class TurboKV {
             }
         }
         this.#pendingDel.add(key);
-        this.#pendingDelHash.set(keyHash, key);
+        this.#pendingDelHash.set(keyHash, { key, at });
     }
 
     // See the wrapped branch of #drain. Keeps only the marks the arena still
@@ -1836,13 +1890,17 @@ class TurboKV {
             const at = this.#deletedAt.get(key);
             if (at !== undefined && at > mark) return 'l3DeletedWhileReading';
         }
-        // Counted apart from `l3PromotionsBlocked`: this is not the ring
-        // reporting that someone else changed the key, it is this same
-        // process's own write still on its way to L3. Folding it into the
-        // shared counter would put self-inflicted traffic in the same number
-        // an operator watches for contention from elsewhere. See the counter
-        // note above #promotionBlock.
-        if (owed === 'set') return 'l3PromotionsBlockedSelf';
+        // THE CLEAR REASONS COME BEFORE THE SELF-SET REASON, and the order is
+        // not cosmetic: only one of the two changes what the caller is TOLD.
+        // `l3PromotionsBlockedSelf` blocks the placement and still hands back
+        // what L3 returned, while `l3ClearedWhileReading` answers undefined.
+        // Asked the other way round, a read that started before a clearAll()
+        // and happened to overlap a set of this process's own was handed the
+        // very value the clear was removing, while `get()` for the same key
+        // correctly said undefined -- decision 70's "no exception for reads
+        // that started first", undone by a guard that stopped at the first
+        // reason it matched rather than at the strongest one.
+        //
         // A CLEAR THIS PROCESS ISSUED, asked before the degraded bail-out
         // below rather than after it. l3ClearsInFlight needs no arena, and on
         // a degraded worker it is the ONLY clear guard left -- decision 70
@@ -1852,11 +1910,38 @@ class TurboKV {
         // answered with the value its own clearAll() was erasing, and every
         // later read of that key joined the same answer through the herd map.
         if (l3ClearsInFlight > 0) return 'l3ClearedWhileReading';
+        // A CLEAR ANY PROCESS ON THIS BOX HANDED TO L3 AND L3 HAS NOT APPLIED.
+        // Guarded on having an arena rather than sitting under the bail-out
+        // below, so that the self-set reason underneath it stays reachable on
+        // a degraded worker -- where it is the only guard of its kind left.
+        if (mark >= 0 && storeReady && !this.#primaryDead &&
+            (this.#sharedClearsInFlight() > 0 || native.l3ClearGen() !== clearMark))
+            return 'l3ClearedWhileReading';
+        // Counted apart from `l3PromotionsBlocked`: this is not the ring
+        // reporting that someone else changed the key, it is this same
+        // process's own write still on its way to L3. Folding it into the
+        // shared counter would put self-inflicted traffic in the same number
+        // an operator watches for contention from elsewhere. See the counter
+        // note above #promotionBlock.
+        if (owed === 'set') return 'l3PromotionsBlockedSelf';
+        // AND THIS WORKER'S OWN WRITE THAT L3 HAS ALREADY ACKNOWLEDGED, which
+        // the queue check above cannot see: it released the SET at the ack,
+        // and the arena has no record for it either, because the primary has
+        // not drained the submission ring. In that gap an L3 GET issued before
+        // the write -- and answered from the pre-write value, which is
+        // ordinary for a snapshot-reading store -- promoted the old value
+        // straight over the new one in this worker's own L1. The caller had
+        // awaited `setAsync === true` and then read the old value back from
+        // the instance it had just written through. See #l1Put's `own`.
+        if (this.#id !== 0) {
+            const mine = this.#l1.get(key);
+            if (mine !== undefined && mine.own) return 'l3PromotionsBlockedSelf';
+        }
         // A degraded worker has no arena to read the ring from, so it cannot
         // know what happened and must refuse. Refusing costs a promotion, not
         // correctness.
         if (mark < 0 || !storeReady || this.#primaryDead) return 'l3PromotionsBlocked';
-        // A CLEAR ANY PROCESS ON THIS BOX HANDED TO L3 AND L3 HAS NOT APPLIED.
+        // THE OTHER HALF OF THE CLEAR GUARD IS ABOVE.
         //
         // The ring cannot answer this one either, for the mirror-image reason
         // the queue check above exists: a clear issued in ANOTHER process puts
@@ -1877,8 +1962,6 @@ class TurboKV {
         // own clear is erasing -- no resurrection into the arena, but a direct
         // contradiction of "no exception for reads that started first", and of
         // the entry guard, which has been answering misses since the call.
-        if (this.#sharedClearsInFlight() > 0 ||
-            native.l3ClearGen() !== clearMark) return 'l3ClearedWhileReading';
         const h = native.hashKey(key);
         // A key the arena cannot even hash -- a lone surrogate -- has no ring
         // record to compare against, and `get` already treats it as never
@@ -2311,8 +2394,18 @@ class TurboKV {
             return false;
         }
         if (minLevel === 1) {
+            // SELF-MARKED ON A WORKER. This write is in L1 now and in the
+            // submission ring, and the ring record has not come back -- so an
+            // L3 read this worker already had in flight, whose adapter reply
+            // predates the write, would otherwise promote the OLD value
+            // straight over it. Neither existing guard can see that: the queue
+            // let go of the SET the moment L3 acknowledged it, #pendingDel and
+            // #deletedAt cover only removals, and the ring carries no record
+            // for a write the primary has not drained. So the caller who
+            // awaited `setAsync === true` read the old value back from its own
+            // instance. See #l1Put and #promotionBlock.
             this.#l1Put(key, l1Value, keyHash, this.#noCodec ? 0 : enc.length,
-                        ttlMs > 0 ? monoMs() + ttlMs : 0);
+                        ttlMs > 0 ? monoMs() + ttlMs : 0, this.#id !== 0);
         } else {
             // Bypassing L1 must EVICT any copy already there. Leaving it would
             // make this option produce stale reads -- the caller asked for the
@@ -2321,20 +2414,20 @@ class TurboKV {
             // On the primary that is enough: native.set below is synchronous, so
             // the next get() reads the new value straight from L2. In a WORKER
             // the write is still in flight, so a local read would find L2's
-            // PREVIOUS value -- wrong, not merely stale. Mark it pending, the
-            // same way a queued delete is, so local reads MISS until the ring
-            // confirms it landed. A miss is the failure mode this system is
-            // built around; a stale value is not.
+            // PREVIOUS value -- wrong, not merely stale. It is marked pending,
+            // the same way a queued delete is, so local reads MISS until the
+            // ring confirms it landed. A miss is the failure mode this system
+            // is built around; a stale value is not.
             //
-            // `minLevel: 3` is deliberately NOT marked here. It writes nothing
-            // locally, so the record that would clear the mark is the eviction
-            // below -- which is only published if it is actually submitted, and
-            // is not submitted at all on a degraded worker. Marking here left
-            // those keys permanently unreadable. The minLevel-3 branch takes
-            // the mark itself, at the point where it knows.
-            if (this.#id !== 0 && minLevel !== 3) {
-                this.#markPendingDel(key, keyHash);
-            }
+            // NOT MARKED HERE, for either level. A mark is only ever honest
+            // once something has actually been submitted: the record that
+            // clears it is the submission's own, so a mark taken beside a
+            // write that is then SHED -- by a full ring, by a dead primary --
+            // is one nothing can ever clear, and a marked key is unreadable
+            // from every tier, L3 included, for the life of the worker.
+            // `minLevel: 3` already took its mark at the point where it knew;
+            // `minLevel: 2` did not, and had exactly that hole. Both now mark
+            // inside the submission branch below.
         }
         // `minLevel: L3` means NOTHING is written locally -- spec 5.2, and the
         // read path has always agreed (`#fillFromL3` fills only at `level <= 2`).
@@ -2396,6 +2489,12 @@ class TurboKV {
         if (this.#ringIdx >= 0) {
             if (this.#publishRingSet(key, enc, ttlMs)) {
                 this.stats.sent++;
+                // MARKED ONLY NOW, and only at minLevel 2 -- see the else
+                // branch above. The record that clears this mark is the one
+                // the push just made; a mark taken before the push and left
+                // behind by the shed below made the key unreadable from every
+                // tier, L3 included, for the life of the worker.
+                if (minLevel !== 1) this.#markPendingDel(key, keyHash);
                 this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
                 return true;
             }
@@ -2407,6 +2506,10 @@ class TurboKV {
             this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return true;
         }
+        // The IPC fallback can still be shed later, inside flush(), which is
+        // why flush() unmarks what it drops -- the mark cannot be deferred to
+        // the send the way the ring's can, because the push IS the handover.
+        if (minLevel !== 1) this.#markPendingDel(key, keyHash);
         this.#publishOutbox('s', key, enc, ttlMs, encLen + key.length + 48);
         this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
         return true;                      // queued; capacity is decided by the primary
@@ -3132,13 +3235,32 @@ class TurboKV {
             // keeping them cannot be what grows this buffer: one `c` and one
             // `+`/`-` pair per clearAll, and a clear is not a hot-path
             // operation.
+            //
+            // AND WHAT IS SHED IS UNMARKED. A `d`, and an `s` at minLevel >= 2,
+            // leave a #pendingDel mark behind so this worker's own reads miss
+            // until the removal comes back around the invalidation ring. The
+            // record that clears the mark is the one this batch was carrying,
+            // so dropping the batch without dropping the mark leaves a key
+            // that is unreadable from EVERY tier, L3 included, for the life of
+            // the worker -- and whose entry counts against the bound that then
+            // evicts real pending deletes. The honest state after a shed write
+            // is the one the ring-full path already reports: the removal did
+            // not reach L2. An `r` is a cap the primary will now never apply,
+            // which is what l3FailTtlUnapplied means.
             const keep = [];
+            let shed = 0, capsLost = 0;
             for (let i = 0; i < this.#outbox.length; i += 4) {
-                const op = this.#outbox[i];
-                if (op === 'c' || op === '+' || op === '-') keep.push(op, '', null, 0);
+                const op = this.#outbox[i], key = this.#outbox[i + 1];
+                if (op === 'c' || op === '+' || op === '-') { keep.push(op, '', null, 0); continue; }
+                if (op === 'r') { capsLost++; continue; }
+                shed++;
+                if (this.#pendingDel.size && this.#pendingDel.has(key)) {
+                    this.#pendingDel.delete(key);
+                    this.#pendingDelHash.delete(native.hashKey(key));
+                }
             }
-            this.stats.writesShed = (this.stats.writesShed || 0) +
-                                    (this.#outbox.length - keep.length) / 4;
+            if (shed) this.stats.writesShed = (this.stats.writesShed || 0) + shed;
+            if (capsLost) this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + capsLost;
             this.#outbox = keep;
             this.#outboxBytes = 0;
             this.lastError = 'IPC send window full; L2 writes shed';
