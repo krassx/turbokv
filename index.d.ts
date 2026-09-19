@@ -382,13 +382,18 @@ export declare class TurboKV<T = unknown> {
      *  its writer id: ids are yours to choose and are normally reused across
      *  restarts, so releasing by one would settle whatever worker holds that
      *  slot now, which may be a live successor with a clear of its own in
-     *  flight. A bare id is accepted but names only a sender that never
-     *  identified itself, such as a hand-built batch.
+     *  flight.
+     *
+     *  Passing a writer id **throws**, and the parameter type rejects one at
+     *  compile time: it used to be the whole signature, it would now settle
+     *  nothing, and a leaked generation blocks L3 reads in every process until
+     *  the arena is recreated. Failing loudly is the only safe way to change
+     *  this call.
      *
      *  `install()` calls this on a worker's `'exit'` and `'disconnect'`. Call
      *  it yourself only if you route cluster messages yourself, the way
      *  {@link applyBatch} is called -- the two are a pair. */
-    static releaseWorker(who: unknown): number;
+    static releaseWorker(who: object): number;
 
     /** Undefined when no arena is attached (before open, or after close). */
     static arenaStats(): ArenaStats | undefined;

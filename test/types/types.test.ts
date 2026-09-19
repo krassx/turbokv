@@ -108,7 +108,12 @@ const l3Blocked: number | undefined = c.stats.l3PromotionsBlocked;
 const l3Unhashable: number | undefined = c.stats.l3UnhashableKeys;
 const l3DelReading: number | undefined = c.stats.l3DeletedWhileReading;
 const l3Clearing: number | undefined = c.stats.l3ClearedWhileReading;
-const released: number = TurboKV.releaseWorker(1);
+// A worker is named by a MESSAGE, never by a writer id: ids are reused across
+// restarts, so releasing by one could settle a live successor's clear. The old
+// call has to fail at compile time, not quietly return 0.
+const released: number = TurboKV.releaseWorker({ t: 'tc', id: 1, n: 'attach-nonce' });
+// @ts-expect-error a writer id is no longer a worker
+TurboKV.releaseWorker(1);
 const anyHit: boolean = (c.stats.l3Hits ?? 0) > 0;
 void [l3Hits, l3Misses, l3Sets, l3SetFailed, l3DeleteFailed, l3FailTtl,
      l3Blocked, l3Unhashable, l3DelReading, l3Clearing, released, anyHit];

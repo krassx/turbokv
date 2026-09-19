@@ -835,7 +835,15 @@ class TurboKV {
             let last = null;
             w.on('message', m => {
                 if (m && m.t === RING_MSG) { TurboKV.drainSubmissions(); return; }
-                if (TurboKV.isCacheMessage(m)) { last = m; TurboKV.applyBatch(m); }
+                if (TurboKV.isCacheMessage(m)) {
+                    // The NAME, not the message. `m.b` holds the batch --
+                    // every key and every encoded value in it -- and keeping
+                    // the message would pin the largest batch this worker ever
+                    // sent for the life of the channel. Two fields is all
+                    // reconciliation reads.
+                    last = { id: m.id, n: m.n };
+                    TurboKV.applyBatch(m);
+                }
             });
             // Both, and idempotent by construction: a disconnect usually
             // precedes an exit, and releaseWorker settles nothing the second
@@ -2142,12 +2150,27 @@ class TurboKV {
     // See ATTACH_NONCE.
     static #clearGensOwed = new Map();
 
-    // The sender's attachment, as a map key. A message with no nonce is one
-    // this package did not send -- a hand-rolled or replayed batch -- and has
-    // no attachment identity to offer; it falls back to its declared id, which
-    // is all it has said about itself, and which no real attachment can
-    // collide with because a real one always carries a nonce.
-    static #attachmentOf(msg) { return msg && msg.n ? msg.n : 'id:' + (msg && msg.id); }
+    // The sender's attachment, or undefined when the message names none.
+    //
+    // THERE IS NO FALLBACK TO THE WRITER ID, and that is the whole point. An
+    // id-keyed fallback reads as a kindness to an older worker and is in fact
+    // the original defect wearing a different hat: a mixed-version rolling
+    // restart is precisely the stable-slot deployment that made ids collide,
+    // so the fallback re-opened, silently, the hole the nonce closes. A
+    // generation must never be opened under a name that a DIFFERENT process
+    // can also answer to.
+    static #attachmentOf(msg) { return msg && typeof msg.n === 'string' && msg.n ? msg.n : undefined; }
+
+    // Loud rather than silent: an unguarded clear is a correctness event, and
+    // an operator watching `lastError` is the only person who can act on it.
+    // Reported on every cache in this process, the way applyBatch already
+    // touches every instance -- they all share the arena this affects.
+    static #refuseUnidentifiedClear(op) {
+        const why = `turbokv: ignored a clear-generation op ('${op}') from a batch that names no ` +
+                    `attachment; that worker's L3 clear is not guarded across processes ` +
+                    `(version skew, or a hand-built batch)`;
+        for (const c of instances) c.lastError = why;
+    }
 
     static #l3ClearOpenFor(who) {
         TurboKV.#clearGensOwed.set(who, (TurboKV.#clearGensOwed.get(who) || 0) + 1);
@@ -2182,8 +2205,25 @@ class TurboKV {
     // dead worker is part of the job. Idempotent: a second call settles
     // nothing, so 'exit' after 'disconnect' is free.
     static releaseWorker(who) {
-        const key = typeof who === 'object' && who !== null
-            ? TurboKV.#attachmentOf(who) : 'id:' + who;
+        // The old shape -- a writer id -- is now a MISTAKE, not a deprecated
+        // spelling, and it must not fail quietly. It would settle nothing (ids
+        // name no attachment any more), so a primary that routes IPC itself
+        // and upgrades would keep compiling, see no warning, and leak a
+        // generation on every worker replacement: a cluster-wide L3 outage,
+        // arrived at by doing nothing wrong except not reading a changelog.
+        if (typeof who !== 'object' || who === null) {
+            throw new TypeError(
+                `turbokv: releaseWorker() takes a cache message from the worker that is gone, ` +
+                `not a writer id (got ${typeof who === 'number' ? who : JSON.stringify(who)}). ` +
+                `Ids are reused across restarts, so releasing by one could settle a LIVE ` +
+                `successor's clear; a message names the attachment instead. Keep the last ` +
+                `message you routed to applyBatch, or let install() do the whole job.`);
+        }
+        const key = TurboKV.#attachmentOf(who);
+        // A message that names no attachment opened nothing either (see
+        // applyBatch), so there is genuinely nothing to settle -- this zero is
+        // the truth about that sender, not a silent failure.
+        if (key === undefined) return 0;
         let n = 0;
         while (TurboKV.#l3ClearSettleFor(key)) n++;
         return n;
@@ -2568,8 +2608,22 @@ class TurboKV {
             // writer -- does it. '+' arrives in the same batch as the 'c' it
             // belongs to and immediately before it; '-' arrives once that
             // worker's adapter has actually applied the clear.
-            else if (op === '+') TurboKV.#l3ClearOpenFor(TurboKV.#attachmentOf(msg));
-            else if (op === '-') TurboKV.#l3ClearSettleFor(TurboKV.#attachmentOf(msg));
+            //
+            // A batch that names no attachment gets NEITHER. Opening a
+            // generation for a sender that cannot be identified means opening
+            // one that nothing can reliably settle: its own '-' names nothing
+            // either, and reconciliation has no handle to release. The wipe
+            // itself ('c', above) still applies -- it can only REMOVE data,
+            // which every worker on this channel can already ask for, and
+            // refusing it would leave L2 serving values that worker's L3
+            // clear is removing, a permanent divergence rather than one
+            // unguarded round trip. See decision 70.
+            else if (op === '+' || op === '-') {
+                const who = TurboKV.#attachmentOf(msg);
+                if (who === undefined) TurboKV.#refuseUnidentifiedClear(op);
+                else if (op === '+') TurboKV.#l3ClearOpenFor(who);
+                else TurboKV.#l3ClearSettleFor(who);
+            }
         }
     }
 

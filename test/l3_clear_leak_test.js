@@ -41,7 +41,7 @@ if (!cluster.isPrimary) {
     // the worker is killed. `stall`: one that lands on cue, so its `-` is
     // pushed at a moment we choose -- while the channel is congested.
     let releaseClear = null;
-    const HELD_OPEN = ['kill', 'recycle', 'shedclear'];
+    const HELD_OPEN = ['kill', 'recycle', 'shedclear', 'nononce'];
     const clearImpl = HELD_OPEN.includes(process.env.TC_CASE)
         ? () => new Promise(() => {})           // never lands: the generation stays open
         : () => new Promise((r) => { releaseClear = r; });
@@ -78,6 +78,18 @@ if (!cluster.isPrimary) {
     const burst = () => { for (let i = 0; i < 600; i++) c.set('k' + (n++), 'V'.repeat(64)); c.flush(); };
 
     (async () => {
+        // A WORKER FROM BEFORE THE NONCE EXISTED, simulated by stripping the
+        // field this version adds. A mixed-version rolling restart is exactly
+        // the stable-slot deployment that makes writer ids collide, so a
+        // primary that fell back to the id for such a worker would re-open the
+        // hole the nonce closes -- silently, and only during an upgrade.
+        if (process.env.TC_CASE === 'nononce') {
+            process.send = (msg, cb) => {
+                if (msg && msg.n) { const copy = { ...msg }; delete copy.n; return realSend(copy, cb); }
+                return realSend(msg, cb);
+            };
+        }
+
         // The clear that is SHED rather than stalled: this worker congests the
         // channel FIRST, so the clearAll itself lands in a batch that is shed.
         if (process.env.TC_CASE === 'shedclear') {
@@ -163,23 +175,32 @@ for (const k of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) f.store.set(k, { value: 'P
     // Applied exactly as a worker's batch would be, under a writer id that has
     // opened nothing. Before the per-writer accounting this disarmed the
     // cluster-wide guard for everybody.
-    TurboKV.applyBatch({ t: MSG, id: 424242, b: ['-', '', null, 0] });
+    const forged = { t: MSG, id: 424242, n: 'attach-forged', b: ['-', '', null, 0] };
+    TurboKV.applyBatch(forged);
     ok(native.l3ClearsInFlight() === 1,
-       `a settle from a writer that opened nothing disarms nothing (${native.l3ClearsInFlight()})`);
-    ok(TurboKV.releaseWorker(424242) === 0, 'and that writer has nothing to release either');
+       `a settle from a sender that opened nothing disarms nothing (${native.l3ClearsInFlight()})`);
+    ok(TurboKV.releaseWorker(forged) === 0, 'and that sender has nothing to release either');
     ok(await primary.getAsync('p3') === undefined, 'the guard is still armed after the forged settle');
+
+    // The OLD call shape is a mistake now, not a deprecated spelling: it would
+    // settle nothing and leak a generation on every worker replacement, so it
+    // must fail loudly rather than quietly.
+    let threw = null;
+    try { TurboKV.releaseWorker(424242); } catch (e) { threw = e; }
+    ok(threw instanceof TypeError && /cache message/.test(threw.message),
+       `releasing by writer id throws rather than silently settling nothing (${threw && threw.message})`);
 
     // The count is per writer and it is a COUNT: one worker clearing twice
     // before the first lands owes two, and the first `-` must not disarm the
     // second clear (the same reason the process-local counter is a count).
-    const open2 = { t: MSG, id: 777, b: ['+', '', null, 0] };
+    const open2 = { t: MSG, id: 777, n: 'attach-777', b: ['+', '', null, 0] };
     TurboKV.applyBatch(open2); TurboKV.applyBatch(open2);
     ok(native.l3ClearsInFlight() === 3,
        `two clears from one worker are two generations (${native.l3ClearsInFlight()})`);
-    TurboKV.applyBatch({ t: MSG, id: 777, b: ['-', '', null, 0] });
+    TurboKV.applyBatch({ t: MSG, id: 777, n: 'attach-777', b: ['-', '', null, 0] });
     ok(native.l3ClearsInFlight() === 2,
        `the first settle closes one of them, not both (${native.l3ClearsInFlight()})`);
-    ok(TurboKV.releaseWorker(777) === 1, 'and releasing that writer settles the one still owed');
+    ok(TurboKV.releaseWorker(open2) === 1, 'and releasing that attachment settles the one still owed');
     ok(native.l3ClearsInFlight() === 1,
        `leaving the OTHER worker's generation untouched (${native.l3ClearsInFlight()})`);
 
@@ -190,8 +211,6 @@ for (const k of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) f.store.set(k, { value: 'P
        `the primary settles what a vanished worker still owed (${native.l3ClearsInFlight()})`);
     ok(await primary.getAsync('p4') === 'P', 'and the cluster reads L3 again rather than staying dark');
     ok(TurboKV.releaseWorker(lastB) === 0, 'releasing the same attachment twice settles nothing');
-    ok(TurboKV.releaseWorker(wB.id) === 0,
-       'and a real worker cannot be released by its writer id at all -- ids are reused, attachments are not');
 
     // === 4. a recycled writer id ==========================================
     // A supervisor that names workers by slot reuses the number when it
@@ -218,7 +237,37 @@ for (const k of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) f.store.set(k, { value: 'P
     ok(native.l3ClearsInFlight() === 0, 'and the successor is reconciled in its turn');
     ok(await primary.getAsync('p6') === 'P', 'after which L3 reads work again');
 
-    // === 5. a clearAll shed by a congested channel =========================
+    // === 5. a batch that names no attachment ==============================
+    // Version skew, not malice: a worker built before the nonce existed. Its
+    // `+` must not open a generation -- nothing could reliably settle one,
+    // since its `-` names nothing either and reconciliation has no handle --
+    // while its `c` still applies, because a wipe can only remove data and
+    // refusing it would leave L2 serving what that worker's L3 clear removes.
+    primary.set('kept2', 'OLD');
+    const wF = cluster.fork({ TC_CASE: 'nononce', TC_ID: '7', TCL_ARENA: ARENA });
+    await once(wF, 'armed');
+    ok(native.l3ClearsInFlight() === 0,
+       `an unidentified batch opens no clear generation (${native.l3ClearsInFlight()})`);
+    ok(native.get('kept2') === undefined, `but its clearAll still wiped L2 (${native.get('kept2')})`);
+    ok(/names no attachment/.test(primary.lastError || ''),
+       `and the refusal is reported rather than silent (${JSON.stringify(primary.lastError)})`);
+
+    // ... and it cannot take a REAL worker's generation with it when it dies,
+    // even though they share writer id 7.
+    const wG = cluster.fork({ TC_CASE: 'recycle', TC_ID: '7', TCL_ARENA: ARENA });
+    await once(wG, 'armed');
+    ok(native.l3ClearsInFlight() === 1, 'a properly attached worker in the same slot opens one');
+    wF.kill('SIGKILL');
+    await exited(wF);
+    await sleep(50);
+    ok(native.l3ClearsInFlight() === 1,
+       `the unidentified worker's death settles nothing (${native.l3ClearsInFlight()})`);
+    wG.kill('SIGKILL');
+    await exited(wG);
+    await sleep(50);
+    ok(native.l3ClearsInFlight() === 0, 'and the real one is reconciled as usual');
+
+    // === 6. a clearAll shed by a congested channel =========================
     // The `-` is not the only op that can be thrown away under congestion.
     // Losing the `c` loses the clearAll itself while its own bookkeeping
     // reports success: the guard opens and settles cleanly, and L2 goes on
