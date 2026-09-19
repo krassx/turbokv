@@ -8,6 +8,9 @@
 // invalidated while the read was in flight.
 const { fork } = require('child_process');
 const { TurboKV } = require('../src/turbokv');
+// The damage a resurrection does is in the SHARED arena, not in this
+// instance's L1, so the assertions have to look there directly.
+const native = require('../src/native');
 const { makeFake } = require('./l3_fake');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -172,6 +175,104 @@ if (process.env.TCG_ROLE === 'worker') {
         ok(c.stats.l3UnhashableKeys === 1, `the unhashable key is counted separately (${c.stats.l3UnhashableKeys})`);
         ok(c.stats.l3PromotionsBlocked === undefined,
            `and NOT as a blocked promotion (${c.stats.l3PromotionsBlocked})`);
+        c.close();
+    }
+
+    // THE PRIMARY RESURRECTING ITS OWN DELETE.
+    //
+    // The primary has no #pendingDel -- it applies a delete to the arena
+    // synchronously, so there is nothing to remember. But the L3 DEL is still
+    // on the wire, and for that whole round trip L3 answers with the value the
+    // delete is removing. Nothing in the ring can say so: the delete produced
+    // no invalidation L3 has seen. So a concurrent read fetched the value back
+    // out of L3 and wrote it into the SHARED arena for a full TTL, visible to
+    // every process on the box, after `delete` had returned true and `get` was
+    // already answering undefined. "Delete then read" is an ordinary
+    // cache-aside sequence; the window is one L3 round trip per delete.
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        await c.setAsync('k', 'v');
+        f.latency.set('delete', 5000);           // held on the wire for the assertions
+        ok(c.delete('k') === true, 'the primary delete reports the key was there');
+        ok(c.get('k') === undefined, `the sync form reports it gone (${c.get('k')})`);
+        const got = await c.getAsync('k');
+        ok(got === undefined, `the async form agrees rather than resurrecting it (${got})`);
+        ok(c.get('k') === undefined, `nothing was promoted back into L1 (${c.get('k')})`);
+        ok(native.get('k') === undefined,
+           `and nothing was written back into the SHARED arena (${native.get('k')})`);
+        ok(f.calls.filter(x => x[0] === 'get' && x[1] === 'k').length === 0,
+           'and L3 was never even asked for a key this process had deleted');
+        // hasAsync answers from the same state, for the same reason: `has` is
+        // already false, and a `true` here would contradict a delete this
+        // caller was told had succeeded.
+        ok(await c.hasAsync('k') === false, 'hasAsync agrees with has()');
+        c.close();
+    }
+
+    // The same race with the delete landing DURING the read, so the early-out
+    // cannot help -- and with deleteAsync left unawaited, which is how the
+    // sequence is usually written.
+    {
+        const f = makeFake();
+        f.store.set('j', { value: 'L3VALUE', expiresAt: 0 });
+        f.latency.set('get', 60);
+        f.latency.set('delete', 5000);
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        const read = c.getAsync('j');
+        await sleep(10);
+        c.deleteAsync('j');                      // deliberately not awaited
+        const got = await read;
+        ok(got === undefined, `a delete during the read wins over L3's value (${got})`);
+        ok(c.get('j') === undefined, `and nothing was promoted (${c.get('j')})`);
+        ok(native.get('j') === undefined, `not into the shared arena either (${native.get('j')})`);
+        // Counted here and not in the block above: a delete known BEFORE the
+        // read never asks L3 at all, so there is no promotion to prevent. This
+        // one got all the way to a value in hand.
+        ok(c.stats.l3DeletedWhileReading === 1,
+           `the prevented resurrection is counted (${c.stats.l3DeletedWhileReading})`);
+        c.close();
+    }
+
+    // A `minLevel: L3` WRITE RACING A READ PROMOTED THE OLDER VALUE.
+    //
+    // `minLevel: L3` evicts the local copies on purpose and tells the adapter
+    // `willCache: false`, so no provider will ever send an invalidation for
+    // this key. While the SET is on the wire L3 still holds the previous
+    // value, and `get` now misses -- so a read goes straight to L3, gets the
+    // value the write supersedes, and puts it in L1 and L2 for a full TTL.
+    // Permanent and cross-box: the local tiers then answer from that copy and
+    // L3 is not consulted again.
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        await c.setAsync('m', 'v1');
+        f.latency.set('set', 5000);
+        ok(c.set('m', 'v2', { minLevel: TurboKV.L3 }) === true, 'the minLevel L3 write is accepted');
+        ok(c.get('m') === undefined, `and evicts the local copies (${c.get('m')})`);
+        const got = await c.getAsync('m');
+        ok(got === 'v1', `the caller still receives what L3 actually holds right now (${got})`);
+        ok(c.get('m') === undefined, `but the superseded value is NOT promoted into L1 (${c.get('m')})`);
+        ok(native.get('m') === undefined,
+           `nor into the shared arena, where willCache:false means nothing would invalidate it (${native.get('m')})`);
+        ok(c.stats.l3PromotionsBlocked === 1,
+           `counted as contention on this key (${c.stats.l3PromotionsBlocked})`);
+        c.close();
+    }
+
+    // WITH NO ADAPTER the guard's new question must not exist at all: there is
+    // no queue to ask, so nothing is consulted and nothing behaves differently.
+    {
+        const c = TurboKV.open({ storage: 'bytes' });
+        c.set('n', 'v');
+        ok(c.delete('n') === true, 'delete still reports what it removed');
+        ok(c.get('n') === undefined, 'and the key is gone');
+        ok(await c.getAsync('n') === undefined, 'getAsync without an adapter is still just get');
+        ok(await c.hasAsync('n') === false, 'hasAsync without an adapter is still just has');
+        c.set('n', 'again');
+        ok(await c.getAsync('n') === 'again', 'and a live key still reads back');
+        ok(c.stats.l3DeletedWhileReading === undefined,
+           `no L3 counter is invented for a cache that has no L3 (${c.stats.l3DeletedWhileReading})`);
         c.close();
     }
 

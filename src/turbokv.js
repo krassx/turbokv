@@ -1287,12 +1287,11 @@ class TurboKV {
         // on to L3 with it would hand the adapter -- and hashKey -- something
         // neither of them accepts.
         if (!isStringKey(key)) return undefined;
-        // A key THIS process deleted, whose removal the arena has not applied
-        // yet. `get` answers undefined for it deliberately; L3 has not seen the
-        // delete either, so going there would both resurrect the key locally
-        // and make the two forms disagree about a delete this caller was
-        // already told had succeeded.
-        if (this.#pendingDel.size && this.#pendingDel.has(key)) return undefined;
+        // A key THIS process deleted, whose removal some tier below has not
+        // applied yet. `get` answers undefined for it deliberately; going to L3
+        // would both resurrect the key locally and make the two forms disagree
+        // about a delete this caller was already told had succeeded.
+        if (this.#deletedHere(key)) return undefined;
         const level = opts === undefined ? 1 : this.#resolveLevel(opts.minLevel);
         // Keyed by LEVEL AND KEY, not by key alone. The herd only shares a
         // request when the requests are the same request: two concurrent reads
@@ -1340,25 +1339,33 @@ class TurboKV {
         }
         if (rec === undefined || rec === null) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
         this.stats.l3Hits = (this.stats.l3Hits || 0) + 1;
-        // The delete landed WHILE this read was in flight. Two separate reasons
-        // this cannot be treated like any other blocked promotion: the arena may
-        // not have applied it yet, so there is no ring record for the guard
-        // below to find; and `get` now answers undefined for this key, so
-        // handing back L3's value would make the two forms disagree about a
-        // delete this process issued itself. Not a stale read -- a resurrection.
-        if (this.#pendingDel.size && this.#pendingDel.has(key)) {
-            this.stats.l3DeletedWhileReading = (this.stats.l3DeletedWhileReading || 0) + 1;
-            return undefined;
-        }
-        // The caller gets what L3 returned either way. Blocking changes only
-        // what is stored locally, never what this caller observes.
         const why = this.#promotionBlock(key, mark);
         if (why) {
             this.stats[why] = (this.stats[why] || 0) + 1;
+            // A delete of OUR OWN that L3 has not applied yet is the one reason
+            // that changes the answer, not merely the placement: `get` already
+            // says undefined for this key, so handing back the value the delete
+            // is on its way to removing would make the two forms disagree about
+            // this process's own state. Every other reason leaves the caller
+            // with what L3 returned -- blocking changes only what is stored
+            // locally, never what this caller observes.
+            if (why === 'l3DeletedWhileReading') return undefined;
             return this.#decodeFromL3(rec.value);
         }
         this.#fillFromL3(key, rec, level);
         return this.#decodeFromL3(rec.value);
+    }
+
+    // Is this process still holding an L3 operation for `key` that L3 has not
+    // applied yet -- a delete, specifically? Two places can be holding one and
+    // neither covers the other: a WORKER's delete waits in #pendingDel until
+    // the primary applies it to the arena, while on the PRIMARY the arena is
+    // updated immediately and there is no #pendingDel at all -- the delete is
+    // outstanding only in the L3 queue, which is where the answer has to come
+    // from. Free when there is no adapter: #queue is null and no lookup runs.
+    #deletedHere(key) {
+        if (this.#pendingDel.size && this.#pendingDel.has(key)) return true;
+        return this.#queue !== null && this.#queue.outstandingKind(key) === 'delete';
     }
 
     // Did anything invalidate THIS key while the read was in flight? Checking
@@ -1366,12 +1373,35 @@ class TurboKV {
     // under load the head always moves, so the conservative version would never
     // promote and L3 hits would never reach L2.
     //
-    // Returns '' to promote, or the name of the counter to bump. The two reasons
-    // are unrelated events and an operator watching one is misled by the other:
+    // Returns '' to promote, or the name of the counter to bump. The reasons are
+    // unrelated events and an operator watching one is misled by the other:
     // `l3PromotionsBlocked` is ordinary contention -- this key changed, or the
-    // ring cannot rule out that it did -- while `l3UnhashableKeys` is a key that
-    // can never live in L1 or L2 at all, whatever the ring says.
+    // ring cannot rule out that it did -- `l3UnhashableKeys` is a key that can
+    // never live in L1 or L2 at all, whatever the ring says, and
+    // `l3DeletedWhileReading` is a prevented resurrection, the one reason that
+    // also changes the answer the caller gets (see #fetchFromL3).
     #promotionBlock(key, mark) {
+        // WHAT THIS PROCESS ITSELF STILL OWES L3, asked first and asked of the
+        // queue rather than the ring.
+        //
+        // The ring answers "did anyone else change this key". It cannot answer
+        // "did I already change it": an operation of ours that is queued or on
+        // the wire has by definition not reached L3, so L3 still serves the
+        // value it supersedes, and no ring record exists for a change L3 has
+        // not made. This check also has to come BEFORE the degraded-worker
+        // bail-out below, because it holds whether or not there is an arena to
+        // read a ring from.
+        //
+        // A delete is a resurrection: promoting here would put a removed value
+        // back into the SHARED arena, for a full TTL, visible to every process
+        // on the box. A set is the older value winning: the write already
+        // evicted the local copies and told the adapter `willCache: false`, so
+        // promoting L3's pre-write value would reinstate a copy no provider
+        // will ever invalidate. Both must refuse; only the delete also changes
+        // what the caller is told.
+        const owed = this.#queue === null ? undefined : this.#queue.outstandingKind(key);
+        if (owed === 'delete' || (this.#pendingDel.size && this.#pendingDel.has(key))) return 'l3DeletedWhileReading';
+        if (owed === 'set') return 'l3PromotionsBlocked';
         // A degraded worker has no arena to read the ring from, so it cannot
         // know what happened and must refuse. Refusing costs a promotion, not
         // correctness.
@@ -1776,12 +1806,13 @@ class TurboKV {
         // not accept.
         if (!isStringKey(key)) return false;
         // A key THIS process deleted, whose removal L3 has not applied yet
-        // (the delete is queued but has not landed). `has` already answers
-        // false for it; going to L3 here would say `true` for a key this
-        // caller was just told is gone -- same reasoning as the pendingDel
-        // guard in #fetchFromL3, for a read that answers existence rather
-        // than a value.
-        if (this.#pendingDel.size && this.#pendingDel.has(key)) return false;
+        // (the delete is queued or on the wire, but has not landed). `has`
+        // already answers false for it -- on a worker because of #pendingDel,
+        // on the primary because the arena was updated synchronously -- so
+        // going to L3 here would say `true` for a key this caller was just
+        // told is gone. Same reasoning as the guard in #fetchFromL3, for a
+        // read that answers existence rather than a value.
+        if (this.#deletedHere(key)) return false;
         // Bounded for the same reason the read path is: a hung adapter must
         // answer "not here" within the operation budget rather than never.
         try {
