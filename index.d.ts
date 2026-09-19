@@ -83,11 +83,23 @@ export interface L3Record<T = unknown> {
  * needlessly). Validated once, at construction, so a malformed adapter is a
  * `TypeError` from `TurboKV.open`/`createPrimary`/`attachWorker`, never a
  * rejection discovered on the first cache miss.
+ *
+ * **An adapter method must not call back into the cache it belongs to.**
+ * `clear()` in particular must not await a `set`/`get`/`delete`/`clearAsync`
+ * (or their sync forms) issued against the same cache instance: `clearAll`
+ * makes a clear a barrier in the L3 queue (decision 65/66) that waits for
+ * this call to settle, so a `clear()` that waits on a push back into the same
+ * cache deadlocks the two waiting on each other, permanently. Reliably
+ * detecting reentrancy from inside the library costs more than the rule is
+ * worth, so it is a contract obligation instead: implement against a
+ * different client/connection than the one your own reads and writes use, or
+ * queue the callback for a later tick.
  */
 export interface L3Adapter<T = unknown> {
     get(key: string, options?: L3GetOptions): Promise<L3Record<T> | undefined | null>;
     set(key: string, value: T, options?: L3SetOptions): Promise<void>;
     delete(key: string, options?: L3DeleteOptions): Promise<void>;
+    /** Must not call back into this cache -- see the interface note above. */
     clear(): Promise<void>;
     /** Optional: `EXISTS`-shaped check. Falls back to `get` when absent. */
     has?(key: string): Promise<boolean>;
@@ -503,7 +515,11 @@ export declare class TurboKV<T = unknown> {
     clearAll(): void;
     /** `clearAll`, then L3 (if an adapter is attached), resolving once the L3
      *  clear has landed. A clear is never shed by the L3 queue and retries
-     *  indefinitely, so this promise always eventually resolves `true`. */
+     *  indefinitely, so absent a `close()` this promise always eventually
+     *  resolves `true`. `close()` can cut that short: it ends the retry loop
+     *  at the clear's next failed attempt rather than retrying forever
+     *  against a cache that no longer exists, so a clear still outstanding
+     *  when `close()` is called can resolve `false` instead. */
     clearAsync(): Promise<boolean>;
 
     /** Wait for every operation currently queued for L3 (of any kind, for

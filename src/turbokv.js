@@ -2882,9 +2882,16 @@ class TurboKV {
     }
 
     // clearAll(), then L3. Identical effects to clearAll(); the only
-    // difference is that this one can wait for L3 (and, unlike a set or a
-    // delete, its promise always eventually resolves true -- a clear is
-    // never shed).
+    // difference is that this one can wait for L3. Unlike a set or a delete,
+    // a clear is never shed and retries indefinitely (decision 70), so
+    // ABSENT A close(), this promise always eventually resolves true. close()
+    // is the one thing that can end that early: it tells the queue it is
+    // closed (see L3Queue#close and decision 71), which ends the retry loop
+    // at its NEXT FAILED ATTEMPT rather than trying forever against a cache
+    // that no longer exists -- so a clear still outstanding when close() is
+    // called can resolve false instead, same as an abandoned set or delete.
+    // An attempt already succeeding when close() lands still resolves true;
+    // only a failing one is cut short.
     async clearAsync() {
         this.clearAll();
         const p = this.#lastQueued;
