@@ -318,6 +318,61 @@ if (process.env.TCR3_ROLE === 'lostcap') {
     return;
 }
 
+// -- the walk's round bound must not become an escape hatch ---------------
+// #ringWritersSince walks the invalidation ring in batches of 1024, bounded at
+// 64 rounds. A bound that gives up and returns WHAT IT HAS reads as "no record
+// for this key anywhere", so a rewrite sitting past the unscanned tail becomes
+// a PROVEN loss -- the same false fire the ambiguity answer exists to prevent,
+// through the door the bound itself opened. An exhausted bound must return
+// null, exactly as `wrapped` does.
+//
+// This exercises the relationship that makes the bound safe rather than the
+// exhaustion itself: `ringCap` is capped at 65536 records and a round takes
+// 1024, so 64 rounds cover a FULL ring and a static one always completes. The
+// walk here crosses a nearly full ring -- sixty-odd rounds -- and must still
+// reach a definite verdict. Lower the bound below the ring depth and it goes
+// from `unapplied` to `unconfirmed`, which is the fix's behaviour; lower it
+// AND return the partial result and it stays `unapplied`, which is the defect.
+if (process.env.TCR3_ROLE === 'ringdepth') {
+    (async () => {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const w = TurboKV.attachWorker(process.env.TCR3_ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 200, l3FailTtlMs: 150 });
+        const cap = native.ringStats().capacity;
+        ok(cap === 65536, `the arena is big enough for a full-depth ring (${cap})`);
+        ok(cap <= 64 * 1024,
+           `and the bound covers a full ring, which is why a static walk always completes ` +
+           `(${cap} <= ${64 * 1024})`);
+
+        // Its own record lands before the mark, so the verdict can be proven.
+        w.set('deep', 'REFUSED');
+        for (let i = 0; i < 80 && native.get('deep') === undefined; i++) { await sleep(25); w.get('poke'); }
+        ok(native.get('deep') === 'REFUSED', `the write reached the arena (${native.get('deep')})`);
+        await w.drainL3();
+        await sleep(50);
+        ok(w.__unsafeCapState().caps === 1, `a read guard is outstanding (${w.__unsafeCapState().caps})`);
+        const mark = native.ringStats().head;
+
+        // Fill the ring to just under its capacity from the PRIMARY, so the
+        // walk is deep but the mark is still readable (past it and the ring
+        // would have lapped, which is a different -- and already tested --
+        // reason to answer `unconfirmed`).
+        process.send({ step: 'fill' }); await step('filled');
+        const depth = native.ringStats().head - mark;
+        ok(depth > 60 * 1024, `the walk from the mark is sixty-odd rounds deep (${depth} records)`);
+        ok(depth < cap, `and the mark has not been lapped (${depth} < ${cap})`);
+
+        await sleep(2500);                       // past deadline + L3_CAP_WINDOW_MS
+        ok((w.stats.l3FailTtlUnapplied || 0) === 1,
+           `a full-depth walk still reaches a proven verdict (${w.stats.l3FailTtlUnapplied})`);
+        ok((w.stats.l3FailTtlUnconfirmed || 0) === 0,
+           `rather than giving up part way (${w.stats.l3FailTtlUnconfirmed})`);
+        done(w, 'ring-depth');
+    })();
+    return;
+}
+
 // -- the writer id cannot identify us, and must not be trusted to ---------
 // Shared-memory submissions are stamped with the RING SLOT plus one; an IPC
 // batch is stamped with the sender's WRITER ID; nothing keeps those two
@@ -456,9 +511,10 @@ if (process.env.TCR3_ROLE === 'capmax') {
 
 // ------------------------------------------------------------------ parent
 // One child at a time, each against an arena shaped for what it needs.
-function runChild(role, arena, primaryOpts, onStep, before, route = true) {
+function runChild(role, arena, primaryOpts, onStep, before, route = true,
+                  arenaBytes = 16 << 20, indexSlots = 1 << 14) {
     return new Promise((resolve) => {
-        const p = TurboKV.createPrimary(arena, 16 << 20, 1 << 14,
+        const p = TurboKV.createPrimary(arena, arenaBytes, indexSlots,
             { storage: 'bytes', maintenance: false, ...primaryOpts });
         if (before) before(p);
         // `drain: false` HOLDS rather than drops: a held batch is applied on
@@ -720,6 +776,19 @@ const drainAll = () => { let g = 0; while (TurboKV.drainSubmissions(8192) > 0 &&
     {
         const code = await runChild('capmax', ARENA + '8', {}, () => {}, undefined, false);
         ok(code === 0, `the cap-max cases passed (child exited ${code})`);
+    }
+    {
+        // A 64MB arena, which is what gives the ring its full 65536 records
+        // (store.h caps it at 4% of the arena). `route: false`: the cap must
+        // never be applied.
+        const code = await runChild('ringdepth', ARENA + 'a', {}, (s, p, state, kid) => {
+            if (s !== 'fill') return;
+            // 62000 records from the PRIMARY: deep enough to need sixty-odd
+            // rounds, shallow enough that the worker's mark is still readable.
+            for (let i = 0; i < 62000; i++) p.set('f' + i, 'v');
+            kid.send({ step: 'filled' });
+        }, undefined, false, 64 << 20, 1 << 17);
+        ok(code === 0, `the ring-depth cases passed (child exited ${code})`);
     }
     {
         // `route: false` for the cap holder -- its request must never be

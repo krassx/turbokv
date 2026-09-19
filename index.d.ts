@@ -385,8 +385,9 @@ export interface CacheStats {
     /** Caps that were handed to the primary and whose outcome this process
      *  can no longer establish, counted once each. Four ways: the worker
      *  degraded or closed before the read guard's window ran out; the
-     *  invalidation ring had lapped past the cap's mark, so it cannot say
-     *  whether anybody rewrote the key; the only record for the key inside
+     *  invalidation ring had lapped past the cap's mark, or the walk over it
+     *  could not be completed, so it cannot say whether anybody rewrote the
+     *  key; the only record for the key inside
      *  the window carried this handle's own writer id, which a shared-memory
      *  submission and an `'ipc'` worker's batch can both produce (ring slot
      *  plus one, and the sender's id, are not separate spaces); or no guard

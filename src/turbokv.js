@@ -2362,10 +2362,27 @@ class TurboKV {
     // BOUNDED, like #primaryInvalidate's walk: `wrapped` is the ordinary exit,
     // but a producer faster than this loop could otherwise keep it going, and
     // this runs on a timer with the event loop to itself.
+    //
+    // AND AN EXHAUSTED BOUND RETURNS null, exactly as `wrapped` does. This is
+    // the one thing a bound must not do quietly: a partial walk returned as a
+    // result reads as "no record for this key anywhere", so a rewrite sitting
+    // past the unscanned tail became a PROVEN loss -- the same false fire the
+    // ambiguity answer above exists to prevent, through the door the bound
+    // itself opened. An incomplete scan is indistinguishable from a lapped
+    // ring and must land in the same bucket.
+    //
+    // The bound is deliberately not tight against the geometry by accident:
+    // `ringCap` is capped at 65536 records (store.h) and each round takes
+    // 1024, so 64 rounds cover a FULL ring. A static ring therefore always
+    // completes, and exhaustion means only one thing -- the primary appended
+    // faster than this synchronous walk could read, sustained over 65536
+    // records -- which is exactly the case where the answer is unknown.
+    // test/review3_regression_test.js walks a nearly full ring to keep that
+    // relationship honest.
     #ringWritersSince(from) {
         const mine = this.#ringIdx >= 0 ? this.#ringIdx + 1 : this.#id;
         const other = new Set(), own = new Set();
-        let cursor = from, all = false;
+        let cursor = from, all = false, complete = false;
         for (let round = 0; round < 64; round++) {
             let r;
             try { r = native.ringRead(cursor, 1024); } catch { return null; }
@@ -2375,9 +2392,10 @@ class TurboKV {
                 if (r.writers[i] === mine) own.add(r.hashes[i]);
                 else other.add(r.hashes[i]);
             }
-            if (r.head <= cursor || r.head >= r.ringHead) break;
+            if (r.head <= cursor || r.head >= r.ringHead) { complete = true; break; }
             cursor = r.head;
         }
+        if (!complete) return null;
         return { other, mine: own, all };
     }
 
