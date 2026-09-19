@@ -46,10 +46,6 @@ class ServiceTimers {
         for (const t of this.#armed) { if (t.unref) t.unref(); }
         this.#armed.clear();
     }
-    get closed() { return this.#closed; }
-    // Test-only: lets a test prove a deadline is holding the loop rather than
-    // inferring it from an exit code.
-    get armed() { return this.#armed.size; }
 }
 
 // Races `promise` against a bound, REJECTING when the bound wins.
@@ -73,9 +69,9 @@ class ServiceTimers {
 // -- so `await setAsync` never settles, never prints, and exits 0 as though it
 // had succeeded. The backoff's treatment is the model: `timers` keeps the timer
 // ref'd while the queue is in service and unrefs every one of them at close(),
-// so shutdown still cannot be detained. A caller that passes no registry gets
-// the old unref'd behaviour, which is right for a one-off with no lifecycle
-// behind it.
+// so shutdown still cannot be detained. The registry is required, not optional:
+// every deadline in this system belongs to a cache with a lifecycle, and an
+// optional one is how the unref'd default got here in the first place.
 function withDeadline(promise, ms, what, timers) {
     if (!(ms > 0)) return Promise.resolve(promise);
     return new Promise((resolve, reject) => {
@@ -83,16 +79,15 @@ function withDeadline(promise, ms, what, timers) {
         const timer = setTimeout(() => {
             if (done) return;
             done = true;
-            if (timers) timers.disarm(timer);
+            timers.disarm(timer);
             reject(new Error(`turbokv: the l3 adapter's ${what}() did not settle within ${ms}ms`));
         }, ms);
-        if (timers) timers.arm(timer);
-        else if (timer.unref) timer.unref();
+        timers.arm(timer);
         const finish = (fn) => (v) => {
             if (done) return;
             done = true;
             clearTimeout(timer);
-            if (timers) timers.disarm(timer);
+            timers.disarm(timer);
             fn(v);
         };
         Promise.resolve(promise).then(finish(resolve), finish(reject));
@@ -164,9 +159,6 @@ class L3Queue {
     // the same obligation: a bounded wait must hold the loop while it is
     // waiting and let go the moment the cache closes.
     deadline(promise, ms, what) { return withDeadline(promise, ms, what, this.#timers); }
-
-    // Test-only: deadlines and backoffs currently holding the event loop.
-    get armedTimers() { return this.#timers.armed; }
 
     get pending() { return this.#count; }
     // Bytes currently OUTSTANDING -- queued PLUS in flight, not merely
@@ -463,4 +455,4 @@ class L3Queue {
 
     drain() { return this.#count === 0 ? Promise.resolve() : new Promise(r => this.#idle.push(r)); }
 }
-module.exports = { L3Queue, withDeadline, ServiceTimers };
+module.exports = { L3Queue };
