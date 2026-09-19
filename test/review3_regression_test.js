@@ -207,6 +207,18 @@ if (process.env.TCR3_ROLE === 'ipcshed') {
         ok(w.get('k') === 'V1', `the deleted key is readable again, honestly (${JSON.stringify(w.get('k'))})`);
         ok(w.get('m2') === 'V1', `and so is the minLevel:L2 one (${JSON.stringify(w.get('m2'))})`);
         ok(await w.getAsync('k') === 'V1', 'and neither is cut off from L3 either');
+
+        // AND A CAP REQUEST SHED BY THE SAME BRANCH IS COUNTED. It is a cap
+        // the primary will now never apply, which is the third of the ways
+        // l3FailTtlUnapplied can move -- and the one most easily lost among
+        // the writes it is shed with.
+        f.fail.set('set', new Error('l3 down'));
+        ok(await w.setAsync('capme', 'V') === false, 'a write whose L3 half failed');
+        ok((w.stats.l3FailTtlApplied || 0) >= 1, 'its L1 copy was capped');
+        for (let i = 0; i < 8; i++) w.set('pad2' + i, 'z'.repeat(100));   // force the shed
+        await sleep(60);
+        ok((w.stats.l3FailTtlUnapplied || 0) >= 1,
+           `and the shed cap request is counted (${w.stats.l3FailTtlUnapplied})`);
         done(w, 'ipc-shed');
     })();
     return;
@@ -244,9 +256,44 @@ if (process.env.TCR3_ROLE === 'oldrecord') {
     return;
 }
 
+// ------------- the shm/IPC coupling: a lost cap must become a number -----
+// `transport: 'shm'` moves the WRITES off the cluster channel; it does not
+// take a worker off it. A worker's l3FailTtlMs re-time is a REQUEST the
+// primary applies, and it travels as a cluster message on both transports --
+// so a consumer that routes the ring doorbell but never calls applyBatch
+// leaves the value L3 refused in the SHARED arena with no expiry, box-wide,
+// forever. The stats used to say that worked: l3FailTtlApplied moved for the
+// L1 half and nothing at all moved on the other side.
+if (process.env.TCR3_ROLE === 'lostcap') {
+    (async () => {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const w = TurboKV.attachWorker(process.env.TCR3_ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 10, l3FailTtlMs: 100 });
+        ok(w.transport === 'shm', `the worker is on the shm transport (${w.transport})`);
+        ok(await w.setAsync('lost', 'REFUSED') === false, 'the L3 write failed');
+        // The parent drains the ring on the doorbell, so the WRITE lands --
+        // it is only the cap request it never applies.
+        for (let i = 0; i < 80 && native.get('lost') === undefined; i++) { await sleep(25); w.get('poke'); }
+        ok(native.get('lost') === 'REFUSED', `the write reached the shared arena (${native.get('lost')})`);
+        ok(native.lastTtlRemainingMs() === 0,
+           `and sits there with no expiry, because the cap was never applied (${native.lastTtlRemainingMs()})`);
+        ok((w.stats.l3FailTtlApplied || 0) >= 1,
+           `the L1 half alone reports success (${w.stats.l3FailTtlApplied})`);
+        // ...which is exactly why the other side has to move too.
+        for (let i = 0; i < 240 && !(w.stats.l3FailTtlUnapplied > 0); i++) await sleep(25);
+        ok((w.stats.l3FailTtlUnapplied || 0) >= 1,
+           `the silence is counted, not silent (${w.stats.l3FailTtlUnapplied})`);
+        ok((w.stats.l3FailTtlUnapplied || 0) === 1,
+           `and counted once (${w.stats.l3FailTtlUnapplied})`);
+        done(w, 'lost-cap');
+    })();
+    return;
+}
+
 // ------------------------------------------------------------------ parent
 // One child at a time, each against an arena shaped for what it needs.
-function runChild(role, arena, primaryOpts, onStep, before) {
+function runChild(role, arena, primaryOpts, onStep, before, route = true) {
     return new Promise((resolve) => {
         const p = TurboKV.createPrimary(arena, 16 << 20, 1 << 14,
             { storage: 'bytes', maintenance: false, ...primaryOpts });
@@ -268,7 +315,13 @@ function runChild(role, arena, primaryOpts, onStep, before) {
             // parent routes it the way install() would -- except while a test
             // is deliberately holding the primary still, because applyBatch
             // drains every submission ring before it applies anything.
-            if (TurboKV.isCacheMessage(m)) { if (state.drain) TurboKV.applyBatch(m); else held.push(m); return; }
+            // `route: false` is a primary that routes the ring doorbell and
+            // nothing else -- the hand-wired consumer this coupling traps.
+            if (TurboKV.isCacheMessage(m)) {
+                if (!route) return;
+                if (state.drain) TurboKV.applyBatch(m); else held.push(m);
+                return;
+            }
             if (m && m.t === 'tcr') { if (state.drain) TurboKV.drainSubmissions(20000); return; }
             if (m && m.step) onStep(m.step, p, state, kid);
         });
@@ -404,6 +457,45 @@ const drainAll = () => { let g = 0; while (TurboKV.drainSubmissions(8192) > 0 &&
         c.close();
     }
 
+    // THE SAME SILENCE, REACHED THROUGH A CLOSED CHANNEL. flush() dropped an
+    // `r` when `!process.connected` without counting either side, so a cap
+    // that could not leave the process at all still read as success.
+    {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const c = TurboKV.createPrimary(ARENA + 'i', 8 << 20, 1 << 13,
+            { storage: 'bytes', maintenance: false, l3: f.adapter, l3RetryMs: 30, l3FailTtlMs: 5000 });
+        // A worker handle in this same process: no cluster channel, so its
+        // outbox has nowhere to go.
+        const w = new TurboKV({ storage: 'bytes', l3: f.adapter, workerId: 1,
+                                l3RetryMs: 30, l3FailTtlMs: 5000, l3CloseTimeoutMs: 1 });
+        ok(process.connected !== true, 'this process has no cluster channel');
+        w.set('nochannel', 'V');
+        for (let i = 0; i < 80 && !(w.stats.l3FailTtlUnapplied > 0); i++) await sleep(25);
+        ok((w.stats.l3FailTtlUnapplied || 0) >= 1,
+           `a cap that cannot leave the process is counted (${w.stats.l3FailTtlUnapplied})`);
+        await w.close();
+        await c.close();
+    }
+
+    // `attached: false` YIELDS #id === 0 IN ANY PROCESS. It is an undeclared
+    // escape hatch past the constructor's "workerId 0 is the primary" guard,
+    // so the rule's own check cannot rest on the id alone.
+    {
+        const f = makeFake();
+        f.store.set('p', { value: 'L3VAL', expiresAt: 0 });
+        const c = TurboKV.createPrimary(ARENA + 'j', 4 << 20, 1 << 12,
+            { storage: 'bytes', maintenance: false });
+        const hatch = new TurboKV({ storage: 'bytes', l3: f.adapter, attached: false });
+        ok(await hatch.getAsync('p') === 'L3VAL', 'the escape-hatch handle reads through to L3');
+        // It IS the primary process here, so the promotion is legitimate --
+        // the check below is that the rule looks at the process, which is the
+        // half a non-primary process would fail.
+        ok(native.get('p') === 'L3VAL', `and in the primary process it may promote (${native.get('p')})`);
+        hatch.close();
+        await c.close();
+    }
+
     // THE ARCHITECTURAL RULE, from the primary's side: its OWN promotion still
     // writes L2. The worker's refusal is checked in l3_guard_test.js, and a
     // refusal nobody balances is indistinguishable from promotion being
@@ -449,6 +541,10 @@ const drainAll = () => { let g = 0; while (TurboKV.drainSubmissions(8192) > 0 &&
         const code = await runChild('ipcshed', ARENA + '4', { transport: 'ipc' },
             () => {}, (p) => { p.set('k', 'V1'); p.set('m2', 'V1'); });
         ok(code === 0, `the ipc-shed cases passed (child exited ${code})`);
+    }
+    {
+        const code = await runChild('lostcap', ARENA + '6', {}, () => {}, undefined, false);
+        ok(code === 0, `the lost-cap cases passed (child exited ${code})`);
     }
     {
         const code = await runChild('oldrecord', ARENA + '5', {}, (s, p, state, kid) => {

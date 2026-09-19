@@ -146,6 +146,18 @@ scripts/                          build helpers
   reason in `lastError`.
 - **Primary death**: a worker detaches, keeps serving its warm L1, polls, and
   recovers when a heartbeat *advances* — then flushes L1 and re-claims a ring.
+- **Routing cluster messages yourself**: `TurboKV.install(cluster)` is the easy
+  path and does the whole job. If your application owns the primary's `message`
+  handler instead, it must pass turbokv's messages to `TurboKV.applyBatch()` —
+  **on both transports**. `'shm'` moves the *writes* off the channel; it does
+  not take a worker off it. A `clearAll()`'s wipe, the two halves of its
+  cluster-wide L3 clear generation, and the conditional re-time a worker asks
+  for when an `l3` write fails all still travel as cluster messages and are
+  applied nowhere else. Route the ring doorbell but not these and a value L3
+  rejected stays in the shared arena with no expiry, for every process, until
+  something overwrites it — watch `stats.l3FailTtlUnapplied`, which is what
+  moves when it happens. Call `TurboKV.releaseWorker()` on `'exit'` and
+  `'disconnect'` for the same reason.
 
 The full design, decision log and measurements — including what was built and
 rejected — are in [DESIGN.md](DESIGN.md).

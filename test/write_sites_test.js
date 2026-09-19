@@ -22,6 +22,18 @@
 // A source-level test, because the property is about the SHAPE of the code
 // rather than about a behaviour: the behaviours were tested each round, and
 // each round the next uncovered site was a different behaviour.
+//
+// ITS KNOWN LIMIT, so nobody mistakes it for exhaustive: this is a ONE-LEVEL
+// TEXTUAL SCAN. It attributes a call to its enclosing member, so a violation
+// moved one level down -- `#fillFromL3` calling a new `#helper()` that calls
+// `native.submitSet` -- is caught by the stray check (the helper is not in
+// ALLOWED) but the L3 section below, which reads one method body at a time,
+// would not see it inside `#fillFromL3`. It is a tripwire against the edit
+// that reintroduces the defect the obvious way, not a proof. The BEHAVIOURAL
+// half is `l3_guard_test.js`, which forks a real worker, promotes a real L3
+// value and asserts the arena never saw it -- with the primary's own
+// promotion as a non-vacuity control, so "nothing reached L2" cannot pass by
+// promotion being broken. Neither test is sufficient alone; both are cheap.
 const fs = require('fs');
 const path = require('path');
 
@@ -154,10 +166,19 @@ for (const m of L3_METHODS) {
 // And the route itself refuses anyone but the primary. Without this the
 // section above would pass for a helper that had quietly become a passthrough.
 {
-    const body = bodyOf('#publishL3Derived');
-    ok(body !== null, '#publishL3Derived() exists');
-    ok(body !== null && /#id\s*!==\s*0/.test(body),
-       '#publishL3Derived() refuses a caller that is not the primary');
+    const raw = bodyOf('#publishL3Derived');
+    ok(raw !== null, '#publishL3Derived() exists');
+    // COMMENTS STRIPPED. These names are discussed in the prose right above
+    // the code that uses them, so a check reading the whole body passes on
+    // the explanation of a guard that has been deleted -- which is exactly
+    // what happened when this was first written.
+    const body = raw === null ? '' : raw.split('\n').map(l => l.replace(/^\s*\/\/.*$/, '')).join('\n');
+    ok(/#id\s*!==\s*0/.test(body),
+       '#publishL3Derived() refuses a caller whose id is not 0');
+    // ...and `attached: false` yields #id === 0 in any process, so the id
+    // alone is not the primary test.
+    ok(/isPrimaryProcess/.test(body),
+       '#publishL3Derived() also requires this to BE the primary process');
     // It is reached from ONE place. A second caller is not wrong in itself,
     // but it is exactly how "the organising rule" decays back into a list of
     // special cases, so it has to be a deliberate edit here.

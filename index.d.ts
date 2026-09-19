@@ -162,7 +162,13 @@ export interface CacheOptions<T = unknown> {
      *  JSON-shaped objects. Default 3. */
     heapFactor?: number;
     heapGuard?: HeapGuardOptions | false;
-    /** @see Transport. Default `'shm'`. */
+    /** @see Transport. Default `'shm'`.
+     *
+     *  `'shm'` moves the WRITES off the cluster channel; it does not take a
+     *  worker off it. A clear, its L3 clear generation, and an `l3FailTtlMs`
+     *  re-time request still travel as a cluster message, so a primary that
+     *  routes messages by hand must call {@link TurboKV.applyBatch} on both
+     *  transports. `install()` does. */
     transport?: Transport;
     /** Bytes a worker may hold in the IPC outbox before shedding. Default 1MB. */
     outboxMaxBytes?: number;
@@ -182,7 +188,17 @@ export interface CacheOptions<T = unknown> {
      *  through to it on an L1/L2 miss. Validated once, at construction. */
     l3?: L3Adapter<T>;
     /** How long a value stays in the local tiers after its L3 write failed,
-     *  before it reverts to whatever L3 holds. Default 5000ms. */
+     *  before it reverts to whatever L3 holds. Default 5000ms.
+     *
+     *  Only ever SHORTENS: an entry whose own TTL expires sooner keeps it, and
+     *  a key L2 no longer holds is left alone rather than resurrected.
+     *
+     *  On a WORKER the L2 half is a request the primary applies conditionally,
+     *  and it travels as a cluster message on **both** transports — so a
+     *  primary that routes messages itself must call
+     *  {@link TurboKV.applyBatch} or this option has no L2 half at all, and
+     *  the value L3 refused stays in the shared arena with no expiry.
+     *  `stats.l3FailTtlUnapplied` is what moves when that happens. */
     l3FailTtlMs?: number;
     /** TTL applied to a value filled into the local tiers from an L3 read
      *  that carried none of its own. Default 60000ms. */
@@ -279,7 +295,14 @@ export interface CacheStats {
     invalidated: number; expired: number;
     /** Writes accepted locally that never reached L2 (ring or channel full). */
     writesShed?: number;
-    sent?: number; flushes?: number; flushDropped?: number; congested?: number;
+    /** Operations handed to the primary: ring records plus every entry in an
+     *  IPC batch. Batch entries include the keyless clear ops and, with an
+     *  `l3` adapter, an `l3FailTtlMs` re-time request — deliberately, since
+     *  each of those is a message this worker sent and the primary must
+     *  process. It is a transport counter, not a count of data writes; use
+     *  `sets`/`deletes` for those. */
+    sent?: number;
+    flushes?: number; flushDropped?: number; congested?: number;
     rejectedKey?: number; rejectedType?: number; rejectedSize?: number;
     heapShed?: number;
     /** Times this worker re-attached after losing its primary. */
@@ -327,15 +350,24 @@ export interface CacheStats {
      *  cap only ever SHORTENS: an entry whose own TTL already expires sooner
      *  keeps it, and a key the arena no longer holds is left alone rather
      *  than resurrected. On a worker the L2 half is a request the primary
-     *  applies conditionally -- a worker never writes L2 itself. */
+     *  applies conditionally -- a worker never writes L2 itself.
+     *
+     *  **This moving does NOT mean L2 was capped.** On a worker it moves for
+     *  the L1 half alone, which always succeeds. Read it together with
+     *  `l3FailTtlUnapplied`, which is the other side of the same event. */
     l3FailTtlApplied?: number;
-    /** The L2 half of a cap that could not be applied OR handed over at all:
-     *  no arena to write (a degraded worker), or the batch carrying a
-     *  worker's cap request was shed by a congested IPC channel. NOT a cap
-     *  the primary refused -- a cap for a value something newer superseded,
-     *  or one whose entry already expires sooner, has nothing left to bound
-     *  and is not counted here. The value it was capping is left with
-     *  whatever expiry it already had, which may be none. */
+    /** The L2 half of a cap that never landed. Four ways, counted once each:
+     *  there was no arena to write (a degraded worker); the batch carrying a
+     *  worker's request was shed by a congested IPC channel; the channel was
+     *  gone or refused it; or the request was sent and the arena still held
+     *  the capped value, unbounded, when the guard's window closed — which is
+     *  what a primary that never calls {@link TurboKV.applyBatch} produces.
+     *
+     *  NOT a cap the primary REFUSED: one for a value something newer
+     *  superseded, or whose entry already expires sooner, has nothing left to
+     *  bound and is not counted. Every count here means a value L3 rejected
+     *  is resident in the shared arena with no expiry, visible to every
+     *  process on the box. */
     l3FailTtlUnapplied?: number;
     /** L3 hits returned to the caller but not promoted, because SOMEONE ELSE
      *  changed the key while the read was in flight, or the ring could not
@@ -439,12 +471,31 @@ export declare class TurboKV<T = unknown> {
      *  handling. If your application already routes cluster messages itself,
      *  use this to pick turbokv's out of your own handler and pass them to
      *  {@link applyBatch}. The two are a pair: identifying a message is only
-     *  useful if you can also apply it. */
+     *  useful if you can also apply it.
+     *
+     *  Needed whatever `transport` the workers negotiated — see
+     *  {@link applyBatch} for what a `'shm'` worker still sends this way, and
+     *  what is silently lost if you do not. */
     static isCacheMessage(m: unknown): boolean;
 
     /** Apply a worker's batch to L2, from your own `message` handler.
      *  Only call this for messages {@link isCacheMessage} accepted, and only on
-     *  the primary. `install()` does exactly this for you. */
+     *  the primary. `install()` does exactly this for you.
+     *
+     *  **Required on BOTH transports, not only `'ipc'`.** A `'shm'` worker
+     *  sends its writes through shared memory, but three kinds of message
+     *  still travel in this batch and are applied nowhere else: a
+     *  `clearAll()`'s wipe, the two halves of its cluster-wide L3 clear
+     *  generation, and — with an `l3` adapter attached — the conditional
+     *  re-time a worker asks for when an L3 write fails (`l3FailTtlMs`). A
+     *  primary that routes the ring doorbell but never calls this leaves the
+     *  value L3 refused resident in the **shared arena with no expiry, for
+     *  every process on the box, forever**. Since v0.1 that silence is at
+     *  least counted, as `l3FailTtlUnapplied`; it is still a divergence.
+     *
+     *  This call also drains every submission ring to empty before it applies
+     *  anything, which is what orders a worker's own writes ahead of the
+     *  clear or re-time that refers to them. */
     static applyBatch(m: unknown): void;
 
     /** Tell the primary that a worker is gone, so any L3 `clear` it had in
@@ -561,7 +612,9 @@ export declare class TurboKV<T = unknown> {
     /** Live entries in the arena, from the arena-wide counter. */
     get size(): number;
 
-    /** Which write path this handle negotiated. */
+    /** Which write path this handle negotiated. `'shm'` means ordinary writes
+     *  go through shared memory — it does NOT mean this handle sends nothing
+     *  over the cluster channel. See {@link TurboKV.applyBatch}. */
     get transport(): Transport;
 
     /** Push any buffered worker writes now. */

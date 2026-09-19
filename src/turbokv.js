@@ -357,6 +357,11 @@ class TurboKV {
     #doorbellPending = false;           // retained FIFO cursor into #l1; see #oldestEntry
     #l1Max;
     #outbox = [];
+    // Keys of the `r` (conditional re-time) entries currently sitting in the
+    // outbox. Tracked alongside rather than scanned out of it, so flush() --
+    // which is the IPC hot path -- pays nothing at all when no cap is
+    // outstanding, which is every moment L3 is healthy. See #capUnapplied.
+    #outboxCapKeys = null;
     #outboxBytes = 0;
     #outboxMaxBytes = 1 << 20;      // flush eagerly past this, bounding worker memory
     #inFlightBytes = 0;       // bytes handed to process.send and not yet drained
@@ -2174,6 +2179,35 @@ class TurboKV {
         clearInterval(this.#capTimer); this.#capTimer = null;
     }
 
+    // THE ONE PLACE A LOST CAP BECOMES A NUMBER, and once per cap.
+    //
+    // `l3FailTtlApplied` counts the failed write whose LOCAL copy was capped,
+    // which on a worker is L1 -- so it moves whether or not the L2 half ever
+    // lands, and on its own it reads as success. The silence on the other side
+    // is the dangerous half: the value L3 refused sits in the SHARED arena
+    // with no expiry, box-wide, for every process, forever. It has to have a
+    // counter, and `l3FailTtlUnapplied` is it.
+    //
+    // Reached from three kinds of place and deduplicated through the guard
+    // entry, so a cap the outbox dropped is not counted again when its guard
+    // retires: flush(), when the batch carrying the request is shed or the
+    // channel refuses it; and #runCaps, when the guard's window closes with
+    // the capped value still resident and still unbounded -- which is the only
+    // way to see a request that WAS sent and simply never applied, the case a
+    // consumer routing IPC by hand and forgetting applyBatch produces.
+    //
+    // A cap with no guard entry (one recorded past L3_CAP_MAX, or on a closed
+    // cache) is counted unconditionally: there is nothing to deduplicate
+    // against, and under-reporting a divergence is the wrong direction.
+    #capUnapplied(key) {
+        const c = this.#l3Caps.get(key);
+        if (c !== undefined) {
+            if (c.counted) return;
+            c.counted = true;
+        }
+        this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + 1;
+    }
+
     // One pass over the outstanding read-guard entries: retire the ones whose
     // window has closed, and stop the timer once none is left.
     //
@@ -2185,7 +2219,32 @@ class TurboKV {
     #runCaps() {
         if (!storeReady || this.#primaryDead) { this.#l3Caps.clear(); this.#stopCapTimer(); return; }
         const now = monoMs();
-        for (const [key, c] of this.#l3Caps) if (now >= c.until) this.#l3Caps.delete(key);
+        for (const [key, c] of this.#l3Caps) {
+            if (now < c.until) continue;
+            // RETIRING IS ALSO THE ONE MOMENT THIS WORKER CAN TELL WHETHER THE
+            // CAP EVER LANDED, and it costs one arena read per cap, once --
+            // not per tick, which is what the old poll did and why it needed a
+            // budget. By now the primary has either applied the request or is
+            // not going to: an entry still holding exactly the bytes the cap
+            // named, still with no deadline, is the divergence this counter
+            // exists to name. That covers the case nothing else can see -- a
+            // request that was SENT and silently never applied, which is what
+            // a consumer routing the doorbell but not the cache messages
+            // produces (see applyBatch).
+            //
+            // A false positive is possible and is the right direction: if
+            // someone re-wrote the same bytes with no TTL after the cap
+            // landed, this counts -- and the box really is holding that value
+            // unbounded, which is what an operator watching this number wants
+            // to know.
+            if (!c.counted) {
+                let cur;
+                try { cur = native.get(key); } catch { cur = undefined; }
+                if (cur !== undefined && sameStored(cur, c.enc) && native.lastTtlRemainingMs() === 0)
+                    this.#capUnapplied(key);
+            }
+            this.#l3Caps.delete(key);
+        }
         if (this.#l3Caps.size === 0) this.#stopCapTimer();
     }
 
@@ -3248,11 +3307,11 @@ class TurboKV {
             // not reach L2. An `r` is a cap the primary will now never apply,
             // which is what l3FailTtlUnapplied means.
             const keep = [];
-            let shed = 0, capsLost = 0;
+            let shed = 0;
             for (let i = 0; i < this.#outbox.length; i += 4) {
                 const op = this.#outbox[i], key = this.#outbox[i + 1];
                 if (op === 'c' || op === '+' || op === '-') { keep.push(op, '', null, 0); continue; }
-                if (op === 'r') { capsLost++; continue; }
+                if (op === 'r') continue;               // counted through #capUnapplied below
                 shed++;
                 if (this.#pendingDel.size && this.#pendingDel.has(key)) {
                     this.#pendingDel.delete(key);
@@ -3260,7 +3319,7 @@ class TurboKV {
                 }
             }
             if (shed) this.stats.writesShed = (this.stats.writesShed || 0) + shed;
-            if (capsLost) this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + capsLost;
+            this.#dropOutboxCaps();
             this.#outbox = keep;
             this.#outboxBytes = 0;
             this.lastError = 'IPC send window full; L2 writes shed';
@@ -3268,6 +3327,10 @@ class TurboKV {
         }
         const batch = this.#outbox;
         const batchBytes = this.#outboxBytes;
+        // Taken WITH the batch: from here on these caps live or die with it,
+        // and a later flush must not be blamed for them.
+        const capKeys = this.#outboxCapKeys;
+        this.#outboxCapKeys = null;
         this.#outbox = [];
         this.#outboxBytes = 0;
         this.stats.flushes++;
@@ -3276,7 +3339,16 @@ class TurboKV {
         // primary exited threw EPIPE and killed the worker with an unhandled
         // 'error' event. Losing a batch during shutdown is acceptable; crashing
         // the worker over it is not.
-        if (!process.connected) { this.stats.flushDropped = (this.stats.flushDropped || 0) + 1; return; }
+        // AND A CAP IN IT IS COUNTED, not silently dropped. Without this the
+        // stats say a failed write was capped (`l3FailTtlApplied`, from the L1
+        // half) with nothing at all on the other side, while the value L3
+        // refused sits in the shared arena with no expiry for every process on
+        // the box.
+        if (!process.connected) {
+            this.stats.flushDropped = (this.stats.flushDropped || 0) + 1;
+            if (capKeys) for (const k of capKeys) this.#capUnapplied(k);
+            return;
+        }
         // The write fails ASYNCHRONOUSLY, so try/catch cannot see it; without a
         // callback Node emits an unhandled 'error' event that kills the process.
         // Passing a callback routes the failure here instead - and tells us when
@@ -3302,6 +3374,7 @@ class TurboKV {
                 if (!err) return;
                 self.stats.flushDropped = (self.stats.flushDropped || 0) + 1;
                 self.lastError = `flush failed: ${err.code || err.message}`;
+                if (capKeys) for (const k of capKeys) self.#capUnapplied(k);
             });
             // false means the backlog is above libuv's high-water mark.
             // Informational only now: a `false` return is normal backpressure and
@@ -3317,7 +3390,16 @@ class TurboKV {
             }
             this.stats.flushDropped = (this.stats.flushDropped || 0) + 1;
             this.lastError = `flush failed: ${e.code || e.message}`;
+            if (capKeys) for (const k of capKeys) this.#capUnapplied(k);
         }
+    }
+
+    // Every cap request still sitting in the outbox is gone. Used by the shed
+    // branch of flush(), which keeps only the keyless clear ops.
+    #dropOutboxCaps() {
+        if (this.#outboxCapKeys === null) return;
+        for (const k of this.#outboxCapKeys) this.#capUnapplied(k);
+        this.#outboxCapKeys = null;
     }
 
     // Primary side: apply a worker's batch to L2.
@@ -3485,7 +3567,14 @@ class TurboKV {
     // primitive or publish helper other than this one appears in #fillFromL3,
     // and if this method ever stops refusing a non-primary caller.
     static #publishL3Derived(key, enc, ttlMs, by) {
-        if (by.#id !== 0) return false;
+        // AND `isPrimaryProcess`, not `#id` alone. `attached: false` yields
+        // `#id === 0` in ANY process -- it is the escape hatch that lets a
+        // handle skip the "workerId 0 is the primary" guard in the
+        // constructor -- so an undeclared option would otherwise take a
+        // process that is not the primary straight past this check and into
+        // native.set against a read-only mapping. A hole in a rule that is
+        // meant to be total is worth one extra conjunct.
+        if (by.#id !== 0 || !isPrimaryProcess) return false;
         if (!TurboKV.#publishArenaSet(key, enc, 0, ttlMs)) return false;
         // The primary skips the ring records it writes itself, so nothing else
         // drops the copies other instances in THIS process are holding --
@@ -3554,6 +3643,7 @@ class TurboKV {
     // l3FailTtlUnapplied there rather than silently lost.
     #retimeOutbox(key, enc, cap) {
         this.#outbox.push('r', key, enc, cap);
+        (this.#outboxCapKeys || (this.#outboxCapKeys = [])).push(key);
         this.#schedule(encodedBytes(enc) + key.length + 48);
         return true;
     }
