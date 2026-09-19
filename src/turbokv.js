@@ -1008,7 +1008,15 @@ class TurboKV {
     // observable from outside, and "the marks reconcile, a slice at a time" is
     // a claim that should be checked rather than asserted in a comment.
     __unsafeMarkState() {
-        return { pending: this.#pendingDel.size, owed: this.#reconcileOwed, deletedAt: this.#deletedAt.size };
+        return {
+            pending: this.#pendingDel.size, owed: this.#reconcileOwed,
+            deletedAt: this.#deletedAt.size,
+            // WHICH entries survived, not just how many: an eviction that kept
+            // the newest and one that kept the oldest are the same size and
+            // opposite policies.
+            deletedAtKeys: [...this.#deletedAt.keys()],
+            pendingKeys: [...this.#pendingDel],
+        };
     }
     __unsafeCapState() {
         let sent = 0;
@@ -1020,6 +1028,14 @@ class TurboKV {
     // many ticks the sample happened to span -- which made the obvious timing
     // test flaky in both directions.
     __unsafeRunCaps() { this.#runCaps(); }
+    // Test-only: stops the automatic poll so a test can drive it a tick at a
+    // time with nothing racing it. Only #deferCap re-arms the timer, so a test
+    // that defers nothing after this call keeps it stopped.
+    __unsafePauseCaps() { this.#stopCapTimer(); }
+    // Test-only: the ring position recorded for one key's removal. See
+    // #deletedAt -- the position is the whole content of that guard, and a
+    // wrong one is invisible from outside.
+    __unsafeDeletedAtOf(key) { return this.#deletedAt.get(key); }
 
     // Test and shutdown helper: resolves when this process has no L3 work left.
     drainL3() { return this.#queue ? this.#queue.drain() : Promise.resolve(); }
@@ -1341,8 +1357,15 @@ class TurboKV {
         // Before the early-out below, not after it: a reconciliation left over
         // from a wrap has to make progress even on the drains that find the
         // ring quiet, which is most of them.
-        if (this.#reconcileOwed > 0) this.#reconcilePendingDel(this.#cursor);
-        if (native.ringHead() === this.#cursor) return;
+        // native.ringHead(), not this.#cursor: the record path computes the
+        // exact position of the record it is retiring (cursor + i + 1), and a
+        // slice running here -- BEFORE that scan -- would otherwise stamp a
+        // strictly earlier position on the same kind of mark, preempting the
+        // precise path with a looser answer. The head is read on the next line
+        // anyway, so this costs nothing.
+        const head = native.ringHead();
+        if (this.#reconcileOwed > 0) this.#reconcilePendingDel(head);
+        if (head === this.#cursor) return;
         const r = native.ringRead(this.#cursor, 512);
         if (!r) return;                            // detached mid-drain
         if (r.wrapped) {                       // fell too far behind: flush wholesale
@@ -1639,12 +1662,26 @@ class TurboKV {
     // the mark is only taken when a removal was ACTUALLY submitted -- is stated
     // once rather than at each call site.
     //
-    // The bound is a wholesale flush rather than an eviction of the oldest
-    // entry: the marks have no useful order, and a Set that quietly dropped one
-    // key at a time would hide the condition. Losing marks costs stale reads
-    // until the invalidations arrive; growing without bound costs the process.
+    // The bound EVICTS THE OLDEST, and does not wipe. This used to be a
+    // wholesale flush, on the ground that the marks have no useful order --
+    // but they do: a Set is insertion-ordered, the oldest mark is the one
+    // whose removal has had the longest to be applied, and the comment beside
+    // that flush said in as many words that losing these marks costs stale
+    // reads. Dropping ONE of them costs one possible stale read; dropping four
+    // thousand costs four thousand, which is the same argument already
+    // accepted for #deletedAt with a worse consequence.
+    //
+    // Delete before add, for the reason #noteDeleted gives: re-marking a key
+    // must refresh its place in the order, not leave it in an old slot.
     #markPendingDel(key, keyHash) {
-        if (this.#pendingDel.size >= PENDING_DEL_MAX) { this.#pendingDel.clear(); this.#pendingDelHash.clear(); }
+        this.#pendingDel.delete(key);
+        if (this.#pendingDel.size >= PENDING_DEL_MAX) {
+            const oldest = this.#pendingDel.values().next();
+            if (!oldest.done) {
+                this.#pendingDel.delete(oldest.value);
+                this.#pendingDelHash.delete(native.hashKey(oldest.value));
+            }
+        }
         this.#pendingDel.add(key);
         this.#pendingDelHash.set(keyHash, key);
     }
@@ -1703,6 +1740,12 @@ class TurboKV {
         // one step once a wrapped-ring reconcile could push up to
         // PENDING_DEL_MAX entries in at once. Map iteration is insertion order,
         // so the first key is the oldest.
+        // DELETE BEFORE SET. `Map.set` on a key already present keeps its
+        // FIRST-insertion slot, so a key deleted repeatedly would carry a
+        // fresh position in an old slot and be evicted first -- the exact
+        // inversion of the rule above, for exactly the keys most likely to
+        // need the guard.
+        this.#deletedAt.delete(key);
         if (this.#deletedAt.size >= PENDING_DEL_MAX) {
             const oldest = this.#deletedAt.keys().next();
             if (!oldest.done) this.#deletedAt.delete(oldest.value);
@@ -1852,19 +1895,14 @@ class TurboKV {
                 // process are holding -- decision 64's family, of which this
                 // is the third call site. A sibling instance went on serving
                 // its own stale L1 copy indefinitely after a promotion.
-                if (native.set(key, accepted.enc, 0, cap) === true) TurboKV.#dropOthers(key, this);
+                if (TurboKV.#publishArenaSet(key, accepted.enc, 0, cap)) TurboKV.#dropOthers(key, this);
             }
-            else if (this.#ringIdx >= 0) {
-                // A PROMOTION IS A WRITE INTO THE RING, so it cancels
-                // outstanding caps exactly as set() does. Narrower window -- a
-                // key being promoted was a local miss, so a cap outstanding for
-                // it means the arena is holding something this process wrote
-                // and L3 refused -- but the same shape, and the same outcome if
-                // it fires: the cap lands behind the promotion and puts the
-                // refused value back over it.
-                TurboKV.#cancelCaps(key);
-                if (native.submitSet(key, accepted.enc, cap)) this.#ringDoorbell();
-            }
+            // A promotion is a write like any other, so it supersedes an
+            // outstanding cap -- but only if the ring takes it. Cancelling
+            // before the push, which is where this sat, threw the cap away for
+            // a promotion that was shed, and the arena then held the value L3
+            // refused with no expiry at all.
+            else if (this.#ringIdx >= 0) this.#publishRingSet(key, accepted.enc, cap);
         }
         if (level === 1) {
             const v = this.#codec && !this.#l1Decoded ? accepted.enc : accepted.value;
@@ -2145,7 +2183,7 @@ class TurboKV {
         try { cur = native.get(key); } catch { return false; }
         if (cur === undefined || !sameStored(cur, enc)) return false;
         if (this.#id === 0) {
-            if (native.set(key, enc, 0, cap) !== true) return false;
+            if (!TurboKV.#retimeArena(key, enc, cap)) return false;
             // Decision 64's family again: the primary skips its own ring
             // records, so a sibling instance keeps an L1 copy carrying the
             // expiry this call just SHORTENED -- and goes on serving, past the
@@ -2153,8 +2191,7 @@ class TurboKV {
             TurboKV.#dropOthers(key, this);
             return true;
         }
-        if (this.#ringIdx >= 0 && native.submitSet(key, enc, cap)) { this.#ringDoorbell(); return true; }
-        return false;
+        return this.#ringIdx >= 0 && this.#retimeRing(key, enc, cap);
     }
 
     // Local first, then L3. L3-first was rejected: when the remote is
@@ -2325,8 +2362,7 @@ class TurboKV {
         // current -- this option would produce stale reads instead of misses.
         if (minLevel === 3) {
             if (this.#id === 0) {
-                native.del(key, 0);
-                TurboKV.#cancelCaps(key);
+                TurboKV.#publishArenaDel(key, 0);
                 TurboKV.#dropOthers(key, this);
             } else if (!this.#primaryDead) {
                 // MARKED ONLY WHEN THE EVICTION IS ACTUALLY SUBMITTED. The mark
@@ -2337,28 +2373,25 @@ class TurboKV {
                 // can clear -- and a marked key is unreadable from every tier,
                 // L3 included, for the life of the worker.
                 if (this.#ringIdx >= 0) {
-                    if (native.submitDel(key)) {
-                        TurboKV.#cancelCaps(key);
-                        this.#markPendingDel(key, keyHash); this.#ringDoorbell();
-                    }
+                    if (this.#publishRingDel(key)) this.#markPendingDel(key, keyHash);
                     else {
                         this.stats.writesShed = (this.stats.writesShed || 0) + 1;
                         this.lastError = 'submission ring full; L2 eviction shed';
                     }
                 } else {
                     this.#markPendingDel(key, keyHash);
-                    this.#outbox.push('d', key, null, 0); this.#schedule(key.length + 48);
+                    this.#publishOutbox('d', key, null, 0, key.length + 48);
                 }
             }
             this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return true;
         }
         if (this.#id === 0) {
-            const ok = native.set(key, enc, 0, ttlMs) === true;
+            const ok = TurboKV.#publishArenaSet(key, enc, 0, ttlMs);
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
             // Our own ring record is skipped on the primary, so nothing else
             // invalidates the copies other instances in THIS process hold.
-            else { TurboKV.#cancelCaps(key); TurboKV.#dropOthers(key, this); }
+            else TurboKV.#dropOthers(key, this);
             if (ok) this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return ok;
         }
@@ -2372,9 +2405,8 @@ class TurboKV {
             return true;
         }
         if (this.#ringIdx >= 0) {
-            if (native.submitSet(key, enc, ttlMs)) {
-                TurboKV.#cancelCaps(key);
-                this.stats.sent++; this.#ringDoorbell();
+            if (this.#publishRingSet(key, enc, ttlMs)) {
+                this.stats.sent++;
                 this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
                 return true;
             }
@@ -2386,8 +2418,7 @@ class TurboKV {
             this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return true;
         }
-        this.#outbox.push('s', key, enc, ttlMs);
-        this.#schedule(encLen + key.length + 48);
+        this.#publishOutbox('s', key, enc, ttlMs, encLen + key.length + 48);
         this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
         return true;                      // queued; capacity is decided by the primary
     }
@@ -2487,9 +2518,8 @@ class TurboKV {
         if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
         this.stats.deletes++;
         if (this.#id === 0) {
-            const had = native.del(key, 0);
+            const had = TurboKV.#publishArenaDel(key, 0);
             this.#l1Drop(key);
-            TurboKV.#cancelCaps(key);
             TurboKV.#dropOthers(key, this);
             // The removal is applied to the arena synchronously here, so its
             // ring position is exactly the head that follows it -- and that is
@@ -2538,7 +2568,7 @@ class TurboKV {
             ? this.#queue.push({ kind: 'delete', key, originId: this.#originId(), bytes: key.length + 48 })
             : null;
         if (this.#ringIdx >= 0) {
-            if (native.submitDel(key)) { TurboKV.#cancelCaps(key); this.#ringDoorbell(); }
+            if (this.#publishRingDel(key)) { /* published */ }
             else {
                 this.stats.writesShed = (this.stats.writesShed || 0) + 1;
                 this.lastError = 'submission ring full; L2 delete shed';
@@ -2554,8 +2584,7 @@ class TurboKV {
             }
             return had;
         }
-        this.#outbox.push('d', key, null, 0);
-        this.#schedule(key.length + 48);
+        this.#publishOutbox('d', key, null, 0, key.length + 48);
         return had;
     }
 
@@ -2636,7 +2665,7 @@ class TurboKV {
                 .then((r) => { l3ClearsInFlight--; this.#settleClearGen(); return r; });
         }
         if (this.#id === 0) {
-            native.clearAll(0);
+            TurboKV.#publishArenaClear(0);
             // The flush marker on the invalidation ring reaches other in-process
             // instances too, but only whenever #primaryInvalidate next runs after
             // a drain -- so between this call and that drain a sibling instance
@@ -2652,9 +2681,7 @@ class TurboKV {
         // arena the clear has just emptied. Narrow, and the same one-line shape
         // as every other site in this family -- the primary branch above gets
         // it through #clearOthers, which reaches each sibling's clearLocal().
-        TurboKV.#cancelAllCaps();
-        this.#outbox.push('c', '', null, 0);
-        this.#schedule(48);
+        this.#publishOutboxOp('c', true);
     }
 
     // Open this clear's generation in the ARENA HEADER, so that every OTHER
@@ -2676,8 +2703,7 @@ class TurboKV {
     // L3 nothing and must keep behaving exactly as it did.
     #openClearGen() {
         if (this.#id === 0) { TurboKV.#l3ClearBegin(); return; }
-        this.#outbox.push('+', '', null, 0);
-        this.#schedule(48);
+        this.#publishOutboxOp('+', false);
     }
 
     // Close it again -- and it has to actually LEAVE this process, because
@@ -2699,7 +2725,7 @@ class TurboKV {
     // stops the retry loop and the queue settles the op (see #closeL3).
     #settleClearGen(resend = false) {
         if (this.#id === 0) { TurboKV.#l3ClearSettle(); return; }
-        if (!resend) { this.#outbox.push('-', '', null, 0); this.#schedule(48); }
+        if (!resend) this.#publishOutboxOp('-', false);
         this.flush();
         if (this.#outbox.length === 0 || !process.connected) return;
         const t = setTimeout(() => this.#settleClearGen(true), 50);
@@ -3192,9 +3218,9 @@ class TurboKV {
         const b = msg.b;
         for (let i = 0; i < b.length; i += 4) {
             const op = b[i], key = b[i + 1];
-            if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3]); TurboKV.#localDrop(key); }
-            else if (op === 'd') { native.del(key, msg.id); TurboKV.#localDrop(key); }
-            else if (op === 'c') { native.clearAll(msg.id); for (const c of instances) c.clearLocal(); }
+            if (op === 's') { TurboKV.#publishArenaSet(key, b[i + 2], msg.id, b[i + 3]); TurboKV.#localDrop(key); }
+            else if (op === 'd') { TurboKV.#publishArenaDel(key, msg.id); TurboKV.#localDrop(key); }
+            else if (op === 'c') { TurboKV.#publishArenaClear(msg.id); for (const c of instances) c.clearLocal(); }
             // The two halves of a WORKER's L3 clear generation. The worker
             // cannot write the header itself (PROT_READ; a store there is a
             // SIGBUS), so it says so here and the primary -- the arena's sole
@@ -3254,6 +3280,90 @@ class TurboKV {
     static #cancelCaps(fullKey) {
         for (const c of instances) c.#cancelCap(fullKey);
     }
+    // --- THE ONLY PLACES THIS PROCESS PUBLISHES A VALUE FOR A KEY --------
+    //
+    // Every route a write can take out of this cache ends in one of these: the
+    // primary's direct arena write, a worker's submission-ring record, or the
+    // IPC fallback batch. The cap cancel lives HERE, not at the call sites.
+    //
+    // "Cancel a cap if and only if a write actually lands" was a hand-enforced
+    // invariant spread over nine call sites, and four consecutive rounds of
+    // review each found one more site on the wrong side of a branch -- a
+    // cancel before a size check, a cancel before a shed test, a path that had
+    // lost its cancel entirely. That is what a hand-enforced invariant
+    // scattered over nine sites does, not carelessness. Here a call site
+    // cannot forget what it does not have to remember, a rejected or shed
+    // write cannot cancel because the cancel is inside the success branch, and
+    // a write site added later has to come through here -- which
+    // test/write_sites_test.js checks, by attributing every raw call to the
+    // arena, the ring and the outbox to its enclosing method.
+    //
+    // The cap's OWN write is deliberately not one of these: it re-publishes a
+    // value this process already published, with a shorter deadline, so it
+    // supersedes nothing and must not cancel itself. It has its own pair,
+    // named for that difference -- see #retimeArena and #retimeRing.
+    static #publishArenaSet(key, enc, writerId, ttlMs) {
+        if (native.set(key, enc, writerId, ttlMs) !== true) return false;
+        TurboKV.#cancelCaps(key);
+        return true;
+    }
+    // A delete is published whether or not the key was there (see
+    // storeDelete), so it always supersedes; `had` is the answer to a
+    // different question and is passed straight through.
+    static #publishArenaDel(key, writerId) {
+        const had = native.del(key, writerId);
+        TurboKV.#cancelCaps(key);
+        return had;
+    }
+    static #publishArenaClear(writerId) {
+        native.clearAll(writerId);
+        TurboKV.#cancelAllCaps();
+    }
+    #publishRingSet(key, enc, ttlMs) {
+        if (!native.submitSet(key, enc, ttlMs)) return false;
+        TurboKV.#cancelCaps(key);
+        this.#ringDoorbell();
+        return true;
+    }
+    #publishRingDel(key) {
+        if (!native.submitDel(key)) return false;
+        TurboKV.#cancelCaps(key);
+        this.#ringDoorbell();
+        return true;
+    }
+    // The IPC fallback. This is the one publish that is not strictly
+    // CONFIRMED: flush() can still shed the batch under congestion. It cancels
+    // anyway, and that is the safe direction here -- a lost cap costs bounded
+    // divergence, while a cap left outstanding is ordered behind a write that
+    // did reach the arena through applyBatch and puts the old value back over
+    // it, which is a resurrection. The window is real across INSTANCES: a
+    // handle on the ring holds the cap while a sibling opened with
+    // `transport: 'ipc'` writes the same key, and two channels have no
+    // ordering between them.
+    #publishOutbox(op, key, enc, ttlMs, bytes) {
+        this.#outbox.push(op, key, enc, ttlMs);
+        TurboKV.#cancelCaps(key);
+        this.#schedule(bytes);
+    }
+    // The keyless ops -- a clear and the two halves of a clear generation.
+    // A `c` supersedes every cap; `+` and `-` are bookkeeping and supersede
+    // nothing, so they say which they are rather than guessing.
+    #publishOutboxOp(op, supersedes) {
+        this.#outbox.push(op, '', null, 0);
+        if (supersedes) TurboKV.#cancelAllCaps();
+        this.#schedule(48);
+    }
+    // The cap's own write: the SAME value, with a shorter deadline. Named
+    // apart from the publish family because it is the one write that must not
+    // cancel -- doing so would drop the entry the read guard still needs, and
+    // #stepCap is what retires it instead.
+    static #retimeArena(key, enc, cap) { return native.set(key, enc, 0, cap) === true; }
+    #retimeRing(key, enc, cap) {
+        if (!native.submitSet(key, enc, cap)) return false;
+        this.#ringDoorbell();
+        return true;
+    }
+
     // The no-key form, for a clear: it removes EVERY key, so it supersedes
     // every outstanding cap. See clearAll().
     static #cancelAllCaps() {

@@ -86,6 +86,55 @@ if (process.env.TCC_ROLE === 'worker') {
     return;
 }
 
+// ------------------------------------------------- worker, shed and ipc ----
+// A SHED WRITE MUST NOT CANCEL A CAP, and an IPC write MUST. Both are one
+// branch inside one publish helper now, which is the point of the refactor --
+// but a branch is still a branch, and the source-level test in
+// write_sites_test.js cannot see which side of it the cancel sits on.
+if (process.env.TCC_ROLE === 'shed') {
+    (async () => {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const a = TurboKV.attachWorker(process.env.TCC_ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 5, l3FailTtlMs: 60000 });
+        a.set('capped', 'OURS');
+        await a.drainL3();
+        await sleep(20);
+        a.__unsafePauseCaps();                  // nothing races the assertions below
+        ok(a.__unsafeCapState().caps === 1, `a cap is outstanding (${a.__unsafeCapState().caps})`);
+
+        // Saturate the ring. The primary was started with maintenance off, so
+        // nothing drains it.
+        for (let i = 0; i < 2000 && !(a.stats.writesShed > 0); i++) a.set('fill' + i, 'v');
+        ok(a.stats.writesShed > 0, `the submission ring is full (shed ${a.stats.writesShed})`);
+        const before = a.stats.writesShed;
+        a.set('capped', 'NEWER');               // shed: nothing reaches the ring
+        ok(a.stats.writesShed > before, 'the write to the capped key is shed too');
+        ok(a.__unsafeCapState().caps === 1,
+           `a shed write does not cancel the cap (${a.__unsafeCapState().caps})`);
+        // The promotion path shares #publishRingSet, so it shares this branch.
+        f.store.set('capped', { value: 'L3VAL', expiresAt: 0 });
+        ok(a.__unsafeCapState().caps === 1, 'and still does after a shed promotion');
+
+        // THE IPC FALLBACK, from a sibling instance. Those writes reach the
+        // arena through applyBatch, on a channel with no ordering against the
+        // submission ring -- so the cap has to go, or it lands behind that
+        // write on the next drain and puts the old value back over it.
+        const ipc = TurboKV.attachWorker(process.env.TCC_ARENA, 1,
+            { storage: 'bytes', transport: 'ipc' });
+        ok(ipc.transport === 'ipc', `the sibling negotiated the ipc transport (${ipc.transport})`);
+        ipc.set('capped', 'VIA-IPC');
+        ok(a.__unsafeCapState().caps === 0,
+           `an IPC write cancels the cap (${a.__unsafeCapState().caps})`);
+        ipc.close();
+
+        a.close();
+        console.log(fail ? `  ${fail} failed (shed)` : '  [l3-cap] shed/ipc cases passed');
+        process.exit(fail ? 1 : 0);
+    })();
+    return;
+}
+
 // ---------------------------------------------------- worker, bulk poll ----
 // THE POLL IS BOUNDED. Deciding whether a cap can be applied means asking the
 // arena, and that copies a value out of it: a full pass over the 4096-entry
@@ -186,15 +235,16 @@ if (process.env.TCC_ROLE === 'bulk') {
         await sleep(80);
         ok(w2.__unsafeCapState().sent === 0,
            `which cannot be submitted while the write is still in the ring (${w2.__unsafeCapState().sent})`);
+        // Stop the automatic poll BEFORE the arena is told about the write, so
+        // there is no turn in which it could claim the cap. Only #deferCap
+        // re-arms the timer and nothing defers after this point, so the
+        // outcome below is deterministic rather than "discriminating whenever
+        // the poll has not got there first".
+        w2.__unsafePauseCaps();
         process.send({ step: 'promo-written' });
         await step('drained3');                   // arena now holds OURS, uncapped
-
-        // From here to the tick below there is no macrotask boundary: the fake
-        // adapter answers through microtasks, so the automatic poll cannot run
-        // in between. It MAY have run in the message turn above, which is why
-        // `sent` is reported rather than asserted -- the arena assertion at the
-        // end holds either way, and is the discriminating one when it is 0.
-        const raced = w2.__unsafeCapState().sent;
+        ok(w2.__unsafeCapState().sent === 0,
+           `the poll is stopped, so the cap is untouched (${w2.__unsafeCapState().sent})`);
         ok(w2.get('promo') === undefined,
            `the read guard makes the key miss locally (${JSON.stringify(w2.get('promo'))})`);
         ok(await w2.getAsync('promo') === 'L3VAL', 'so the read goes through to L3');
@@ -204,8 +254,7 @@ if (process.env.TCC_ROLE === 'bulk') {
         process.send({ step: 'promoted' });
         await step('drained4');
         ok(native.get('promo') === 'L3VAL',
-           `the arena holds what L3 holds, not the value it refused ` +
-           `(${native.get('promo')}; poll had claimed ${raced} before the promotion)`);
+           `the arena holds what L3 holds, not the value it refused (${native.get('promo')})`);
         ok(w2.get('promo') === 'L3VAL', `and the worker reads it (${w2.get('promo')})`);
         w2.close();
 
@@ -373,6 +422,22 @@ if (process.env.TCC_ROLE === 'slow') {
             kid.on('exit', (c) => resolve(c));
         });
         ok(code === 0, `the bulk-poll cases passed (child exited ${code})`);
+        await primary.close();
+    }
+
+    // The shed/IPC case needs a ring too small to take a record and a primary
+    // that never drains it.
+    {
+        const arena = ARENA + 'd';
+        const primary = TurboKV.createPrimary(arena, 16 << 20, 1 << 14,
+            { storage: 'bytes', maintenance: false, submitRings: 2, submitRingBytes: 4096 });
+        const code = await new Promise((resolve) => {
+            const kid = fork(__filename, [], {
+                env: { ...process.env, TCC_ROLE: 'shed', TCC_ARENA: arena }, stdio: 'inherit',
+            });
+            kid.on('exit', (c) => resolve(c));
+        });
+        ok(code === 0, `the shed/ipc cases passed (child exited ${code})`);
         await primary.close();
     }
 

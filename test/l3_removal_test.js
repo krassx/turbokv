@@ -181,7 +181,16 @@ if (process.env.TCR_ROLE === 'wrap') {
         ok(afterOne.pending === 200 - 64,
            `one drain reconciles a slice, not all of them (${afterOne.pending} left of 200)`);
         ok(afterOne.owed === 200 - 64, `and carries the remainder (${afterOne.owed})`);
+        // The RESUMED slices stamp the ring HEAD as the removal position, not
+        // the stale cursor. The slice runs before the ring scan, so a looser
+        // position here would preempt the precise one the record path computes
+        // (cursor + i + 1) for the very same kind of mark -- and a position
+        // behind a live read's mark stops guarding it.
+        const headNow = native.stats().ringHead;
         for (let i = 0; i < 4; i++) w.get('poke');
+        const pos = w.__unsafeDeletedAtOf('many199');
+        ok(pos !== undefined && pos >= headNow,
+           `a resumed slice records the ring head, not a stale cursor (${pos} vs head ${headNow})`);
         const afterAll = w.__unsafeMarkState();
         ok(afterAll.pending === 0, `later drains finish the job (${afterAll.pending} left)`);
         ok(afterAll.owed === 0, `with nothing still owed (${afterAll.owed})`);
@@ -207,6 +216,36 @@ if (process.env.TCR_ROLE === 'fill') {
     for (let i = 0; i < 10000; i++) w.set('f' + i, 'x');
     w.close();
     process.exit(0);
+}
+
+// -------------------------------------------------- worker, mark bounds ----
+// #pendingDel only exists on a worker, so its bound can only be exercised here.
+if (process.env.TCR_ROLE === 'marks') {
+    (async () => {
+        const w = TurboKV.attachWorker(process.env.TCR_ARENA, 1, { storage: 'bytes' });
+        for (let i = 0; i < 4100; i++) w.delete('m' + i);
+        const st = w.__unsafeMarkState();
+        ok(st.pending === 4096, `the marks stay at the bound rather than being wiped (${st.pending})`);
+        ok(st.pendingKeys[0] === 'm4', `the oldest survivor is the 5th (${st.pendingKeys[0]})`);
+        ok(st.pendingKeys[st.pendingKeys.length - 1] === 'm4099',
+           `and the newest is the last (${st.pendingKeys[st.pendingKeys.length - 1]})`);
+        // From the MIDDLE, for the reason the primary case gives.
+        w.delete('m2000');
+        const st2 = w.__unsafeMarkState();
+        ok(st2.pendingKeys[st2.pendingKeys.length - 1] === 'm2000',
+           `a re-deleted key moves to the newest slot (${st2.pendingKeys[st2.pendingKeys.length - 1]})`);
+        ok(st2.pendingKeys[0] === 'm4',
+           `and nothing is evicted, because the re-delete freed its own slot (${st2.pendingKeys[0]})`);
+        // And the hash index follows: a mark dropped by the bound must not
+        // leave its hash behind, or the next invalidation for that hash clears
+        // a mark that is no longer there.
+        ok(w.get('m2000') === undefined, 'the re-deleted key still reads as gone');
+        ok(w.get('m4099') === undefined, 'and so does the newest');
+        w.close();
+        console.log(fail ? `  ${fail} failed (marks)` : '  [l3-removal] mark-bound cases passed');
+        process.exit(fail ? 1 : 0);
+    })();
+    return;
 }
 
 // ------------------------------------------------ worker, tiny ring slot ----
@@ -502,6 +541,49 @@ if (process.env.TCR_ROLE === 'shed') {
         const st = primary.__unsafeMarkState();
         ok(st.deletedAt === 4096,
            `the guard stays full rather than being wiped at the bound (${st.deletedAt})`);
+        // WHICH entries survived, not just how many. An eviction that kept the
+        // newest and one that kept the oldest are the same size and opposite
+        // policies, and only one of them is right: ring positions are
+        // monotonic, so the oldest is the one most likely to be behind every
+        // live read's mark already.
+        ok(st.deletedAtKeys[0] === 'gone4',
+           `the oldest survivor is the 5th delete, not the 1st (${st.deletedAtKeys[0]})`);
+        ok(st.deletedAtKeys[st.deletedAtKeys.length - 1] === 'gone4099',
+           `and the newest is the last one made (${st.deletedAtKeys[st.deletedAtKeys.length - 1]})`);
+        // RE-DELETING A KEY REFRESHES ITS PLACE. `Map.set` on a key already
+        // present keeps its FIRST-insertion slot, so without an explicit
+        // delete a repeatedly deleted key would carry a fresh position in an
+        // old slot and be evicted first -- the exact inversion of the rule,
+        // for exactly the keys most likely to need the guard.
+        // A key from the MIDDLE, deliberately: re-deleting the oldest one
+        // would move to the back either way, because the bound evicts it a
+        // line before the re-insert puts it there.
+        primary.delete('gone2000');
+        const st2 = primary.__unsafeMarkState();
+        ok(st2.deletedAtKeys[st2.deletedAtKeys.length - 1] === 'gone2000',
+           `a re-deleted key moves to the newest slot (${st2.deletedAtKeys[st2.deletedAtKeys.length - 1]})`);
+        ok(st2.deletedAtKeys[0] === 'gone4',
+           `and nothing is evicted, because the re-delete freed its own slot (${st2.deletedAtKeys[0]})`);
+        await primary.close();
+    }
+
+    // M. #pendingDel's BOUND EVICTS THE OLDEST TOO. It used to be a wholesale
+    //    flush, justified on the ground that the marks have no useful order --
+    //    but a Set is insertion-ordered, the oldest mark is the one whose
+    //    removal has had the longest to be applied, and the comment beside
+    //    that flush said in as many words that losing these marks costs stale
+    //    reads. Dropping one costs one possible stale read; dropping four
+    //    thousand costs four thousand.
+    {
+        const arena = ARENA + 'm';
+        const primary = TurboKV.createPrimary(arena, 16 << 20, 1 << 14, { storage: 'bytes', maintenance: false });
+        const code = await new Promise((resolve) => {
+            const kid = fork(__filename, [], {
+                env: { ...process.env, TCR_ROLE: 'marks', TCR_ARENA: arena }, stdio: 'inherit',
+            });
+            kid.on('exit', (c) => resolve(c));
+        });
+        ok(code === 0, `the mark-bound cases passed (child exited ${code})`);
         await primary.close();
     }
 
