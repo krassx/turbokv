@@ -82,6 +82,20 @@ if (process.env.TCR_ROLE === 'worker') {
         await sleep(30);
         const g4 = await d.getAsync('degraded');
         ok(g4 === 'DV', `and can still read it back from L3 (${g4})`);
+
+        // 5. A DELETE on a degraded worker, which is the same route through a
+        //    different door: the removal is submitted into a ring nobody
+        //    drains, so a mark taken for it is one nothing can ever clear.
+        f.store.set('degdel', { value: 'D1', expiresAt: 0 });
+        ok(await d.deleteAsync('degdel') === true, 'a degraded worker still deletes through to L3');
+        f.store.set('degdel', { value: 'D2', expiresAt: 0 });   // written again elsewhere
+        const askedBefore = f.calls.filter(x => x[0] === 'get' && x[1] === 'degdel').length;
+        let deg = [];
+        for (let i = 0; i < 3; i++) { await sleep(60); deg.push(await d.getAsync('degdel')); }
+        ok(deg.every(v => v === 'D2'),
+           `the key is not permanently unreadable afterwards (${JSON.stringify(deg)})`);
+        ok(f.calls.filter(x => x[0] === 'get' && x[1] === 'degdel').length > askedBefore,
+           'and the adapter was actually asked, rather than refused locally');
         d.close();
 
         w.close();
@@ -89,6 +103,59 @@ if (process.env.TCR_ROLE === 'worker') {
         process.exit(fail ? 1 : 0);
     })();
     return;
+}
+
+// ------------------------------------------------------ worker, wrapped ----
+// The worker deletes a key L2 holds, the primary laps the invalidation ring
+// before applying that delete, and the worker then drains and finds `wrapped`.
+// Its own delete is still outstanding and L2 still holds the value, so
+// forgetting the mark here is not a lost invalidation -- it is a stale read.
+if (process.env.TCR_ROLE === 'wrap') {
+    (async () => {
+        const f = makeFake();
+        const w = TurboKV.attachWorker(process.env.TCR_ARENA, 1, { storage: 'bytes', l3: f.adapter });
+        const step = (want) => new Promise((r) => {
+            const h = (m) => { if (m && m.step === want) { process.off('message', h); r(); } };
+            process.on('message', h);
+        });
+        ok(w.get('pend') === 'L2V', `the key is resident in L2 to begin with (${w.get('pend')})`);
+        // The primary never drains here (maintenance:false, and a plain fork
+        // has no channel for the doorbell), so this delete stays pending for
+        // the whole test.
+        ok(w.delete('pend') === true, 'the worker deletes it');
+        ok(w.get('pend') === undefined, `and its own read misses at once (${w.get('pend')})`);
+        // A key the primary never touches again, held in L1. Only a WHOLESALE
+        // flush can remove it, so it is the proof that the ring really wrapped
+        // -- without it this test would pass for the wrong reason the day the
+        // ring is resized.
+        ok(w.get('keeper') === 'K', `the worker caches an untouched key (${w.get('keeper')})`);
+        ok(w.l1Size === 1, `which is resident in L1 (${w.l1Size})`);
+        process.send({ step: 'deleted' });
+        await step('wrapped');
+        w.get('poke');                            // drains, and finds the ring wrapped
+        ok(w.l1Size === 0, `the wholesale flush ran, so the ring did wrap (l1Size ${w.l1Size})`);
+        // Non-vacuous the other way too: L2 must still be holding the value, or
+        // the assertion below would pass because the key is simply gone.
+        ok(native.get('pend') === 'L2V',
+           `L2 still holds the value this worker deleted (${native.get('pend')})`);
+        ok(w.get('pend') === undefined,
+           `a wrapped ring does not resurrect this worker's pending delete (${JSON.stringify(w.get('pend'))})`);
+        ok(w.has('pend') === false, `has() agrees (${w.has('pend')})`);
+        w.close();
+        console.log(fail ? `  ${fail} failed (wrap)` : '  [l3-removal] wrapped-ring cases passed');
+        process.exit(fail ? 1 : 0);
+    })();
+    return;
+}
+
+// ------------------------------------------------------- worker, filler ----
+// Nothing but a source of submission-ring traffic, so the PRIMARY's own
+// invalidation cursor can be made to lap.
+if (process.env.TCR_ROLE === 'fill') {
+    const w = TurboKV.attachWorker(process.env.TCR_ARENA, 1, { storage: 'bytes' });
+    for (let i = 0; i < 10000; i++) w.set('f' + i, 'x');
+    w.close();
+    process.exit(0);
 }
 
 // ------------------------------------------------ worker, tiny ring slot ----
@@ -281,6 +348,79 @@ if (process.env.TCR_ROLE === 'shed') {
         ok(await primary.deleteAsync('k') === false, 'and one that was not');
         ok(await primary.deleteAsync(42) === false, 'a non-string key is still refused');
         primary.close();
+    }
+
+    // J. A WRAPPED RING MUST NOT FORGET WHAT THIS PROCESS REMOVED.
+    //
+    // Absent-key deletes now put a record on the ring where they put none, which
+    // is the point -- and it takes a fan-out invalidation workload from zero
+    // ring traffic to full rate, so a worker that goes quiet wraps. "I do not
+    // know what changed" is a reason to drop what this process HOLDS. It was
+    // also clearing #pendingDel, so a worker whose own delete was still pending
+    // went straight back to serving that key out of L2: a stale value, which
+    // is the one failure mode this design does not accept.
+    {
+        // 4MB, because the invalidation ring is sized from the arena (4% of
+        // it, capped at 65536 records) and this test needs to LAP it: 4MB
+        // gives the 8192-record floor, which 10000 noise writes pass.
+        const primary = TurboKV.createPrimary(ARENA + 'w', 4 << 20, 1 << 14,
+            { storage: 'bytes', maintenance: false });
+        primary.set('pend', 'L2V');
+        primary.set('keeper', 'K');
+        const code = await new Promise((resolve) => {
+            const kid = fork(__filename, [], {
+                env: { ...process.env, TCR_ROLE: 'wrap', TCR_ARENA: ARENA + 'w' }, stdio: 'inherit',
+            });
+            kid.on('message', (m) => {
+                if (m && m.step === 'deleted') {
+                    // Applying the worker's delete is exactly what must NOT
+                    // happen: what is wanted is a ring that laps while that
+                    // delete is still pending. The ring holds 8192 records.
+                    for (let i = 0; i < 10000; i++) primary.set('noise' + i, 'x');
+                    kid.send({ step: 'wrapped' });
+                }
+            });
+            kid.on('exit', (c) => resolve(c));
+        });
+        ok(code === 0, `the wrapped-ring cases passed (child exited ${code})`);
+        await primary.close();
+    }
+
+    // K. THE SAME SHAPE ON THE PRIMARY. #primaryInvalidate has its own wrapped
+    //    branch, reached when enough worker writes are applied between two
+    //    drains, and it flushed every instance wholesale through clearLocal().
+    //    The primary has no #pendingDel, but it does have #deletedAt -- the
+    //    only thing that stops an in-flight read handing back a key this
+    //    process deleted -- and that must survive a wrap for the same reason.
+    {
+        const store = new Map([['wrapdel', 'L3ONLY']]);
+        const adapter = {
+            async get(k) { const v = store.get(k); await sleep(250); return v === undefined ? undefined : { value: v }; },
+            async set(k, v) { store.set(k, v); },
+            async delete(k) { store.delete(k); },
+            async clear() { store.clear(); },
+        };
+        // 4MB for the 8192-record ring floor, as above.
+        const primary = TurboKV.createPrimary(ARENA + 'k', 4 << 20, 1 << 14,
+            { storage: 'bytes', maintenance: false, l3: adapter });
+        const read = primary.getAsync('wrapdel');
+        await sleep(10);
+        await primary.deleteAsync('wrapdel');        // settles long before the read
+        const code = await new Promise((resolve) => {
+            const kid = fork(__filename, [], {
+                env: { ...process.env, TCR_ROLE: 'fill', TCR_ARENA: ARENA + 'k' }, stdio: 'inherit',
+            });
+            kid.on('exit', (c) => resolve(c));
+        });
+        ok(code === 0, `the filler worker ran (exited ${code})`);
+        const applied = TurboKV.drainSubmissions(20000);
+        ok(applied > 8192, `enough records to lap the primary's cursor (${applied})`);
+        const got = await read;
+        ok(got === undefined,
+           `a wrapped ring does not make the primary forget its own delete (${JSON.stringify(got)})`);
+        ok(native.get('wrapdel') === undefined,
+           `and nothing was written back into the arena (${native.get('wrapdel')})`);
+        await primary.close();
     }
 
     console.log(fail ? `  ${fail} failed` : '  [l3-removal] all passed');

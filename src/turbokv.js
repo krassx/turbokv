@@ -249,11 +249,24 @@ const L1_SECOND_CHANCE_BUDGET = 16;
 //   retried.
 const L3_CAP_POLL_MS = 20;
 const L3_CAP_WINDOW_MS = 2000;
+//   SCAN is how many caps one tick may examine. A tick that finds the key
+//   present copies its value out of the arena to compare it, and a full pass
+//   over the 4096 bound below was measured at 1.69ms for 8KB values -- an
+//   event-loop stall every 20ms, on a hot worker, for the length of the
+//   outage. 64 holds that at ~26us, 0.13% of the interval, and a full pass
+//   still completes in 64 ticks (1.28s), inside one window.
+const L3_CAP_SCAN = 64;
 // Bound on outstanding caps, for the same reason #pendingDel has one: a worker
 // writing hard against a dead L3 must not grow a map without limit. Dropping
 // one costs a longer local disagreement, which is what this whole mechanism is
 // bounding anyway.
 const L3_CAP_MAX = 4096;
+// The same bound, for the two maps that record what this process has REMOVED:
+// keys whose removal the primary has not applied yet, and where this instance's
+// own removals landed on the invalidation ring. Named rather than repeated,
+// because a wrapped ring no longer clears either of them (see #drain) and the
+// bound is now the only thing keeping them finite.
+const PENDING_DEL_MAX = 4096;
 let storeReady = false;
 let submitName = null;    // primary: the segment it created, null = IPC transport
 let submitReady = null;   // worker: the segment name it successfully opened
@@ -945,7 +958,12 @@ class TurboKV {
             try { r = native.ringRead(TurboKV.#primaryCursor, 1024); } catch { return; }
             if (!r) return;                        // store detached underneath us
             if (r.wrapped) {                       // fell too far behind: flush wholesale
-                for (const c of instances) c.clearLocal();
+                // Cached values only, exactly as the worker drain does and for
+                // the same reason: "I do not know what changed" is a reason to
+                // drop what these instances HOLD, never a reason to forget the
+                // removals they made themselves. #deletedAt is what stops an
+                // in-flight read handing back a key this process deleted.
+                for (const c of instances) c.#dropCachedValues();
                 TurboKV.#primaryCursor = r.head;
                 return;
             }
@@ -970,6 +988,19 @@ class TurboKV {
     // that is otherwise only observable through a cache miss.
     __unsafeResolveLevel(minLevel) { return this.#resolveLevel(minLevel); }
     __unsafeForcePrimaryDead() { this.#primaryDead = true; }
+    // Test-only, and named to say so: whether this handle is still polling for
+    // an L2 cap is not otherwise observable, and "a closed cache owns no timer"
+    // is a claim that should be checked rather than asserted in a comment.
+    __unsafeCapState() {
+        let sent = 0;
+        for (const c of this.#l3Caps.values()) if (c.sent) sent++;
+        return { caps: this.#l3Caps.size, sent, timer: this.#capTimer !== null };
+    }
+    // Test-only: runs exactly one poll tick. The per-tick bound is a property
+    // of one tick, and sampling it from a loaded event loop measures however
+    // many ticks the sample happened to span -- which made the obvious timing
+    // test flaky in both directions.
+    __unsafeRunCaps() { this.#runCaps(); }
 
     // Test and shutdown helper: resolves when this process has no L3 work left.
     drainL3() { return this.#queue ? this.#queue.drain() : Promise.resolve(); }
@@ -1292,8 +1323,26 @@ class TurboKV {
         const r = native.ringRead(this.#cursor, 512);
         if (!r) return;                            // detached mid-drain
         if (r.wrapped) {                       // fell too far behind: flush wholesale
-            this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear(); this.#deletedAt.clear();
-        this.#l3Caps.clear(); this.#stopCapTimer();
+            // CACHED VALUES ONLY. A wrapped ring means "I do not know what
+            // changed", which is a reason to drop what this process is
+            // HOLDING -- and emphatically not a reason to forget what this
+            // process itself REMOVED, or still owes the arena. Clearing
+            // #pendingDel here handed a worker whose own delete was still
+            // pending straight back to L2's copy of that key: a stale value,
+            // which is the one failure mode this design does not accept, and
+            // reachable now that an absent-key delete appends a record too --
+            // a fan-out invalidation workload takes an idle worker from zero
+            // ring traffic to full rate, and ~0.33s of that wraps a 16MB
+            // arena's ring.
+            //
+            // Keeping them costs bounded memory (all three are capped) and
+            // some extra misses until the marks are resolved on their own
+            // terms, which is the direction this project chooses every time.
+            // #deletedAt's positions are monotonic and #promotionBlock refuses
+            // every promotion while the ring is wrapped anyway, so a stale
+            // position there costs nothing; the caps resolve against the arena
+            // rather than against the ring, so a wrap tells them nothing.
+            this.#dropCachedValues();
             this.#cursor = r.head;
             return;
         }
@@ -1550,7 +1599,7 @@ class TurboKV {
     // key at a time would hide the condition. Losing marks costs stale reads
     // until the invalidations arrive; growing without bound costs the process.
     #markPendingDel(key, keyHash) {
-        if (this.#pendingDel.size >= 4096) { this.#pendingDel.clear(); this.#pendingDelHash.clear(); }
+        if (this.#pendingDel.size >= PENDING_DEL_MAX) { this.#pendingDel.clear(); this.#pendingDelHash.clear(); }
         this.#pendingDel.add(key);
         this.#pendingDelHash.set(keyHash, key);
     }
@@ -1562,7 +1611,7 @@ class TurboKV {
     // passed it.
     #noteDeleted(key, at) {
         if (this.#queue === null) return;        // no adapter: nothing promotes, nothing to guard
-        if (this.#deletedAt.size >= 4096) this.#deletedAt.clear();
+        if (this.#deletedAt.size >= PENDING_DEL_MAX) this.#deletedAt.clear();
         this.#deletedAt.set(key, at);
     }
 
@@ -1866,6 +1915,12 @@ class TurboKV {
     // a process should be kept alive for -- and only runs while a cap is
     // outstanding.
     #deferCap(key, enc, cap) {
+        // A failed write's promise can settle AFTER close(): the queue keeps
+        // retrying until it is told to stop, and #closeL3 tells it only after a
+        // bounded drain. Arming a timer then is low harm -- it is unref'd and
+        // it terminates itself on the first tick, because a closed cache has no
+        // arena -- but a closed cache should own no timer at all.
+        if (this.#closePromise !== null) return;
         if (this.#l3Caps.size >= L3_CAP_MAX) return;
         const now = monoMs();
         this.#l3Caps.set(key, { enc, cap, deadline: now + cap, until: now + L3_CAP_WINDOW_MS });
@@ -1890,34 +1945,70 @@ class TurboKV {
     #runCaps() {
         if (!storeReady || this.#primaryDead) { this.#l3Caps.clear(); this.#stopCapTimer(); return; }
         const now = monoMs();
+        // A BOUNDED SLICE OF THE ARENA WORK. Deciding whether a cap can be
+        // applied means asking the arena, and that COPIES A VALUE OUT of it:
+        // measured at 1.69ms for 4096 entries of 8KB, which is an event-loop
+        // stall every 20ms on a hot worker for the length of an L3 outage. So
+        // at most L3_CAP_SCAN caps reach the arena per tick.
+        //
+        // A cap that has already been SUBMITTED costs nothing here and is
+        // deliberately outside the budget: it is kept only so this worker's own
+        // reads stay honest until its deadline, which is a timestamp compare.
+        // Letting those consume the slice would starve the caps that still have
+        // work to do.
+        let budget = L3_CAP_SCAN;
+        const rotate = [];
         for (const [key, c] of this.#l3Caps) {
-            let cur;
-            try { cur = native.get(key); } catch { this.#l3Caps.delete(key); continue; }
-            // ABSENT IS NOT FINISHED, on a worker. The write being re-timed may
-            // simply not have been applied yet -- that is the entire reason
-            // this map exists -- so an absent key means "keep waiting", and the
-            // window is what ends the wait. (A key genuinely deleted in the
-            // meantime also lands here, and costs nothing but the window.)
-            if (cur !== undefined) {
-                if (!sameStored(cur, c.enc)) { this.#l3Caps.delete(key); continue; }   // superseded
-                const rem = native.lastTtlRemainingMs();
-                // `+ L3_CAP_POLL_MS` of tolerance: the arena's remaining-ms
-                // comes from a clock this process only samples, so an exact
-                // comparison would leave an entry that IS capped looking
-                // uncapped forever.
-                if (rem > 0 && now + rem <= c.deadline + L3_CAP_POLL_MS) { this.#l3Caps.delete(key); continue; }
-                if (!c.sent && this.#capL2AfterL3Failure(key, c.enc, c.cap)) {
-                    c.sent = true;
-                    this.stats.l3FailTtlApplied = (this.stats.l3FailTtlApplied || 0) + 1;
-                    continue;
-                }
+            if (c.sent) {
+                // Kept PAST its deadline, which is the only time the read guard
+                // can bite: before it the capped L1 entry answers, and after it
+                // the question is whether the arena has applied the cap yet.
+                // One more window is the bound -- by then the primary has
+                // either applied a submission it accepted or is not coming
+                // back. No arena work either way, just a timestamp.
+                if (now >= c.deadline + L3_CAP_WINDOW_MS) this.#l3Caps.delete(key);
+                continue;
             }
-            if (now >= c.until) {
-                this.#l3Caps.delete(key);
-                this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + 1;
-            }
+            if (budget <= 0) continue;
+            budget--;
+            if (this.#stepCap(key, c, now)) rotate.push(key);
+            else this.#l3Caps.delete(key);
+        }
+        // Oldest first, so the next tick starts where this one stopped: Map
+        // iteration is insertion order, and re-inserting moves an entry to the
+        // back. Done after the loop rather than inside it, because re-inserting
+        // during iteration would let the same entry be visited twice.
+        for (const key of rotate) {
+            const c = this.#l3Caps.get(key);
+            if (c === undefined) continue;
+            this.#l3Caps.delete(key); this.#l3Caps.set(key, c);
         }
         if (this.#l3Caps.size === 0) this.#stopCapTimer();
+    }
+
+    // One not-yet-submitted cap, one tick. Returns whether it is still worth
+    // keeping. THERE IS NO CONFIRMATION PHASE: once the cap has been submitted
+    // the arena has nothing left to tell us, because either it applies it -- in
+    // which case the entry expires on its own and this worker's reads converge
+    // through the ordinary TTL -- or it does not, in which case the read guard
+    // below is what converges them, and it needs no help from the arena to do
+    // that. Watching for the confirmation instead cost a copy per entry per
+    // tick and, on a near-full map, reported caps that HAD been applied as
+    // unapplied because the confirmation had not come round yet.
+    #stepCap(key, c, now) {
+        // ABSENT IS NOT FINISHED, on a worker: the write being re-timed may
+        // simply still be in the submission ring, which is the entire reason
+        // this map exists. #capL2AfterL3Failure answers both questions at once
+        // -- is it there, and is it still mine -- and the window is what ends
+        // the wait when the answer stays no.
+        if (this.#capL2AfterL3Failure(key, c.enc, c.cap)) {
+            c.sent = true;
+            this.stats.l3FailTtlApplied = (this.stats.l3FailTtlApplied || 0) + 1;
+            return true;                      // kept for the read guard only
+        }
+        if (now < c.until) return true;
+        this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + 1;
+        return false;
     }
 
     // Is the arena's copy of `key` one this worker has already asked to be
@@ -2315,7 +2406,18 @@ class TurboKV {
         // deletes, dropping the record only costs us a stale read, whereas
         // growing without bound costs the process.
         const keyHash = native.hashKey(key);
-        this.#markPendingDel(key, keyHash);
+        // MARKED ONLY WHEN SOMETHING WILL ACTUALLY PUBLISH THE REMOVAL. A
+        // DEGRADED worker submits nothing -- the arena is unmapped and the
+        // primary that would apply it is gone -- so the mark would be one
+        // nothing can ever clear, and a marked key is unreadable from every
+        // tier, L3 included: `deleteAsync('r')` followed by `getAsync('r')`
+        // answered undefined forever, without the adapter being asked once.
+        // Nothing local can serve a stale value while degraded anyway: the
+        // #l1Drop above emptied L1 and `get` answers from L1 only. The mark is
+        // taken again if this handle recovers and deletes again; a delete
+        // issued DURING the outage is a lost write rather than a pending one,
+        // which is what #recovered() already says in as many words.
+        if (!this.#primaryDead) this.#markPendingDel(key, keyHash);
         // The L3 half, shared by every worker path below. Same contract as
         // #queueSet: the sync caller ignores the promise, deleteAsync awaits
         // it. L3 is the store of record for a worker's delete -- there is no
@@ -2379,8 +2481,20 @@ class TurboKV {
     // Drops only this process's L1. The shared arena is untouched, so the next
     // read simply repopulates it.
     clearLocal() {
-        this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear(); this.#deletedAt.clear();
+        this.#dropCachedValues();
+        // A clear is the case where forgetting IS right: the arena has been
+        // emptied, so a pending delete has nothing left to be pending against,
+        // a recorded removal has nothing left to protect, and a cap has no
+        // entry to re-time. Contrast the wrapped-ring branch in #drain, which
+        // looks identical and must not do this.
+        this.#pendingDel.clear(); this.#pendingDelHash.clear(); this.#deletedAt.clear();
         this.#l3Caps.clear(); this.#stopCapTimer();
+    }
+
+    // The L1 half of a flush: everything this process is HOLDING, and nothing
+    // about what it owes.
+    #dropCachedValues() {
+        this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null;
     }
 
     // Wipes the shared arena AND every worker's L1, via a flush record on the

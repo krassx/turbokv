@@ -86,6 +86,57 @@ if (process.env.TCC_ROLE === 'worker') {
     return;
 }
 
+// ---------------------------------------------------- worker, bulk poll ----
+// THE POLL IS BOUNDED. Deciding whether a cap can be applied means asking the
+// arena, and that copies a value out of it: a full pass over the 4096-entry
+// bound was measured at 1.69ms for 8KB values -- an event-loop stall every 20ms
+// for the length of an outage. So a tick reaches the arena for at most 64 caps.
+//
+// Driven a tick at a time against a primary that drains only on request, rather
+// than timed: the bound is a property of ONE tick, and a count sampled from a
+// loaded event loop is a count of however many ticks the sample spanned, which
+// made the obvious timing version flaky in both directions.
+if (process.env.TCC_ROLE === 'bulk') {
+    (async () => {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const w = TurboKV.attachWorker(process.env.TCC_ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 5, l3FailTtlMs: 60000 });
+        const step = (want) => new Promise((r) => {
+            const h = (m) => { if (m && m.step === want) { process.off('message', h); r(); } };
+            process.on('message', h);
+        });
+        const N = 640;                         // ten slices
+        for (let i = 0; i < N; i++) w.set('bulk' + i, 'V');
+        await w.drainL3();
+        await sleep(20);                       // the cap handlers run off the settled promises
+        ok(w.__unsafeCapState().caps === N,
+           `every failed write deferred a cap (${w.__unsafeCapState().caps} of ${N})`);
+        // Nothing has landed in L2 yet, so every tick so far has correctly done
+        // nothing -- which is what makes the first tick after the drain the one
+        // the bound is measured on.
+        ok(w.__unsafeCapState().sent === 0, `and none could be applied yet (${w.__unsafeCapState().sent})`);
+        process.send({ step: 'written' });
+        await step('drained');
+        w.__unsafeRunCaps();
+        const one = w.__unsafeCapState().sent;
+        ok(one > 0, `one tick makes progress (${one})`);
+        // 2x the slice, so a real interval tick slipping into the message turn
+        // cannot fail this. Either way it is nowhere near ${N}.
+        ok(one <= 128, `and reaches the arena for a bounded slice, not all ${N} (${one})`);
+        // The bound must not cost convergence: ten slices, so eleven more ticks.
+        for (let i = 0; i < 12; i++) w.__unsafeRunCaps();
+        ok(w.__unsafeCapState().sent === N,
+           `every cap is applied within ceil(N/64) ticks (${w.__unsafeCapState().sent} of ${N})`);
+        ok((w.stats.l3FailTtlUnapplied || 0) === 0,
+           `and none is abandoned (${w.stats.l3FailTtlUnapplied || 0})`);
+        w.close();
+        console.log(fail ? `  ${fail} failed (bulk)` : '  [l3-cap] bulk-poll cases passed');
+        process.exit(fail ? 1 : 0);
+    })();
+    return;
+}
+
 // ----------------------------------------------------- worker, one drain ----
 // The deferred cap closes the SHARED arena's half. This half is the worker's
 // own: between the moment the cap falls due and the moment the primary applies
@@ -188,6 +239,52 @@ if (process.env.TCC_ROLE === 'slow') {
             kid.on('exit', (c) => resolve(c));
         });
         ok(code === 0, `the one-drain cases passed (child exited ${code})`);
+        await primary.close();
+    }
+
+    // A failed write's promise can settle AFTER close(): the queue goes on
+    // retrying until it is told to stop, and it is told only after a bounded
+    // drain. Arming a poll then is low harm -- unref'd, and it terminates on
+    // its first tick because a closed cache has no arena -- but a closed cache
+    // should own no timer at all.
+    {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const c = TurboKV.createPrimary(ARENA + 'x', 4 << 20, 1 << 12,
+            { storage: 'bytes', maintenance: false, l3: f.adapter,
+              l3RetryMs: 120, l3FailTtlMs: 1000, l3CloseTimeoutMs: 1 });
+        // A worker handle in this same process, so the cap is DEFERRED rather
+        // than applied on the spot -- the primary never defers anything.
+        const w = new TurboKV({ storage: 'bytes', l3: f.adapter, workerId: 1,
+                                l3RetryMs: 120, l3FailTtlMs: 1000, l3CloseTimeoutMs: 1 });
+        w.set('late', 'V');
+        ok(w.__unsafeCapState().timer === false, 'no poll is armed before the write fails');
+        await w.close();
+        await sleep(400);                 // the abandoned write settles in here
+        const st = w.__unsafeCapState();
+        ok(st.timer === false, `a closed cache arms no poll (timer=${st.timer})`);
+        ok(st.caps === 0, `and records no cap (caps=${st.caps})`);
+        await c.close();
+    }
+
+    // The bulk case: one drain, on request, so the first tick after it is the
+    // one the per-tick bound is measured on.
+    {
+        const arena = ARENA + 'u';
+        const primary = TurboKV.createPrimary(arena, 16 << 20, 1 << 14, { storage: 'bytes', maintenance: false });
+        const code = await new Promise((resolve) => {
+            const kid = fork(__filename, [], {
+                env: { ...process.env, TCC_ROLE: 'bulk', TCC_ARENA: arena }, stdio: 'inherit',
+            });
+            kid.on('message', (m) => {
+                if (m && m.step === 'written') {
+                    TurboKV.drainSubmissions(20000);
+                    kid.send({ step: 'drained' });
+                }
+            });
+            kid.on('exit', (c) => resolve(c));
+        });
+        ok(code === 0, `the bulk-poll cases passed (child exited ${code})`);
         await primary.close();
     }
 
