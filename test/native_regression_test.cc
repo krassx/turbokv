@@ -228,6 +228,19 @@ int main() {
       ok(!newer.attachReadOnly(NM4), "an arena one layout version ahead is refused");
     }
 
+    // The field that forced 6 -> 7: the L3 clear generation. A fresh arena owes
+    // L3 nothing, so the two counters must start EQUAL -- the guard's whole
+    // meaning is `gen != settled`, and a non-zero `gen` on a new arena would
+    // make every process serve L3 misses forever. The 16 bytes it added must
+    // also still leave the index where create() computed it: indexOff is
+    // derived from sizeof(Header) and re-validated on every attach, so a
+    // Header that outgrew its 64-byte rounding would move the whole data
+    // region under a reader that rounded differently.
+    ok(w.h->l3ClearGen.load() == 0 && w.h->l3ClearSettled.load() == 0,
+       "layout test: a fresh arena has no L3 clear in flight");
+    ok(w.h->indexOff >= sizeof(Header) && (w.h->indexOff & 63) == 0,
+       "layout test: the index still starts past the grown Header, 64-byte aligned");
+
     // Restore the real layout and confirm a matching build still attaches --
     // a gate that refuses everything would pass the two cases above for the
     // wrong reason.

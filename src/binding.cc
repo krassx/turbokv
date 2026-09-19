@@ -790,6 +790,60 @@ static napi_value ClearAll(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+// ---- the L3 clear generation (Header::l3ClearGen / l3ClearSettled) --------
+//
+// Deliberately NOT folded into ClearAll: a clearAll with no L3 adapter empties
+// the arena and owes L3 nothing, and must behave exactly as it did before this
+// existed. The generation is opened and closed by the JS layer, which is the
+// only layer that knows whether a clear was handed to an adapter at all.
+
+// A clear has been handed to L3 and has not landed yet. Primary only -- see
+// the Header comment: a worker's clear opens its generation through the IPC
+// batch the primary applies, because a worker cannot write this page.
+static napi_value L3ClearBegin(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
+  g.h->l3ClearGen.fetch_add(1, std::memory_order_release);
+  return nullptr;
+}
+
+// That clear landed, or close() stopped waiting for it.
+static napi_value L3ClearSettle(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
+  // Clamped, never a bare increment. A settle can outlive the arena its
+  // generation was opened against -- a primary restart zeroes both counters
+  // while a worker's clear is still retrying -- and an unclamped increment
+  // would then take `settled` PAST `gen` and underflow the unsigned
+  // difference below into "a clear is in flight" forever. The primary is the
+  // sole writer, so load-then-store needs no CAS.
+  uint64_t gen = g.h->l3ClearGen.load(std::memory_order_acquire);
+  if (g.h->l3ClearSettled.load(std::memory_order_acquire) < gen)
+    g.h->l3ClearSettled.fetch_add(1, std::memory_order_release);
+  return nullptr;
+}
+
+// How many clears this cluster has handed to L3 and not seen land. Readable
+// from a read-only attachment, which is the entire point of putting it here.
+static napi_value L3ClearsInFlight(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  uint64_t gen = g.h->l3ClearGen.load(std::memory_order_acquire);
+  uint64_t done = g.h->l3ClearSettled.load(std::memory_order_acquire);
+  napi_value r;
+  napi_create_double(env, gen > done ? (double)(gen - done) : 0, &r);
+  return r;
+}
+
+// The count of clears STARTED. A reader samples this before awaiting L3 and
+// compares it afterwards, so a clear that both began and settled during one
+// read is still seen -- the in-flight count alone is back to zero by then.
+static napi_value L3ClearGen(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  napi_value r;
+  napi_create_double(env, (double)g.h->l3ClearGen.load(std::memory_order_acquire), &r);
+  return r;
+}
+
 // probe(key) -> int  (index probe + memcmp only; no value copy, no decompress)
 static napi_value Probe(napi_env env, napi_callback_info info) {
   ARG(1)
@@ -1063,6 +1117,8 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("submitDestroy", SubmitDestroy) FN("submitRelease", SubmitRelease)
   FN("submitMaxValue", SubmitMaxValue)
   FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
+  FN("l3ClearBegin", L3ClearBegin) FN("l3ClearSettle", L3ClearSettle)
+  FN("l3ClearsInFlight", L3ClearsInFlight) FN("l3ClearGen", L3ClearGen)
   FN("arenaId", ArenaId) FN("detach", Detach) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("__unsafePokeArena", Poke)
   FN("__unsafeSuppressRefBit", SetSuppressRefBit) FN("__unsafeSecondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("__unsafeBackwardShift", SetBackwardShift) FN("__unsafeClearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)

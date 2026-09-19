@@ -290,6 +290,11 @@ export interface CacheStats {
     /** L3 hits discarded because this process deleted the key while the read
      *  was in flight. */
     l3DeletedWhileReading?: number;
+    /** L3 hits not promoted because a `clearAll()` -- issued by ANY process
+     *  sharing this arena, not necessarily this one -- had been handed to L3
+     *  and had not landed yet. Promoting there would put back exactly what the
+     *  clear is removing. */
+    l3ClearsInFlight?: number;
     [k: string]: unknown;
 }
 

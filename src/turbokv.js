@@ -238,6 +238,20 @@ const instances = new Set();  // live caches in THIS process, for local invalida
 // overlapping clears cannot have the first one's completion unblock reads
 // while the second is still pending. Read on every L3 fetch, so kept to one
 // integer comparison.
+//
+// IT IS NOT THE WHOLE GUARD, AND CANNOT BE. The arena is shared across
+// PROCESSES and this counter is not, so a clear issued here left every other
+// process reading L3 unguarded -- and one of them promoting the pre-clear
+// value into the shared arena undid the clear for everyone, this process
+// included (decision 70). The cross-process half lives in the arena header
+// (Header::l3ClearGen) and is read by #sharedClearsInFlight below.
+//
+// The counter STAYS ALONGSIDE it rather than being replaced, because it is
+// the only signal that exists during the window the header cannot cover: on a
+// worker the generation is opened by the primary when it applies the clear's
+// IPC batch, which is a scheduled flush away, and this process must serve
+// misses from the instant clearAll() returns, not from whenever the primary
+// gets to it. It is also all a degraded worker (no arena to read) has left.
 let l3ClearsInFlight = 0;
 
 class TurboKV {
@@ -1318,11 +1332,20 @@ class TurboKV {
         // every instance in the process would see the resurrection, not
         // only the one that happened to read it. Miss instead; that is the
         // failure mode this system is built around, a resurrected value is
-        // not. Process-wide, not per-instance: see l3ClearsInFlight.
-        if (l3ClearsInFlight > 0) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
+        // not. Process-wide, not per-instance: see l3ClearsInFlight -- and
+        // CLUSTER-wide, via the arena's clear generation, because the arena
+        // this would promote into is shared with processes whose own counter
+        // says nothing about a clear issued over here.
+        if (l3ClearsInFlight > 0 || this.#sharedClearsInFlight() > 0) {
+            this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined;
+        }
         // Marked BEFORE the await: everything appended to the invalidation ring
         // from here on happened while this read was in flight.
         const mark = storeReady && !this.#primaryDead ? native.ringHead() : -1;
+        // Sampled for the same reason and at the same moment: a clear that both
+        // begins and lands during the await leaves the in-flight count back at
+        // zero, and only the generation still shows it happened.
+        const clearMark = mark < 0 ? 0 : native.l3ClearGen();
         let rec;
         // Bounded, not merely awaited. An adapter that neither resolves nor
         // rejects would otherwise leave this promise pending forever -- and
@@ -1339,17 +1362,28 @@ class TurboKV {
         }
         if (rec === undefined || rec === null) { this.stats.l3Misses = (this.stats.l3Misses || 0) + 1; return undefined; }
         this.stats.l3Hits = (this.stats.l3Hits || 0) + 1;
-        const why = this.#promotionBlock(key, mark);
+        const why = this.#promotionBlock(key, mark, clearMark);
         if (why) {
             this.stats[why] = (this.stats[why] || 0) + 1;
-            // A delete of OUR OWN that L3 has not applied yet is the one reason
-            // that changes the answer, not merely the placement: `get` already
-            // says undefined for this key, so handing back the value the delete
-            // is on its way to removing would make the two forms disagree about
-            // this process's own state. Every other reason leaves the caller
+            // TWO of the reasons change the ANSWER, not merely the placement,
+            // and they change it for the same cause: a removal this cluster has
+            // already committed to and L3 has not applied yet.
+            //
+            // A delete of OUR OWN is the first: `get` already says undefined
+            // for this key, so handing back the value the delete is on its way
+            // to removing would make the two forms disagree about this
+            // process's own state. A clear is the second, and it is that same
+            // disagreement one step wider -- the clear emptied L1 and L2, here
+            // and in every other process, so `get` says undefined for EVERY
+            // key; a `getAsync` that answered with what L3 still holds would
+            // contradict it, and would contradict the entry guard above, which
+            // has been serving misses for those same keys since the clear was
+            // issued. "Until it lands this process serves misses" (decision 70)
+            // does not get an exception for reads that happened to start first.
+            // Every other reason leaves the caller
             // with what L3 returned -- blocking changes only what is stored
             // locally, never what this caller observes.
-            if (why === 'l3DeletedWhileReading') return undefined;
+            if (why === 'l3DeletedWhileReading' || why === 'l3ClearsInFlight') return undefined;
             return this.#decodeFromL3(rec.value);
         }
         this.#fillFromL3(key, rec, level);
@@ -1368,6 +1402,21 @@ class TurboKV {
         return this.#queue !== null && this.#queue.outstandingKind(key) === 'delete';
     }
 
+    // How many clears the CLUSTER has handed to L3 and not seen land, read
+    // from the arena header (Header::l3ClearGen). This is the half of the
+    // clear guard that crosses a process boundary; l3ClearsInFlight above is
+    // the half that covers this process before the primary has applied its
+    // clear. Zero when there is no arena to ask -- a degraded worker cannot
+    // promote into L2 at all, and its own clears are still covered by the
+    // module counter.
+    //
+    // Only ever called from the L3 read path, so a cache with no adapter never
+    // reaches the addon for it.
+    #sharedClearsInFlight() {
+        if (!storeReady || this.#primaryDead) return 0;
+        return native.l3ClearsInFlight();
+    }
+
     // Did anything invalidate THIS key while the read was in flight? Checking
     // for the key's own hash rather than "did the head move at all" matters:
     // under load the head always moves, so the conservative version would never
@@ -1379,8 +1428,11 @@ class TurboKV {
     // ring cannot rule out that it did -- `l3UnhashableKeys` is a key that can
     // never live in L1 or L2 at all, whatever the ring says, and
     // `l3DeletedWhileReading` is a prevented resurrection, the one reason that
-    // also changes the answer the caller gets (see #fetchFromL3).
-    #promotionBlock(key, mark) {
+    // also changes the answer the caller gets (see #fetchFromL3), and
+    // `l3ClearsInFlight` is a clear SOMEWHERE IN THE CLUSTER that L3 has not
+    // applied yet -- an operator seeing that number wants to know a flush is
+    // still landing, not to have it counted as per-key contention.
+    #promotionBlock(key, mark, clearMark) {
         // WHAT THIS PROCESS ITSELF STILL OWES L3, asked first and asked of the
         // queue rather than the ring.
         //
@@ -1406,6 +1458,20 @@ class TurboKV {
         // know what happened and must refuse. Refusing costs a promotion, not
         // correctness.
         if (mark < 0 || !storeReady || this.#primaryDead) return 'l3PromotionsBlocked';
+        // A CLEAR ANY PROCESS ON THIS BOX HANDED TO L3 AND L3 HAS NOT APPLIED.
+        //
+        // The ring cannot answer this one either, for the mirror-image reason
+        // the queue check above exists: a clear issued in ANOTHER process puts
+        // its flush marker on the ring when the arena is emptied, which is
+        // BEFORE the adapter has applied it -- so a read that starts after
+        // that marker sees a quiet ring, reads the value the clear is still
+        // erasing, and writes it back into the arena every process shares,
+        // with a fresh TTL. That is decision 70's guarantee being undone for
+        // the very process that issued the clear. The header's generation is
+        // the only signal that crosses a process boundary; `clearMark` catches
+        // a clear that both began and settled inside this one read, where the
+        // in-flight count has already gone back to zero.
+        if (this.#sharedClearsInFlight() > 0 || native.l3ClearGen() !== clearMark) return 'l3ClearsInFlight';
         const h = native.hashKey(key);
         // A key the arena cannot even hash -- a lone surrogate -- has no ring
         // record to compare against, and `get` already treats it as never
@@ -1797,10 +1863,13 @@ class TurboKV {
     // has(); the only difference is that this one can wait for L3.
     async hasAsync(key) {
         if (this.has(key)) return true;
-        // Process-wide, same as #fetchFromL3's guard: a sibling instance's
-        // clear in flight must block this instance's L3 reads too, since
-        // they share the arena the clear is emptying.
-        if (!this.#l3 || l3ClearsInFlight > 0) return false;
+        // Process-wide AND cluster-wide, same as #fetchFromL3's guard: a
+        // sibling instance's clear in flight must block this instance's L3
+        // reads too, since they share the arena the clear is emptying -- and
+        // so must another PROCESS's, since they share the same arena and the
+        // same L3. Answering `true` here for a key a clear is erasing is the
+        // existence-shaped form of the same resurrection.
+        if (!this.#l3 || l3ClearsInFlight > 0 || this.#sharedClearsInFlight() > 0) return false;
         // `has` already rejected a non-string key by returning false; going on
         // to L3 with it would hand the adapter something the contract does
         // not accept.
@@ -1913,10 +1982,14 @@ class TurboKV {
         // completion unblock reads while the second is still outstanding.
         // The queue never sheds a clear (src/l3/queue.js): flushing twice is
         // harmless, never flushing is not.
+        // And it has to hold for every PROCESS sharing the arena, which a
+        // module-scope counter cannot express: see l3ClearsInFlight and
+        // #openClearGen.
         if (this.#queue) {
             l3ClearsInFlight++;
+            this.#openClearGen();
             this.#lastQueued = this.#queue.push({ kind: 'clear', bytes: 0 })
-                .then((r) => { l3ClearsInFlight--; return r; });
+                .then((r) => { l3ClearsInFlight--; this.#settleClearGen(); return r; });
         }
         if (this.#id === 0) {
             native.clearAll(0);
@@ -1931,6 +2004,51 @@ class TurboKV {
         this.#outbox.push('c', '', null, 0);
         this.#schedule(48);
     }
+
+    // Open this clear's generation in the ARENA HEADER, so that every OTHER
+    // process serves L3 misses until it lands -- not only this one. The
+    // counter this sits beside is module-scope, and the arena is not.
+    //
+    // ONLY THE PRIMARY MAY WRITE THE HEADER. A worker maps the arena
+    // PROT_READ, and a store through that mapping is a SIGBUS the process
+    // cannot catch, not an exception it can handle -- so a worker's
+    // generation travels the way its clearAll already does, as an op in the
+    // IPC batch the primary applies, and the header therefore lags a worker
+    // by one flush. That lag is exactly why l3ClearsInFlight stays: it covers
+    // THIS process for that window. No other process can be harmed during it
+    // either, because the clear the primary has not applied yet has not
+    // emptied L2 yet -- anything promoted before it lands is wiped by it, and
+    // anything promoted after it sees the generation already open.
+    //
+    // A separate op rather than a flag on 'c': a clearAll with no adapter owes
+    // L3 nothing and must keep behaving exactly as it did.
+    #openClearGen() {
+        if (this.#id === 0) { TurboKV.#l3ClearBegin(); return; }
+        this.#outbox.push('+', '', null, 0);
+        this.#schedule(48);
+    }
+
+    // Close it again. Flushed immediately rather than batched: until this
+    // reaches the primary EVERY process in the cluster is serving L3 misses,
+    // and a worker that has just flushed its cache may have nothing else to
+    // say for a long time. Reached after close() too -- a clear retries
+    // indefinitely, but close() stops the retry loop and the queue settles
+    // the op (see #closeL3), which is what keeps a clear that never lands
+    // from arming this guard for the life of the arena.
+    #settleClearGen() {
+        if (this.#id === 0) { TurboKV.#l3ClearSettle(); return; }
+        this.#outbox.push('-', '', null, 0);
+        this.flush();
+    }
+
+    // The header writes themselves, on the primary. Wrapped because both are
+    // reached from places where the arena may already be gone -- close() tears
+    // it down before the L3 half of shutdown settles a clear that outlived it,
+    // and applyBatch is a public entry point a non-primary could call. A
+    // settle into an arena that no longer exists is a no-op, not an error
+    // worth throwing out of a promise chain nobody awaits.
+    static #l3ClearBegin() { try { native.l3ClearBegin(); } catch { /* no arena to guard */ } }
+    static #l3ClearSettle() { try { native.l3ClearSettle(); } catch { /* no arena to guard */ } }
 
     // clearAll(), then L3. Identical effects to clearAll(); the only
     // difference is that this one can wait for L3 (and, unlike a set or a
@@ -2285,6 +2403,14 @@ class TurboKV {
             if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3]); TurboKV.#localDrop(key); }
             else if (op === 'd') { native.del(key, msg.id); TurboKV.#localDrop(key); }
             else if (op === 'c') { native.clearAll(msg.id); for (const c of instances) c.clearLocal(); }
+            // The two halves of a WORKER's L3 clear generation. The worker
+            // cannot write the header itself (PROT_READ; a store there is a
+            // SIGBUS), so it says so here and the primary -- the arena's sole
+            // writer -- does it. '+' arrives in the same batch as the 'c' it
+            // belongs to and immediately before it; '-' arrives once that
+            // worker's adapter has actually applied the clear.
+            else if (op === '+') TurboKV.#l3ClearBegin();
+            else if (op === '-') TurboKV.#l3ClearSettle();
         }
     }
 
