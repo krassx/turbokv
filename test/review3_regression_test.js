@@ -268,8 +268,15 @@ if (process.env.TCR3_ROLE === 'lostcap') {
     (async () => {
         const f = makeFake();
         f.fail.set('set', new Error('l3 down'));
+        // A QUEUE THAT SHEDS EVERYTHING, so the L3 write is abandoned in a
+        // microtask -- before the ring doorbell has even fired, let alone been
+        // drained. The cap's ring mark is therefore taken BEFORE the record
+        // for this worker's own write exists, which is what makes the "skip my
+        // own writer id" half of the retirement oracle load-bearing: without
+        // it the worker's own write looks like somebody else's rewrite and
+        // suppresses the verdict on every cap it ever takes.
         const w = TurboKV.attachWorker(process.env.TCR3_ARENA, 1,
-            { storage: 'bytes', l3: f.adapter, l3RetryMs: 10, l3FailTtlMs: 100 });
+            { storage: 'bytes', l3: f.adapter, l3QueueMaxBytes: 1, l3FailTtlMs: 100 });
         ok(w.transport === 'shm', `the worker is on the shm transport (${w.transport})`);
         ok(await w.setAsync('lost', 'REFUSED') === false, 'the L3 write failed');
         // The parent drains the ring on the doorbell, so the WRITE lands --
@@ -286,7 +293,84 @@ if (process.env.TCR3_ROLE === 'lostcap') {
            `the silence is counted, not silent (${w.stats.l3FailTtlUnapplied})`);
         ok((w.stats.l3FailTtlUnapplied || 0) === 1,
            `and counted once (${w.stats.l3FailTtlUnapplied})`);
+        ok((w.stats.l3FailTtlUnconfirmed || 0) === 0,
+           `in the bucket that means PROVEN, not the unknowable one (${w.stats.l3FailTtlUnconfirmed})`);
         done(w, 'lost-cap');
+    })();
+    return;
+}
+
+// ------ the lost-cap counter must not fire on a CROSS-PROCESS rewrite ----
+// The retirement check infers "never applied" from the capped bytes still
+// being resident and unbounded. That inference is not sufficient on its own:
+// the primary can APPLY the cap, the entry can then expire, and another
+// process can write byte-identical bytes with no TTL -- at which point the
+// bytes look lost again and the counter fires about a fresh, L3-agreed write.
+// A same-process rewrite cannot do this (#cancelCaps drops the guard), so the
+// false positive is exactly cross-process: in the cluster the counter is for.
+//
+// The invalidation ring is the oracle, asked the question it already answers
+// for the promotion guard -- did anyone ELSE write this key since -- with our
+// own records skipped by writer id, because the write being capped is one of
+// them.
+if (process.env.TCR3_ROLE === 'rewrite') {
+    (async () => {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const w = TurboKV.attachWorker(process.env.TCR3_ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 10, l3FailTtlMs: 120 });
+        ok(await w.setAsync('rw', 'SAME') === false, 'the L3 write failed');
+        // The parent DOES route, so the cap really lands. Proven, not assumed.
+        let rem = 0;
+        for (let i = 0; i < 120 && rem <= 0; i++) {
+            await sleep(20); w.get('poke');
+            if (native.get('rw') !== undefined) rem = native.lastTtlRemainingMs();
+        }
+        ok(rem > 0 && rem <= 120, `the primary applied the cap (ttlRemaining ${rem})`);
+        // Now ANOTHER PROCESS writes the same bytes, unbounded, inside the
+        // guard's window -- so at retirement the bytes look resident and
+        // unbounded exactly as an unapplied cap would.
+        process.send({ step: 'rewrite' }); await step('rewritten');
+        for (let i = 0; i < 80 && native.get('rw') !== 'SAME'; i++) { await sleep(20); w.get('poke'); }
+        ok(native.get('rw') === 'SAME', `the rewrite is in the arena (${native.get('rw')})`);
+        ok(native.lastTtlRemainingMs() === 0,
+           `with no expiry, which is what the byte test alone would call lost (${native.lastTtlRemainingMs()})`);
+        // Well past deadline + L3_CAP_WINDOW_MS.
+        await sleep(2400);
+        ok((w.stats.l3FailTtlUnapplied || 0) === 0,
+           `the cap that DID land is not reported as lost (${w.stats.l3FailTtlUnapplied})`);
+        ok((w.stats.l3FailTtlUnconfirmed || 0) === 0,
+           `nor as unknowable (${w.stats.l3FailTtlUnconfirmed})`);
+        ok((w.stats.l3FailTtlApplied || 0) >= 1, 'while the applied counter still moved');
+        done(w, 'cross-process-rewrite');
+    })();
+    return;
+}
+
+// -- a guard that cannot be kept is counted, not dropped in silence -------
+// #noteCap declines past L3_CAP_MAX while #retimeOutbox still sends, so
+// without an entry nothing can ever judge those requests. A sustained outage
+// against a hand-wired primary therefore under-counted from the 4097th
+// outstanding cap onward -- the scale at which the number matters most.
+if (process.env.TCR3_ROLE === 'capmax') {
+    (async () => {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const w = TurboKV.attachWorker(process.env.TCR3_ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 5, l3FailTtlMs: 600000 });
+        const N = 4200;                                  // past the 4096 bound
+        for (let i = 0; i < N; i++) w.set('m' + i, 'V');
+        await w.drainL3();
+        await sleep(200);
+        const st = w.__unsafeCapState();
+        ok(st.caps === 4096, `the guard map is bounded (${st.caps})`);
+        ok((w.stats.l3FailTtlApplied || 0) >= N, `every failed write capped L1 (${w.stats.l3FailTtlApplied})`);
+        ok((w.stats.l3FailTtlUnconfirmed || 0) === N - 4096,
+           `and every guard that could not be kept is counted, ONCE ` +
+           `(${w.stats.l3FailTtlUnconfirmed} of ${N - 4096})`);
+        ok((w.stats.l3FailTtlUnapplied || 0) === 0,
+           `in the unknowable bucket, not the proven one (${w.stats.l3FailTtlUnapplied})`);
+        done(w, 'cap-max');
     })();
     return;
 }
@@ -545,6 +629,18 @@ const drainAll = () => { let g = 0; while (TurboKV.drainSubmissions(8192) > 0 &&
     {
         const code = await runChild('lostcap', ARENA + '6', {}, () => {}, undefined, false);
         ok(code === 0, `the lost-cap cases passed (child exited ${code})`);
+    }
+    {
+        const code = await runChild('rewrite', ARENA + '7', {}, (s, p, state, kid) => {
+            // The PRIMARY is the other process here: it writes the same bytes
+            // with no TTL, straight into the arena, inside the cap's window.
+            if (s === 'rewrite') { p.set('rw', 'SAME'); kid.send({ step: 'rewritten' }); }
+        });
+        ok(code === 0, `the cross-process-rewrite cases passed (child exited ${code})`);
+    }
+    {
+        const code = await runChild('capmax', ARENA + '8', {}, () => {}, undefined, false);
+        ok(code === 0, `the cap-max cases passed (child exited ${code})`);
     }
     {
         const code = await runChild('oldrecord', ARENA + '5', {}, (s, p, state, kid) => {

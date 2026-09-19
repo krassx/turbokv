@@ -356,19 +356,37 @@ export interface CacheStats {
      *  the L1 half alone, which always succeeds. Read it together with
      *  `l3FailTtlUnapplied`, which is the other side of the same event. */
     l3FailTtlApplied?: number;
-    /** The L2 half of a cap that never landed. Four ways, counted once each:
-     *  there was no arena to write (a degraded worker); the batch carrying a
-     *  worker's request was shed by a congested IPC channel; the channel was
-     *  gone or refused it; or the request was sent and the arena still held
-     *  the capped value, unbounded, when the guard's window closed — which is
-     *  what a primary that never calls {@link TurboKV.applyBatch} produces.
+    /** The L2 half of a cap that was PROVEN not to land, counted once each.
+     *  Either nothing was ever handed over — no arena to write (a degraded
+     *  worker), the batch shed by a congested IPC channel, the channel gone
+     *  or refusing it — or it was handed over and, when the read guard's
+     *  window closed, the arena still held exactly the capped bytes with no
+     *  expiry *and* the invalidation ring showed that nobody else had written
+     *  the key since. That last case is what a primary which never calls
+     *  {@link TurboKV.applyBatch} produces.
      *
      *  NOT a cap the primary REFUSED: one for a value something newer
      *  superseded, or whose entry already expires sooner, has nothing left to
-     *  bound and is not counted. Every count here means a value L3 rejected
-     *  is resident in the shared arena with no expiry, visible to every
-     *  process on the box. */
+     *  bound. NOT a cap whose outcome is merely unknown either — that is
+     *  `l3FailTtlUnconfirmed`, and keeping the two apart is the point.
+     *
+     *  So every count here means a value L3 rejected is resident in the
+     *  shared arena with no expiry, visible to every process on the box. It
+     *  is a LOWER bound, never an inflated one: where the answer cannot be
+     *  established the count goes to `l3FailTtlUnconfirmed` instead. */
     l3FailTtlUnapplied?: number;
+    /** Caps that were handed to the primary and whose outcome this process
+     *  can no longer establish, counted once each. Three ways: the worker
+     *  degraded or closed before the read guard's window ran out; the
+     *  invalidation ring had lapped past the cap's mark, so it cannot say
+     *  whether anybody rewrote the key; or no guard entry could be kept at
+     *  all, because more than 4096 caps were outstanding.
+     *
+     *  Each of these may have landed perfectly. It is counted because "this
+     *  process stopped being able to tell" is itself worth seeing — a rising
+     *  number here during an L3 outage means `l3FailTtlUnapplied` is
+     *  under-reporting, not that the box is healthy. */
+    l3FailTtlUnconfirmed?: number;
     /** L3 hits returned to the caller but not promoted, because SOMEONE ELSE
      *  changed the key while the read was in flight, or the ring could not
      *  rule out that they did. Ordinary contention, not an error. Does NOT

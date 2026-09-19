@@ -34,6 +34,14 @@
 // value and asserts the arena never saw it -- with the primary's own
 // promotion as a non-vacuity control, so "nothing reached L2" cannot pass by
 // promotion being broken. Neither test is sufficient alone; both are cheap.
+//
+// The comment stripping below has the same shape of limit, and the same
+// answer. It handles a line that IS a comment (`^\s*//`) -- which is the
+// vacuity that actually bit, a guard deleted while the prose above it still
+// named the thing it checked for. A trailing `//` comment on a line of code,
+// or a `/* ... */` block, still fools it. Chasing that generally means parsing
+// JavaScript, which is not what this file is for; the behavioural test is the
+// real guard and this one is the tripwire.
 const fs = require('fs');
 const path = require('path');
 

@@ -2132,14 +2132,11 @@ class TurboKV {
             const deadline = monoMs() + cap;
             if (!e.exp || e.exp > deadline) { e.exp = deadline; applied = true; }
         }
-        const l2 = this.#capL2AfterL3Failure(key, enc, cap);
-        if (l2 === 'capped') applied = true;
-        // 'moot' is not a failure: the arena no longer holds the value this
-        // cap was taken against, or already expires it sooner, so there is
-        // nothing left to bound. Only 'unable' -- no arena to write, no
-        // primary to ask -- leaves the box possibly disagreeing with L3 for
-        // longer than l3FailTtlMs, which is what this counter is for.
-        else if (l2 === 'unable') this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + 1;
+        // 'capped' / 'moot' / 'unable' -- informational here. The failure
+        // buckets are counted where the failure is known (see #countCapLost);
+        // 'moot' is not a failure at all, because the arena no longer holds
+        // the value this cap was taken against.
+        if (this.#capL2AfterL3Failure(key, enc, cap) === 'capped') applied = true;
         if (applied) this.stats.l3FailTtlApplied = (this.stats.l3FailTtlApplied || 0) + 1;
     }
 
@@ -2161,14 +2158,29 @@ class TurboKV {
         // bounded drain. Arming a timer then is low harm -- it is unref'd and
         // it terminates itself on the first tick, because a closed cache has no
         // arena -- but a closed cache should own no timer at all.
-        if (this.#closePromise !== null) return;
-        if (this.#l3Caps.size >= L3_CAP_MAX) return;
+        // A GUARD IT CANNOT KEEP IS COUNTED, not dropped in silence. The
+        // request goes out either way (#retimeOutbox is called next), and
+        // without an entry nothing can ever judge whether it landed -- so a
+        // sustained outage against a hand-wired primary under-counted from the
+        // 4097th outstanding cap onward, which is precisely the scale at which
+        // the number matters.
+        if (this.#closePromise !== null || this.#l3Caps.size >= L3_CAP_MAX) {
+            this.#countCapLost('l3FailTtlUnconfirmed');
+            return;
+        }
+        // WHERE THE INVALIDATION RING WAS. At retirement this is what tells a
+        // cap that was never applied apart from one that was applied and then
+        // had the same bytes written over it by somebody else -- see
+        // #judgeRetiredCaps. -1 when there is no ring to read, which makes the
+        // verdict `unconfirmed` rather than a guess.
+        let at = -1;
+        if (storeReady && !this.#primaryDead) { try { at = native.ringHead(); } catch { at = -1; } }
         const now = monoMs();
         // Retired one window PAST the deadline, which is the only stretch in
         // which the guard can bite: before it the capped L1 entry answers, and
         // by the end of it the primary has either applied the cap it was sent
         // or is not coming back.
-        this.#l3Caps.set(key, { enc, cap, deadline: now + cap, until: now + cap + L3_CAP_WINDOW_MS });
+        this.#l3Caps.set(key, { enc, cap, at, deadline: now + cap, until: now + cap + L3_CAP_WINDOW_MS });
         if (this.#capTimer !== null) return;
         this.#capTimer = setInterval(() => this.#runCaps(), L3_CAP_POLL_MS);
         if (this.#capTimer.unref) this.#capTimer.unref();
@@ -2179,33 +2191,54 @@ class TurboKV {
         clearInterval(this.#capTimer); this.#capTimer = null;
     }
 
-    // THE ONE PLACE A LOST CAP BECOMES A NUMBER, and once per cap.
+    // THE ONE PLACE A LOST CAP BECOMES A NUMBER -- literally one, so the claim
+    // can be checked rather than believed -- and once per cap.
     //
     // `l3FailTtlApplied` counts the failed write whose LOCAL copy was capped,
     // which on a worker is L1 -- so it moves whether or not the L2 half ever
     // lands, and on its own it reads as success. The silence on the other side
     // is the dangerous half: the value L3 refused sits in the SHARED arena
-    // with no expiry, box-wide, for every process, forever. It has to have a
-    // counter, and `l3FailTtlUnapplied` is it.
+    // with no expiry, box-wide, for every process, forever.
     //
-    // Reached from three kinds of place and deduplicated through the guard
-    // entry, so a cap the outbox dropped is not counted again when its guard
-    // retires: flush(), when the batch carrying the request is shed or the
-    // channel refuses it; and #runCaps, when the guard's window closes with
-    // the capped value still resident and still unbounded -- which is the only
-    // way to see a request that WAS sent and simply never applied, the case a
-    // consumer routing IPC by hand and forgetting applyBatch produces.
+    // TWO BUCKETS, because they answer different questions and folding them
+    // together is what made the first version of this counter claim a
+    // precision it did not have:
     //
-    // A cap with no guard entry (one recorded past L3_CAP_MAX, or on a closed
-    // cache) is counted unconditionally: there is nothing to deduplicate
-    // against, and under-reporting a divergence is the wrong direction.
-    #capUnapplied(key) {
+    //   l3FailTtlUnapplied  -- PROVEN not applied. Nothing was ever handed
+    //     over, or it was handed over and the arena still holds exactly the
+    //     capped bytes, unbounded, and the invalidation ring says nobody else
+    //     wrote the key since. Every one of these is a real divergence.
+    //   l3FailTtlUnconfirmed -- handed over, outcome UNKNOWABLE from here.
+    //     The worker degraded or closed before the window ran out; the ring
+    //     had lapped past the mark so it cannot say whether anyone wrote the
+    //     key; or no guard entry could be kept at all (past L3_CAP_MAX). It
+    //     may have landed perfectly. It is counted because "we stopped being
+    //     able to tell" is itself something an operator needs to see, and
+    //     because putting it in the other bucket would make that bucket lie.
+    //
+    // A cap that is MOOT -- superseded by a newer write, or wiped by a clear
+    // -- is in neither: there is nothing left to bound. Those sites say so.
+    #countCapLost(bucket) {
+        this.stats[bucket] = (this.stats[bucket] || 0) + 1;
+    }
+    // Deduplicated through the guard entry, and REQUIRING one: a cap whose
+    // guard is already gone has either been judged at retirement or was never
+    // recorded (in which case #noteCap counted it as unconfirmed on the spot).
+    // Counting it again here is what let a `process.send` callback erroring
+    // after the window double-count a cap the retirement check had settled.
+    #capLost(key, bucket) {
         const c = this.#l3Caps.get(key);
-        if (c !== undefined) {
-            if (c.counted) return;
-            c.counted = true;
-        }
-        this.stats.l3FailTtlUnapplied = (this.stats.l3FailTtlUnapplied || 0) + 1;
+        if (c === undefined || c.counted) return;
+        c.counted = true;
+        this.#countCapLost(bucket);
+    }
+    #capUnapplied(key) { this.#capLost(key, 'l3FailTtlUnapplied'); }
+    // By entry rather than by key, for the wholesale drops (degrade, close)
+    // that are walking the map already.
+    #capEntryUnconfirmed(c) {
+        if (c.counted) return;
+        c.counted = true;
+        this.#countCapLost('l3FailTtlUnconfirmed');
     }
 
     // One pass over the outstanding read-guard entries: retire the ones whose
@@ -2217,35 +2250,108 @@ class TurboKV {
     // primary applies now (see #capArena), so there is nothing to retry and no
     // arena work here at all -- only a timestamp compare.
     #runCaps() {
-        if (!storeReady || this.#primaryDead) { this.#l3Caps.clear(); this.#stopCapTimer(); return; }
+        // THE ARENA IS GONE, so nothing here can ever be judged. Every guard
+        // still outstanding was a request that was sent and whose fate this
+        // worker will now never learn -- which is what `unconfirmed` means.
+        if (!storeReady || this.#primaryDead) {
+            for (const c of this.#l3Caps.values()) this.#capEntryUnconfirmed(c);
+            this.#l3Caps.clear(); this.#stopCapTimer(); return;
+        }
         const now = monoMs();
+        let retiring = null;
         for (const [key, c] of this.#l3Caps) {
-            if (now < c.until) continue;
-            // RETIRING IS ALSO THE ONE MOMENT THIS WORKER CAN TELL WHETHER THE
-            // CAP EVER LANDED, and it costs one arena read per cap, once --
-            // not per tick, which is what the old poll did and why it needed a
-            // budget. By now the primary has either applied the request or is
-            // not going to: an entry still holding exactly the bytes the cap
-            // named, still with no deadline, is the divergence this counter
-            // exists to name. That covers the case nothing else can see -- a
-            // request that was SENT and silently never applied, which is what
-            // a consumer routing the doorbell but not the cache messages
-            // produces (see applyBatch).
-            //
-            // A false positive is possible and is the right direction: if
-            // someone re-wrote the same bytes with no TTL after the cap
-            // landed, this counts -- and the box really is holding that value
-            // unbounded, which is what an operator watching this number wants
-            // to know.
-            if (!c.counted) {
-                let cur;
-                try { cur = native.get(key); } catch { cur = undefined; }
-                if (cur !== undefined && sameStored(cur, c.enc) && native.lastTtlRemainingMs() === 0)
-                    this.#capUnapplied(key);
-            }
-            this.#l3Caps.delete(key);
+            if (now >= c.until) (retiring || (retiring = [])).push([key, c]);
+        }
+        if (retiring !== null) {
+            this.#judgeRetiredCaps(retiring);
+            for (const [key] of retiring) this.#l3Caps.delete(key);
         }
         if (this.#l3Caps.size === 0) this.#stopCapTimer();
+    }
+
+    // DID THESE CAPS EVER LAND? Asked once, when the guard's window closes and
+    // the primary has either applied the request or is not going to.
+    //
+    // The cheap half first, and it settles almost everything: a key the arena
+    // no longer holds, or holds with different bytes, or holds with a
+    // deadline, is a cap that landed or was superseded. Only bytes that are
+    // still exactly ours AND still unbounded are suspect.
+    //
+    // THE BYTES ALONE ARE NOT PROOF, though, and that is what the first
+    // version of this check got wrong. The primary can apply the cap, the
+    // entry can then expire or be evicted, and ANOTHER PROCESS can write
+    // byte-identical bytes with no TTL -- at which point the suspect test says
+    // "never applied" about a fresh, L3-agreed write. A same-process rewrite
+    // cannot do this (#cancelCaps drops the guard), so the false positive was
+    // exactly cross-process: in the cluster this counter exists for.
+    //
+    // So ask the invalidation ring the question it is for -- *did anyone else
+    // write this key since I took the cap* -- which is the same question
+    // #promotionBlock asks it. A record from ANOTHER writer at or past the
+    // mark means somebody rewrote the key, so nothing is lost. OUR OWN
+    // records are skipped by writer id, because the write being capped is
+    // itself one of them and would otherwise suppress every verdict.
+    //
+    // ONE ring pass for the whole retiring batch, from the OLDEST mark, so a
+    // burst of 4096 retiring caps costs one walk rather than 4096. The hash
+    // set that produces covers a slightly WIDER span than any single cap's
+    // mark, so a record that predates a given cap can suppress it: that
+    // direction under-counts, never over-counts, which is the direction this
+    // counter has to err in.
+    #judgeRetiredCaps(retiring) {
+        const suspect = [];
+        for (const [key, c] of retiring) {
+            if (c.counted) continue;
+            let cur;
+            try { cur = native.get(key); } catch { cur = undefined; }
+            if (cur === undefined || !sameStored(cur, c.enc)) continue;
+            let rem = 0;
+            try { rem = native.lastTtlRemainingMs(); } catch { continue; }
+            if (rem !== 0) continue;                       // capped, or bounded by something
+            suspect.push([key, c]);
+        }
+        if (suspect.length === 0) return;
+        let from = -1;
+        for (const [, c] of suspect) if (c.at >= 0 && (from < 0 || c.at < from)) from = c.at;
+        const touched = from < 0 ? null : this.#ringWritersSince(from);
+        for (const [key, c] of suspect) {
+            // No mark, or a ring that has lapped past it: the question cannot
+            // be answered from here.
+            if (touched === null || c.at < 0) { this.#capEntryUnconfirmed(c); continue; }
+            if (touched.all) continue;                     // a clear: everything changed
+            let h;
+            try { h = native.hashKey(key); } catch { h = undefined; }
+            if (h === undefined) { this.#capEntryUnconfirmed(c); continue; }
+            if (touched.set.has(h)) continue;              // somebody wrote it; not lost
+            this.#capUnapplied(key);
+        }
+    }
+
+    // Hashes written by SOMEONE OTHER THAN THIS HANDLE at or past `from`, or
+    // null when the ring cannot say (lapped, or detached mid-walk).
+    //
+    // Our own writer id is what the primary stamps on the records it applies
+    // from our submissions: the ring slot plus one for the shared-memory
+    // transport, our writer id for the IPC batch. The primary's own writes are
+    // 0, so a cap the primary applied -- and a rewrite by the primary -- both
+    // count as somebody else, which is correct.
+    #ringWritersSince(from) {
+        const mine = this.#ringIdx >= 0 ? this.#ringIdx + 1 : this.#id;
+        const set = new Set();
+        let cursor = from, all = false;
+        for (;;) {
+            let r;
+            try { r = native.ringRead(cursor, 1024); } catch { return null; }
+            if (!r || r.wrapped) return null;
+            for (let i = 0; i < r.hashes.length; i++) {
+                if (r.hashes[i] === 'ffffffffffffffff') { all = true; continue; }
+                if (r.writers[i] === mine) continue;       // the write being capped is ours
+                set.add(r.hashes[i]);
+            }
+            if (r.head <= cursor || r.head >= r.ringHead) break;
+            cursor = r.head;
+        }
+        return { set, all };
     }
 
     // Is the arena's copy of `key` one this worker has already asked to be
@@ -2277,7 +2383,13 @@ class TurboKV {
     // -- which writes the arena synchronously -- compares and writes with
     // nothing in between. See #capArena and applyBatch's 'r'.
     #capL2AfterL3Failure(key, enc, cap) {
-        if (!storeReady || this.#primaryDead) return 'unable';
+        // Counted HERE rather than by the caller, so that #countCapLost really
+        // is the only site that touches these numbers -- "one counting site"
+        // was not true while the caller incremented on 'unable' as well.
+        if (!storeReady || this.#primaryDead) {
+            this.#countCapLost('l3FailTtlUnapplied');      // no arena: certainly not applied
+            return 'unable';
+        }
         // Our own delete is on its way to the arena. There is nothing left to
         // re-time and rewriting the value would resurrect it.
         if (this.#pendingDel.size && this.#pendingDel.has(key)) return 'moot';
@@ -2294,7 +2406,9 @@ class TurboKV {
         // not the request reaches the primary: until the cap lands, this
         // worker must stop serving the uncapped L2 copy at the deadline.
         this.#noteCap(key, enc, cap);
-        return this.#retimeOutbox(key, enc, cap) ? 'capped' : 'unable';
+        if (this.#retimeOutbox(key, enc, cap)) return 'capped';
+        this.#capUnapplied(key);
+        return 'unable';
     }
 
     // THE CONDITIONAL RE-TIME, and the only place a cap is ever written.
@@ -2778,6 +2892,11 @@ class TurboKV {
         // a recorded removal has nothing left to protect, and a cap has no
         // entry to re-time. Contrast the wrapped-ring branch in #drain, which
         // looks identical and must not do this.
+        //
+        // The caps are dropped WITHOUT COUNTING, deliberately: a cap whose key
+        // the clear has removed is MOOT, not lost. There is nothing left in
+        // L2 to bound, so neither failure bucket applies. Same for a cap a
+        // newer write supersedes -- see #cancelCap.
         this.#pendingDel.clear(); this.#pendingDelHash.clear(); this.#deletedAt.clear();
         this.#l3Caps.clear(); this.#stopCapTimer();
     }
@@ -3165,6 +3284,13 @@ class TurboKV {
         if (this.#timer) { clearInterval(this.#timer); this.#timer = null; }
         // Unref'd already, so it was never holding the process open -- but a
         // closed cache must not go on poking the arena it has released either.
+        //
+        // COUNTED ON THE WAY OUT. Each of these is a cap request that was sent
+        // and whose window this handle will not be around to close, so nothing
+        // will ever judge it. That is `unconfirmed`, not silence -- a process
+        // shutting down mid-outage is exactly when an operator wants to know
+        // how much was left hanging.
+        for (const c of this.#l3Caps.values()) this.#capEntryUnconfirmed(c);
         this.#l3Caps.clear(); this.#stopCapTimer();
         instances.delete(this);
         if (instances.size === 0 && TurboKV.#recoverTimer) {
@@ -3653,6 +3779,11 @@ class TurboKV {
     static #cancelAllCaps() {
         for (const c of instances) c.#cancelOwnCaps();
     }
+    // NEITHER OF THESE COUNTS. A cap superseded by a newer published value,
+    // or wiped by a clear, is moot: the bytes it was bounding are not what
+    // anyone will read, so there is no divergence to report. Counting here
+    // would put ordinary write traffic into a number that is supposed to mean
+    // "this box is holding something L3 rejected, unbounded".
     #cancelOwnCaps() { if (this.#l3Caps.size) { this.#l3Caps.clear(); this.#stopCapTimer(); } }
     #cancelCap(fullKey) { if (this.#l3Caps.size) this.#l3Caps.delete(fullKey); }
 
