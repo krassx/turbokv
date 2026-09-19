@@ -372,15 +372,23 @@ export declare class TurboKV<T = unknown> {
      *  the primary. `install()` does exactly this for you. */
     static applyBatch(m: unknown): void;
 
-    /** Tell the primary that the worker writing under `id` is gone, so any L3
-     *  `clear` it had in flight is settled rather than left blocking L3 reads
-     *  in every process for the life of the arena. Returns how many were
-     *  settled, and is idempotent.
+    /** Tell the primary that a worker is gone, so any L3 `clear` it had in
+     *  flight is settled rather than left blocking L3 reads in every process
+     *  for the life of the arena. Returns how many were settled, and is
+     *  idempotent.
+     *
+     *  Pass a cache message from that worker -- any one of them, so keep the
+     *  last one you routed. A worker is identified by its ATTACHMENT, not by
+     *  its writer id: ids are yours to choose and are normally reused across
+     *  restarts, so releasing by one would settle whatever worker holds that
+     *  slot now, which may be a live successor with a clear of its own in
+     *  flight. A bare id is accepted but names only a sender that never
+     *  identified itself, such as a hand-built batch.
      *
      *  `install()` calls this on a worker's `'exit'` and `'disconnect'`. Call
      *  it yourself only if you route cluster messages yourself, the way
      *  {@link applyBatch} is called -- the two are a pair. */
-    static releaseWorker(id: number): number;
+    static releaseWorker(who: unknown): number;
 
     /** Undefined when no arena is attached (before open, or after close). */
     static arenaStats(): ArenaStats | undefined;

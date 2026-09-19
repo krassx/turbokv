@@ -20,9 +20,13 @@
 //
 // Both are exercised here against a real cluster, with the primary's own L3
 // reads as the end-to-end evidence: blocked while the generation is open,
-// working again once it is settled. The third case is the lever the `-` op
-// creates -- a worker could previously only WIPE the cluster's cache; it must
-// not be able to disarm someone else's clear.
+// working again once it is settled. Three more cases guard the machinery
+// itself: the `-` op is a lever that disarms a CLUSTER-WIDE guard, so a worker
+// must not be able to pull it for someone else; RECONCILIATION is the same
+// lever held by the primary, so a dead worker's reconciliation must not settle
+// the clear of a live successor that reuses its writer id; and the congestion
+// that could strand a `-` could also strand the `c` it belongs to, which loses
+// the clearAll itself while its bookkeeping reports success.
 const cluster = require('cluster');
 const { TurboKV, MSG } = require('../src/turbokv');
 const native = require('../src/native');
@@ -37,8 +41,9 @@ if (!cluster.isPrimary) {
     // the worker is killed. `stall`: one that lands on cue, so its `-` is
     // pushed at a moment we choose -- while the channel is congested.
     let releaseClear = null;
-    const clearImpl = process.env.TC_CASE === 'kill'
-        ? () => new Promise(() => {})
+    const HELD_OPEN = ['kill', 'recycle', 'shedclear'];
+    const clearImpl = HELD_OPEN.includes(process.env.TC_CASE)
+        ? () => new Promise(() => {})           // never lands: the generation stays open
         : () => new Promise((r) => { releaseClear = r; });
     const adapter = {
         async get() { return undefined; },
@@ -48,26 +53,51 @@ if (!cluster.isPrimary) {
     const opts = { storage: 'bytes', transport: 'ipc', l3: adapter };
     // Tiny window and tiny outbox, as in backpressure_test.js: a modest burst
     // then reaches the state that needs both to be full.
-    if (process.env.TC_CASE === 'stall') { opts.maxInFlightBytes = 1024; opts.outboxMaxBytes = 2048; }
-    const c = TurboKV.attachWorker(ARENA, cluster.worker.id, opts);
+    if (process.env.TC_CASE === 'stall' || process.env.TC_CASE === 'shedclear') {
+        opts.maxInFlightBytes = 1024; opts.outboxMaxBytes = 2048;
+    }
+    // The writer id is the CALLER's to choose, and a stable per-slot index out
+    // of the environment is the ordinary way to do it -- which is exactly how
+    // two different worker processes come to share one id.
+    const id = process.env.TC_ID ? Number(process.env.TC_ID) : cluster.worker.id;
+    const c = TurboKV.attachWorker(ARENA, id, opts);
     process.on('message', (m) => { if (m && m.t === 'bye') process.exit(0); });
 
+    // CONGEST THE CHANNEL, precisely rather than statistically. The bytes
+    // reserved for a batch are returned by process.send's CALLBACK, so a send
+    // whose callback never runs leaves the window full for as long as we like
+    // -- which is what a congested channel really is.
+    const realSend = process.send.bind(process);
+    const held = [];
+    const congest = () => { process.send = (msg, cb) => { held.push(cb); return true; }; };
+    const relieve = () => {
+        process.send = realSend;
+        for (const cb of held) if (typeof cb === 'function') cb(null);
+    };
+    let n = 0;
+    const burst = () => { for (let i = 0; i < 600; i++) c.set('k' + (n++), 'V'.repeat(64)); c.flush(); };
+
     (async () => {
+        // The clear that is SHED rather than stalled: this worker congests the
+        // channel FIRST, so the clearAll itself lands in a batch that is shed.
+        if (process.env.TC_CASE === 'shedclear') {
+            congest();
+            burst(); burst(); burst();          // window full, outbox over its cap: shedding
+            c.clearAll();                       // `c` and `+` pushed into that state
+            burst(); burst();                   // ... and shed with the next batch
+            relieve();
+            c.flush();                          // one ordinary flush, no new writes
+            await sleep(50);
+            process.send({ t: 'shed', shed: c.stats.writesShed || 0 });
+            return;
+        }
+
         c.clearAll();
         await sleep(150);                       // the primary has applied the `+` by now
         process.send({ t: 'armed' });
         if (process.env.TC_CASE !== 'stall') return;
 
-        // CONGEST THE CHANNEL, precisely rather than statistically. The bytes
-        // reserved for a batch are returned by process.send's CALLBACK, so a
-        // send whose callback never runs leaves the window full for as long as
-        // we like -- which is what a congested channel really is.
-        const realSend = process.send.bind(process);
-        const held = [];
-        process.send = (msg, cb) => { held.push(cb); return true; };
-
-        let n = 0;
-        const burst = () => { for (let i = 0; i < 600; i++) c.set('k' + (n++), 'V'.repeat(64)); c.flush(); };
+        congest();
         burst(); burst(); burst();              // window full, outbox over its cap: shedding
 
         releaseClear();                         // the L3 clear lands: `-` is pushed HERE
@@ -78,8 +108,7 @@ if (!cluster.isPrimary) {
         // Nothing is written after this point, deliberately -- the `-` has to
         // leave on its own, with no traffic to carry it.
         await sleep(20);
-        process.send = realSend;
-        for (const cb of held) if (typeof cb === 'function') cb(null);
+        relieve();
         process.send({ t: 'shed', shed: c.stats.writesShed || 0 });
     })();
     return;
@@ -100,7 +129,7 @@ const until = async (pred, ms) => {
 };
 
 const f = makeFake();
-for (const k of ['p1', 'p2', 'p3', 'p4']) f.store.set(k, { value: 'P', expiresAt: 0 });
+for (const k of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) f.store.set(k, { value: 'P', expiresAt: 0 });
 
 (async () => {
     const primary = TurboKV.createPrimary(ARENA, 16 << 20, 1 << 14,
@@ -121,6 +150,10 @@ for (const k of ['p1', 'p2', 'p3', 'p4']) f.store.set(k, { value: 'P', expiresAt
 
     // === 2. the worker vanishes with its clear still outstanding ===========
     const wB = cluster.fork({ TC_CASE: 'kill', TCL_ARENA: ARENA });
+    // Kept the way install() keeps one: a worker is named by its attachment,
+    // and any of its messages carries it.
+    let lastB = null;
+    wB.on('message', (m) => { if (TurboKV.isCacheMessage(m)) lastB = m; });
     await once(wB, 'armed');
     ok(native.l3ClearsInFlight() === 1, 'a clear that has not landed keeps the guard armed');
     ok(await primary.getAsync('p2') === undefined,
@@ -156,7 +189,50 @@ for (const k of ['p1', 'p2', 'p3', 'p4']) f.store.set(k, { value: 'P', expiresAt
     ok(native.l3ClearsInFlight() === 0,
        `the primary settles what a vanished worker still owed (${native.l3ClearsInFlight()})`);
     ok(await primary.getAsync('p4') === 'P', 'and the cluster reads L3 again rather than staying dark');
-    ok(TurboKV.releaseWorker(wB.id) === 0, 'releasing a worker twice settles nothing the second time');
+    ok(TurboKV.releaseWorker(lastB) === 0, 'releasing the same attachment twice settles nothing');
+    ok(TurboKV.releaseWorker(wB.id) === 0,
+       'and a real worker cannot be released by its writer id at all -- ids are reused, attachments are not');
+
+    // === 4. a recycled writer id ==========================================
+    // A supervisor that names workers by slot reuses the number when it
+    // replaces one. The predecessor's reconciliation must not settle the
+    // SUCCESSOR's clear -- and the successor can attach before the
+    // predecessor's 'exit' is delivered, which is the ordering that makes
+    // "release everything under this id" wrong however it is spelled.
+    const wC = cluster.fork({ TC_CASE: 'recycle', TC_ID: '5', TCL_ARENA: ARENA });
+    await once(wC, 'armed');
+    ok(native.l3ClearsInFlight() === 1, 'the first worker in slot 5 opened a generation');
+    const wD = cluster.fork({ TC_CASE: 'recycle', TC_ID: '5', TCL_ARENA: ARENA });
+    await once(wD, 'armed');
+    ok(native.l3ClearsInFlight() === 2, 'its replacement in the same slot opened another');
+    wC.kill('SIGKILL');
+    await exited(wC);
+    await sleep(50);
+    ok(native.l3ClearsInFlight() === 1,
+       `the dead worker's reconciliation settles ITS generation only (${native.l3ClearsInFlight()})`);
+    ok(await primary.getAsync('p5') === undefined,
+       'so the live successor\'s clear is still guarded, rather than resurrecting what it removes');
+    wD.kill('SIGKILL');
+    await exited(wD);
+    await sleep(50);
+    ok(native.l3ClearsInFlight() === 0, 'and the successor is reconciled in its turn');
+    ok(await primary.getAsync('p6') === 'P', 'after which L3 reads work again');
+
+    // === 5. a clearAll shed by a congested channel =========================
+    // The `-` is not the only op that can be thrown away under congestion.
+    // Losing the `c` loses the clearAll itself while its own bookkeeping
+    // reports success: the guard opens and settles cleanly, and L2 goes on
+    // serving values L3 no longer has.
+    primary.set('kept', 'OLD');
+    ok(native.get('kept') === 'OLD', 'the primary has a value in L2 for the worker to clear');
+    const wE = cluster.fork({ TC_CASE: 'shedclear', TC_ID: '9', TCL_ARENA: ARENA });
+    const shedE = await once(wE, 'shed');
+    ok(shedE.shed > 0, `the worker's outbox shed under a full window (writesShed=${shedE.shed})`);
+    ok(native.get('kept') === undefined,
+       `the clearAll still reached L2 rather than being shed with the writes (${native.get('kept')})`);
+    wE.kill('SIGKILL');
+    await exited(wE);
+    await sleep(50);
 
     await primary.close();
     console.log(fail ? `  ${fail} FAILURES` : '  [l3-clear-leak] all passed');

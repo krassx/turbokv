@@ -254,6 +254,27 @@ const instances = new Set();  // live caches in THIS process, for local invalida
 // gets to it. It is also all a degraded worker (no arena to read) has left.
 let l3ClearsInFlight = 0;
 
+// THIS PROCESS'S ATTACHMENT IDENTITY, minted once and never reused.
+//
+// The primary tracks which clear generations a worker has opened so it can
+// settle them if that worker vanishes (see #clearGensOwed). Keying that on the
+// WRITER ID was wrong, and not in a theoretical way: `attachWorker` takes the
+// id from the caller, and a stable per-slot index out of the environment is
+// the normal way to name workers across restarts. A worker that died and was
+// replaced in the same slot therefore had its SUCCESSOR's outstanding clear
+// settled by its own reconciliation -- the guard dropped while L3 was still
+// mid-clear, and the next read resurrected exactly what the clear was
+// removing. No misuse required; the ids are supposed to be reused.
+//
+// The nonce is per PROCESS rather than per instance: it names the channel the
+// generation arrived on, which is the thing that goes away, and several
+// instances in one process share one channel (decision 64). It rides on the
+// batch message, so every wiring gets it -- install()'s and a hand-rolled
+// one alike -- and a successor in the same slot is a different attachment
+// however early it attaches, which is what makes the ordering safe: nothing
+// is ever released by a name a live process could also be answering to.
+const ATTACH_NONCE = `${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
+
 class TurboKV {
     #l1 = new Map();          // key -> { v, bytes, hits }
     #byHash = new Map();      // hash hex -> key   (ring records carry hashes)
@@ -801,26 +822,28 @@ class TurboKV {
         const attach = w => {
             if (!w || wired.has(w)) return;
             wired.add(w);
-            // The writer ids this channel has actually used. A worker that
-            // vanishes mid-clear cannot send the `-` that closes its clear
-            // generation, and an open generation makes every process on the
-            // box serve L3 misses for every key -- so when the channel goes
-            // away the primary settles what that worker still owed. Learned
-            // from the batches themselves rather than assumed to be
-            // `worker.id`: the id is the caller's to choose (it is the ring's
-            // writer id), and this must reconcile the id that actually opened
-            // the generation.
-            const ids = new Set();
+            // One message from this channel, kept so the channel can be named
+            // when it goes away. A worker that vanishes mid-clear cannot send
+            // the `-` that closes its clear generation, and an open generation
+            // makes every process on the box serve L3 misses for every key --
+            // so the primary settles what that worker still owed. The MESSAGE
+            // rather than its `id`: the id is the caller's to choose and is
+            // reused across restarts, so releasing by it settles whatever
+            // worker holds that slot NOW, which may be a live successor with a
+            // clear of its own in flight. Every message from one attachment
+            // names the same attachment, so any one of them will do.
+            let last = null;
             w.on('message', m => {
                 if (m && m.t === RING_MSG) { TurboKV.drainSubmissions(); return; }
-                if (TurboKV.isCacheMessage(m)) { ids.add(m.id); TurboKV.applyBatch(m); }
+                if (TurboKV.isCacheMessage(m)) { last = m; TurboKV.applyBatch(m); }
             });
             // Both, and idempotent by construction: a disconnect usually
             // precedes an exit, and releaseWorker settles nothing the second
             // time. A worker that merely disconnects can no longer deliver a
-            // `-` either, so waiting for 'exit' would hold the guard armed for
-            // no benefit.
-            const gone = () => { for (const id of ids) TurboKV.releaseWorker(id); };
+            // `-` either. The honest cost of settling on disconnect is in
+            // decision 70: a graceful rolling restart disarms the guard while
+            // that worker's clear may still be landing in L3.
+            const gone = () => { if (last) TurboKV.releaseWorker(last); };
             w.on('exit', gone);
             w.on('disconnect', gone);
         };
@@ -2112,36 +2135,57 @@ class TurboKV {
     // The primary's own clears are NOT tracked here. They do not travel over
     // IPC, so neither job applies: there is no channel to lose and no message
     // to forge, and if the primary dies the arena dies with it.
+    //
+    // Keyed by ATTACHMENT (the sender's nonce), never by writer id: ids are
+    // caller-supplied and are meant to be reused across restarts, and keying
+    // on one let a dead worker's reconciliation settle its successor's clear.
+    // See ATTACH_NONCE.
     static #clearGensOwed = new Map();
 
-    static #l3ClearOpenFor(id) {
-        TurboKV.#clearGensOwed.set(id, (TurboKV.#clearGensOwed.get(id) || 0) + 1);
+    // The sender's attachment, as a map key. A message with no nonce is one
+    // this package did not send -- a hand-rolled or replayed batch -- and has
+    // no attachment identity to offer; it falls back to its declared id, which
+    // is all it has said about itself, and which no real attachment can
+    // collide with because a real one always carries a nonce.
+    static #attachmentOf(msg) { return msg && msg.n ? msg.n : 'id:' + (msg && msg.id); }
+
+    static #l3ClearOpenFor(who) {
+        TurboKV.#clearGensOwed.set(who, (TurboKV.#clearGensOwed.get(who) || 0) + 1);
         TurboKV.#l3ClearBegin();
     }
 
-    // Returns false when this writer has nothing open -- a `-` that matches no
-    // `+` of its own settles nothing at all.
-    static #l3ClearSettleFor(id) {
-        const owed = TurboKV.#clearGensOwed.get(id) || 0;
+    // Returns false when this attachment has nothing open -- a `-` that
+    // matches no `+` of its own settles nothing at all.
+    static #l3ClearSettleFor(who) {
+        const owed = TurboKV.#clearGensOwed.get(who) || 0;
         if (owed <= 0) return false;
-        if (owed === 1) TurboKV.#clearGensOwed.delete(id);
-        else TurboKV.#clearGensOwed.set(id, owed - 1);
+        if (owed === 1) TurboKV.#clearGensOwed.delete(who);
+        else TurboKV.#clearGensOwed.set(who, owed - 1);
         TurboKV.#l3ClearSettle();
         return true;
     }
 
-    // A worker is gone: settle every clear generation it still owed, so its
-    // disappearance does not leave the cluster serving L3 misses forever.
-    // Returns how many were settled.
+    // A worker is gone: settle every clear generation THAT ATTACHMENT still
+    // owed, so its disappearance does not leave the cluster serving L3 misses
+    // forever. Returns how many were settled.
     //
-    // install() calls this on 'exit' and 'disconnect'. It is public for the
-    // same reason applyBatch is: a primary that wires the IPC channel itself,
-    // without cluster, has to be able to do the whole job -- and reconciling a
+    // `who` is a cache message from the worker that has gone away -- any one
+    // of them; they all name the same attachment. install() keeps the last one
+    // per channel for exactly this. A plain writer id is accepted too, but it
+    // identifies only a sender that never gave a nonce (a hand-rolled batch):
+    // a real worker cannot be released by its id, deliberately, because ids
+    // are reused across restarts and releasing by one settles the successor's
+    // clear rather than the dead worker's.
+    //
+    // Public for the same reason applyBatch is: a primary that wires the IPC
+    // channel itself has to be able to do the whole job, and reconciling a
     // dead worker is part of the job. Idempotent: a second call settles
     // nothing, so 'exit' after 'disconnect' is free.
-    static releaseWorker(id) {
+    static releaseWorker(who) {
+        const key = typeof who === 'object' && who !== null
+            ? TurboKV.#attachmentOf(who) : 'id:' + who;
         let n = 0;
-        while (TurboKV.#l3ClearSettleFor(id)) n++;
+        while (TurboKV.#l3ClearSettleFor(key)) n++;
         return n;
     }
 
@@ -2420,17 +2464,23 @@ class TurboKV {
             // without bound. The value stays in this worker's L1, it just does
             // not reach L2, so other workers see a miss, never a wrong value.
             //
-            // A CLEAR-GENERATION OP IS NOT SHED WITH THE REST. Shedding a
-            // write costs one key its place in L2 and the value is still in
-            // L1; shedding the `-` that closes a clear generation leaves
-            // EVERY process in the cluster serving L3 misses for EVERY key
-            // until this worker happens to write again. They carry no key and
-            // no value, so keeping them cannot be what grows this buffer --
-            // one per clearAll, and a clear is not a hot-path operation.
+            // A CLEAR IS NOT SHED WITH THE WRITES, NOR ARE ITS GENERATION
+            // OPS. Shedding a write costs one key its place in L2 and the
+            // value is still in L1. Shedding a `c` drops a clearAll() on the
+            // floor while the bookkeeping around it succeeds -- the guard
+            // opens and cleanly settles, and L2 goes on serving values L3 no
+            // longer has, which is the resurrection this whole mechanism
+            // exists to prevent, reached through congestion instead of
+            // through a race. Shedding a `-` leaves every process in the
+            // cluster serving L3 misses for every key until this worker
+            // happens to write again. All three carry no key and no value, so
+            // keeping them cannot be what grows this buffer: one `c` and one
+            // `+`/`-` pair per clearAll, and a clear is not a hot-path
+            // operation.
             const keep = [];
             for (let i = 0; i < this.#outbox.length; i += 4) {
                 const op = this.#outbox[i];
-                if (op === '+' || op === '-') keep.push(op, '', null, 0);
+                if (op === 'c' || op === '+' || op === '-') keep.push(op, '', null, 0);
             }
             this.stats.writesShed = (this.stats.writesShed || 0) +
                                     (this.#outbox.length - keep.length) / 4;
@@ -2469,7 +2519,7 @@ class TurboKV {
             // never returned those bytes -- eight such batches wedged the worker
             // for its lifetime while every set() still reported success.
             this.#inFlightBytes += batchBytes;
-            const accepted = process.send({ t: MSG, id: this.#id, b: batch }, err => {
+            const accepted = process.send({ t: MSG, id: this.#id, n: ATTACH_NONCE, b: batch }, err => {
                 self.#inFlightBytes -= batchBytes;
                 if (self.#inFlightBytes < 0) self.#inFlightBytes = 0;
                 if (!err) return;
@@ -2518,8 +2568,8 @@ class TurboKV {
             // writer -- does it. '+' arrives in the same batch as the 'c' it
             // belongs to and immediately before it; '-' arrives once that
             // worker's adapter has actually applied the clear.
-            else if (op === '+') TurboKV.#l3ClearOpenFor(msg.id);
-            else if (op === '-') TurboKV.#l3ClearSettleFor(msg.id);
+            else if (op === '+') TurboKV.#l3ClearOpenFor(TurboKV.#attachmentOf(msg));
+            else if (op === '-') TurboKV.#l3ClearSettleFor(TurboKV.#attachmentOf(msg));
         }
     }
 
