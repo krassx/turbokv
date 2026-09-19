@@ -534,6 +534,54 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         ok(reports.includes('close'), `and through the listener, as a close (${reports.join(',')})`);
     }
 
+    // 22. CLEAR IS ORDERED AGAINST WRITES ON EVERY KEY, not just its own.
+    //
+    // `clear` has no key, so the per-key chains that keep `set(k,A); set(k,B)`
+    // in order say nothing about a set on some other key. A set still in flight
+    // when the clear was issued therefore landed in L3 AFTER it, leaving L3
+    // holding exactly what the clear was meant to remove -- and the next
+    // getAsync pulled it back into the local tiers, so a clear that reported
+    // success had undone itself. Decision 66 leaves cross-key order alone so a
+    // slow key cannot throttle the process; `clear` is its exception, because
+    // "every key" is what the operation means.
+    {
+        const f = makeFake();
+        f.latency.set('set', 60);
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        c.set('k', 'v');                           // 60ms on the wire to L3
+        ok(await c.clearAsync() === true, 'clearAsync still resolves true');
+        // Drained before the assertion, because the resurrection is the set
+        // landing AFTER the clear: checking the instant the clear resolves
+        // would find L3 empty and the damage still on the wire.
+        await c.drainL3();
+        ok(f.store.get('k') === undefined,
+           `a set in flight when the clear was issued does not survive it (${f.store.get('k') && f.store.get('k').value})`);
+        ok(c.get('k') === undefined, 'and the key is gone locally');
+        const got = await c.getAsync('k');
+        ok(got === undefined, `so a later read cannot resurrect it out of L3 (${got})`);
+        await c.close();
+    }
+
+    // 23. ...including a write that was still queued behind a slower one, and
+    //     NOT including a write issued after the clear, which must survive it.
+    {
+        const f = makeFake();
+        f.latency.set('set', 40);
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        c.set('h', '1');                           // on the wire
+        c.set('h', '2');                           // queued behind it
+        const cleared = c.clearAsync();
+        const later = c.setAsync('after', 'kept'); // pushed after the clear
+        ok(await cleared === true, 'the clear settles');
+        ok(await later === true, 'and so does the write issued after it');
+        await c.drainL3();
+        ok(f.store.get('h') === undefined, `the queued write did not outlive the clear (${f.store.get('h') && f.store.get('h').value})`);
+        ok(f.store.get('after') && f.store.get('after').value === 'kept',
+           'a write issued AFTER the clear survives it, which is what "later writes win" means');
+        ok(await c.getAsync('after') === 'kept', 'and reads back');
+        await c.close();
+    }
+
     console.log(fail ? `  ${fail} failed` : '  [l3-api] all passed');
     process.exit(fail ? 1 : 0);
 })();

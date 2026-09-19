@@ -6,6 +6,13 @@
 const { L3Queue } = require('../src/l3/queue');
 const { makeFake, delay } = require('./l3_fake');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
+// close() UNREFS the backoff a retrying operation is sleeping in, on purpose:
+// a closing queue must not detain a process that is trying to exit. That is
+// right for production and awkward for a test, which wants to see the
+// abandoned operation settle -- with nothing else ref'd, node exits mid-
+// assertion. `hold` keeps the loop alive across those few blocks; a genuine
+// hang still fails, via the per-file timeout in test/run.js.
+const hold = () => { const t = setInterval(() => {}, 1000); return () => clearInterval(t); };
 
 (async () => {
     // 1. order per key is preserved even when the FIRST write is much slower
@@ -140,6 +147,160 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
            `a delete queued behind a slower set still lands last and the key stays absent (has=${f.store.has('resurrect')})`);
         const order = f.calls.filter(c => c[1] === 'resurrect').map(c => c[0]).join(',');
         ok(order === 'set,delete', `set then delete were sent in that order (${order})`);
+    }
+
+    // 11. outstandingKind: the question the read path asks this queue.
+    //
+    // The invalidation ring can say whether someone ELSE changed a key. It
+    // cannot say whether THIS process still owes L3 a change, because an
+    // operation that has not reached L3 has produced no invalidation anywhere.
+    // So the queue has to answer, and it has to answer for the operation on the
+    // wire as well as the one merely queued -- the in-flight one is exactly the
+    // case a concurrent read overlaps.
+    {
+        const f = makeFake(); f.latency.set('delete', 40); f.latency.set('set', 40);
+        const q = new L3Queue(f.adapter, {});
+        ok(q.outstandingKind('nothing') === undefined, 'no operation for an untouched key');
+        const d = q.push({ kind: 'delete', key: 'k', bytes: 10 });
+        ok(q.outstandingKind('k') === 'delete',
+           `a delete ON THE WIRE is reported, not just a queued one (${q.outstandingKind('k')})`);
+        q.push({ kind: 'set', key: 'k', value: 'v', bytes: 10 });          // queued behind it
+        ok(q.outstandingKind('k') === 'set',
+           `the NEWEST operation wins: the queued set supersedes the in-flight delete (${q.outstandingKind('k')})`);
+        ok(q.outstandingKind('other') === undefined, 'and it is per key, not per queue');
+        await d; await q.drain();
+        ok(q.outstandingKind('k') === undefined, 'nothing outstanding once the chain has drained');
+        ok(q.chainCount === 0, `and the chain entry is gone (${q.chainCount})`);
+    }
+
+    // 12. CLEAR IS A BARRIER: work already on the wire lands BEFORE it.
+    //
+    // A set that lands after a clear resurrects exactly what the clear removed,
+    // and the clear has no key to be ordered against it by the per-key chain.
+    {
+        const f = makeFake(); f.latency.set('set', 60); f.latency.set('clear', 1);
+        const q = new L3Queue(f.adapter, {});
+        q.push({ kind: 'set', key: 'k', value: 'v', bytes: 10 });   // 60ms on the wire
+        const c = q.push({ kind: 'clear', bytes: 0 });              // issued 0ms later
+        ok(await c === true, 'the clear settles true');
+        await q.drain();
+        const order = f.calls.map(x => x[0]).join(',');
+        ok(order === 'set,clear', `the in-flight set is awaited, then the clear runs (${order})`);
+        ok(f.store.has('k') === false,
+           `and L3 is actually empty afterwards, not holding the set that was in flight (has=${f.store.has('k')})`);
+    }
+
+    // 13. work PENDING BUT UNSENT when the clear arrives is dropped, and
+    //     settles with the CLEAR's outcome -- the same rule coalescing already
+    //     applies to a write a later write supersedes.
+    {
+        const f = makeFake(); f.latency.set('set', 40);
+        const q = new L3Queue(f.adapter, {});
+        q.push({ kind: 'set', key: 'h', value: '1', bytes: 10 });          // on the wire
+        const queued = q.push({ kind: 'set', key: 'h', value: '2', bytes: 10 });   // pending
+        const other = q.push({ kind: 'set', key: 'z', value: '9', bytes: 10 });    // on the wire
+        const c = q.push({ kind: 'clear', bytes: 0 });
+        ok(await queued === true, 'the dropped write settles with the clear\'s outcome rather than hanging');
+        ok(await other === true, 'a write already on the wire still settles on its own result');
+        await c; await q.drain();
+        const sent = f.calls.filter(x => x[0] === 'set' && x[1] === 'h').length;
+        ok(sent === 1, `the unsent write was never sent (${sent} set calls for h, expected 1)`);
+        ok(f.store.size === 0, `L3 is empty after the clear (${f.store.size} keys left)`);
+        ok(f.calls[f.calls.length - 1][0] === 'clear', 'and the clear was the last thing sent');
+    }
+
+    // 14. a dropped write settles FALSE when the clear itself fails: its
+    //     promise means "L3 holds your value, or a later operation from this
+    //     process" -- and if that later operation failed, it holds neither.
+    {
+        const f = makeFake(); f.latency.set('set', 40);
+        f.fail.set('clear', new Error('down'));
+        const q = new L3Queue(f.adapter, { retryMs: 5 });
+        q.push({ kind: 'set', key: 'h', value: '1', bytes: 10 });
+        const queued = q.push({ kind: 'set', key: 'h', value: '2', bytes: 10 });
+        const c = q.push({ kind: 'clear', bytes: 0 });
+        const release = hold();
+        q.close();                       // a clear retries forever otherwise (decision 70)
+        ok(await c === false, 'a clear against a dead L3 settles false once the queue is closing');
+        ok(await queued === false, 'and the write it dropped settles false with it');
+        release();
+    }
+
+    // 15. work pushed AFTER the clear queues behind it and survives it. This is
+    //     what makes the spec's "later writes survive a clear" true; without
+    //     the barrier the later write races the clear instead.
+    {
+        const f = makeFake(); f.latency.set('clear', 40);
+        const q = new L3Queue(f.adapter, {});
+        const c = q.push({ kind: 'clear', bytes: 0 });
+        const later = q.push({ kind: 'set', key: 'after', value: 'kept', bytes: 10 });
+        ok(q.outstandingKind('after') === 'set', 'the later write is outstanding while it waits');
+        await c; await later; await q.drain();
+        const order = f.calls.map(x => x[0]).join(',');
+        ok(order === 'clear,set', `the clear goes first (${order})`);
+        ok(f.store.get('after') && f.store.get('after').value === 'kept',
+           'and the later write survives the clear');
+    }
+
+    // 16. two overlapping clears: the first one finishing must not let work
+    //     through while the second is still on its way.
+    {
+        const f = makeFake(); f.latency.set('clear', 20);
+        const q = new L3Queue(f.adapter, {});
+        const c1 = q.push({ kind: 'clear', bytes: 0 });
+        await delay(25 + 5);                      // c1 is now on the wire or just done
+        const c2 = q.push({ kind: 'clear', bytes: 0 });
+        const w = q.push({ kind: 'set', key: 'w', value: 'v', bytes: 10 });
+        await Promise.all([c1, c2, w]); await q.drain();
+        const order = f.calls.map(x => x[0]).join(',');
+        ok(order === 'clear,clear,set', `both clears precede the later write (${order})`);
+        ok(f.store.get('w').value === 'v', 'and the write survives them');
+        ok(q.chainCount === 0, `no chain is left behind (${q.chainCount})`);
+    }
+
+    // 17. THE ESCAPE VALVE. A clear against an L3 that never answers retries
+    //     indefinitely by design, so the work waiting behind it must not grow
+    //     without bound: it keeps counting against maxBytes and later pushes
+    //     are shed and settle false, exactly as a full submission ring sheds.
+    //     Without this a stuck clear would be a memory leak instead.
+    {
+        const f = makeFake(); f.hang.add('clear');
+        const q = new L3Queue(f.adapter, { maxBytes: 100, retryMs: 10 });
+        const c = q.push({ kind: 'clear', bytes: 0 });
+        const kept = [];
+        for (let i = 0; i < 5; i++) kept.push(q.push({ kind: 'set', key: 'k' + i, value: 'v', bytes: 30 }));
+        const shed = await q.push({ kind: 'set', key: 'overflow', value: 'v', bytes: 30 });
+        ok(shed === false, 'work behind a stuck clear is shed once it passes the byte bound');
+        ok(q.stats.shed > 0, `and counted as shed (${q.stats.shed})`);
+        ok(q.pendingBytes <= 100, `the queue stays inside its bound (${q.pendingBytes}B)`);
+        ok(f.calls.filter(x => x[0] === 'set').length === 0,
+           'nothing waiting behind the clear was sent while it was stuck');
+        const release = hold();
+        q.close();
+        ok(await c === false, 'and the stuck clear settles once the queue closes rather than hanging forever');
+        for (const p of kept) await p;
+        release();
+    }
+
+    // 18. a clear that has not been sent yet is replaced by a later one --
+    //     two flushes in a row are one flush -- and the work the replaced
+    //     clear had already swept up settles with the one that actually runs,
+    //     rather than being forgotten along with it.
+    {
+        const f = makeFake(); f.latency.set('set', 30);
+        const q = new L3Queue(f.adapter, {});
+        q.push({ kind: 'set', key: 's', value: 'v', bytes: 10 });   // on the wire
+        const c1 = q.push({ kind: 'clear', bytes: 0 });             // dispatched, waiting for the wire
+        const w = q.push({ kind: 'set', key: 'w', value: 'v', bytes: 10 });   // behind the gate
+        const c2 = q.push({ kind: 'clear', bytes: 0 });             // queued behind c1; sweeps up w
+        const c3 = q.push({ kind: 'clear', bytes: 0 });             // replaces c2
+        const all = await Promise.all([c1, c2, c3, w]);
+        ok(all.every(Boolean), `every caller settles, including the replaced clear (${all.join(',')})`);
+        await q.drain();
+        const order = f.calls.map(x => x[0]).join(',');
+        ok(order === 'set,clear,clear', `the replaced clear is not sent (${order})`);
+        ok(f.store.size === 0, `L3 is empty (${f.store.size} keys left)`);
+        ok(q.chainCount === 0, `and no chain is left behind (${q.chainCount})`);
     }
 
     console.log(fail ? `  ${fail} failed` : '  [l3-queue] all passed');

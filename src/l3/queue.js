@@ -8,6 +8,11 @@
 //
 // Order ACROSS keys is deliberately not preserved: serialising every key behind
 // one chain would make one slow key throttle the whole process.
+//
+// `clear` IS THE ONE EXCEPTION, because it is the one operation whose meaning
+// is inherently cross-key: "every key" cannot be ordered by a per-key chain,
+// and a set that lands after a clear resurrects exactly what the clear
+// removed. So a clear is a barrier -- see #pushClear.
 
 // `clear` has no key of its own, so it needs a chain id that can never collide
 // with a real string key. A Symbol guarantees that (no string a caller could
@@ -47,12 +52,30 @@ function withDeadline(promise, ms, what) {
 
 class L3Queue {
     #adapter; #maxBytes; #retryMs; #onError; #now;
-    #chains = new Map();          // id -> { pending: op|null, settle: fn|null, busy: bool }
+    // id -> { pending: op|null, inflight: op|null, settle: fn|null, busy: bool }.
+    // `pending` is queued but not yet sent; `inflight` is the one on the wire.
+    // Both are needed, and neither substitutes for the other, because the read
+    // path asks this queue what it still owes L3 for a key (see
+    // outstandingKind): a delete that has already been dispatched is exactly
+    // the case that resurrects a value, and `pending` alone is null for it.
+    #chains = new Map();
     #bytes = 0;
     #count = 0;
     #idle = [];
     #closed = false;
     #backoffs = new Set();        // retry timers currently sleeping; see close()
+    // The clear barrier. `#clears` counts clears pushed and not yet settled;
+    // `#clearGate` is non-null exactly while that count is above zero, and every
+    // non-clear dispatch waits on it. See #pushClear.
+    #clears = 0;
+    #clearGate = null;
+    #gateRelease = null;
+    // Operations currently ON THE WIRE, as opposed to merely outstanding. A
+    // clear waits for this to reach zero before it is sent; #count cannot serve
+    // for that, because work queued BEHIND the clear keeps #count above zero
+    // and the clear would wait for operations that are waiting for it.
+    #onWire = 0;
+    #wireIdle = [];
     stats = { shed: 0, failed: 0, retried: 0, coalesced: 0 };
 
     constructor(adapter, { maxBytes = 8 << 20, retryMs = 2000, onError = null, now = Date.now } = {}) {
@@ -97,18 +120,32 @@ class L3Queue {
     // one entry per distinct key for the life of the process.
     get chainCount() { return this.#chains.size; }
 
+    // What this queue still owes L3 for `key`: 'set', 'delete', or undefined.
+    //
+    // The read path consults this before promoting an L3 value, so it must be
+    // ONE Map lookup and no allocation. It reports the NEWEST operation for the
+    // key -- a queued one supersedes the one on the wire -- because that is what
+    // L3 will end up holding, and it covers the in-flight case deliberately:
+    // an operation already dispatched is precisely the one whose round trip a
+    // concurrent read can overlap.
+    outstandingKind(key) {
+        const chain = this.#chains.get(key);
+        if (chain === undefined) return undefined;
+        if (chain.pending !== null) return chain.pending.kind;
+        return chain.inflight === null ? undefined : chain.inflight.kind;
+    }
+
     push(op) {
-        // A clear is never shed: until it lands, this process serves misses
-        // rather than values the clear was meant to remove, so dropping it
-        // would leave the process permanently blind.
-        if (op.kind !== 'clear' && this.#bytes + op.bytes > this.#maxBytes) {
+        // A clear is a BARRIER, not just another operation -- see #pushClear.
+        if (op.kind === 'clear') return this.#pushClear(op);
+        if (this.#bytes + op.bytes > this.#maxBytes) {
             this.stats.shed++;
             return Promise.resolve(false);
         }
-        const id = op.kind === 'clear' ? CLEAR_ID : op.key;
+        const id = op.key;
         let chain = this.#chains.get(id);
         if (chain === undefined) {
-            chain = { pending: null, settle: null, busy: false };
+            chain = { pending: null, inflight: null, settle: null, busy: false };
             this.#chains.set(id, chain);
         }
         // COALESCING. If an operation for this key is queued but not yet sent
@@ -144,10 +181,127 @@ class L3Queue {
         return result;
     }
 
+    // A CLEAR IS A BARRIER.
+    //
+    // Decision 66 leaves order ACROSS keys unenforced so that one slow key
+    // cannot throttle the whole process. That rationale is about ordinary
+    // per-key work; `clear` means *every* key, so a set that lands after it
+    // resurrects exactly what it removed -- and spec 10.2 already says later
+    // operations queue behind a clear. So, for `clear` only:
+    //
+    //   - work already ON THE WIRE is awaited before the clear is sent, since
+    //     a set that lands afterwards puts back what the clear took out;
+    //   - work PENDING BUT UNSENT is dropped and settles with the CLEAR's
+    //     outcome -- the same rule coalescing already applies to a superseded
+    //     write, whose promise means "L3 holds your value, or a later
+    //     operation from this process", and a clear is such an operation;
+    //   - work pushed AFTER the clear waits for it, which is what makes the
+    //     spec's "later writes survive a clear" guarantee true.
+    //
+    // The dropping happens HERE, at push time, and not when the clear is
+    // finally dispatched: an operation pushed after the clear must queue
+    // behind it, not be swept up by it, and only push order can tell the two
+    // apart. A clear is never shed, and it is counted before anything is
+    // dropped so #count cannot dip to zero in between and let a drain()
+    // resolve with a clear still outstanding.
+    //
+    // Nothing here can hang the process against a dead L3: work waiting behind
+    // the clear keeps counting against maxBytes, so later pushes are shed and
+    // settle false under the same contract as a full submission ring.
+    #pushClear(op) {
+        let chain = this.#chains.get(CLEAR_ID);
+        if (chain === undefined) {
+            chain = { pending: null, inflight: null, settle: null, busy: false };
+            this.#chains.set(CLEAR_ID, chain);
+        }
+        this.#armGate();
+        let result;
+        if (chain.pending !== null) {
+            // A clear not yet sent is replaced by this one, exactly as a write
+            // would be: two flushes in a row are one flush. The work the
+            // earlier clear dropped carries over to this one, so those callers
+            // still settle -- and the earlier clear's hold on the gate is
+            // released with it, since it will never reach #run to release it
+            // itself.
+            const prev = chain.pending, prevSettle = chain.settle;
+            this.stats.coalesced++;
+            op.superseded = prev.superseded;
+            this.#bytes -= prev.bytes; this.#bytes += op.bytes;
+            this.#disarmGate();
+            chain.pending = op;
+            result = new Promise((resolve) => {
+                chain.settle = (v) => { prevSettle(v); resolve(v); };
+            });
+        } else {
+            op.superseded = [];
+            chain.pending = op;
+            this.#bytes += op.bytes; this.#count++;
+            result = new Promise((resolve) => { chain.settle = resolve; });
+        }
+        for (const settle of this.#dropPending()) op.superseded.push(settle);
+        if (!chain.busy) { chain.busy = true; this.#run(CLEAR_ID, chain); }
+        return result;
+    }
+
+    // Every operation queued but not yet sent, removed from its chain and
+    // handed back so the clear can settle it with its own outcome. A chain
+    // whose pending slot is emptied here is never orphaned: `pending !== null`
+    // implies its #run loop is still running, and that loop exits and deletes
+    // the chain the next time it finds the slot empty.
+    #dropPending() {
+        const settles = [];
+        for (const [id, chain] of this.#chains) {
+            if (id === CLEAR_ID || chain.pending === null) continue;
+            this.#bytes -= chain.pending.bytes; this.#count--;
+            // Counted as a coalesce for the same reason it behaves like one:
+            // the operation never reaches L3 because a newer operation from
+            // this process superseded it.
+            this.stats.coalesced++;
+            settles.push(chain.settle);
+            chain.pending = null; chain.settle = null;
+        }
+        return settles;
+    }
+
+    // The gate is one promise shared by every waiter, created when the first
+    // clear arrives and resolved when the last one settles. A count rather than
+    // a boolean: with two clears outstanding, the first one finishing must not
+    // let work through while the second is still on its way.
+    #armGate() {
+        this.#clears++;
+        if (this.#clearGate === null) this.#clearGate = new Promise((r) => { this.#gateRelease = r; });
+    }
+    #disarmGate() {
+        if (--this.#clears > 0) return;
+        const release = this.#gateRelease;
+        this.#clearGate = null; this.#gateRelease = null;
+        release();
+    }
+    // Resolves once nothing is on the wire. See #onWire for why drain() cannot
+    // stand in for this.
+    #wireDrain() {
+        return this.#onWire === 0 ? Promise.resolve() : new Promise((r) => this.#wireIdle.push(r));
+    }
+
     async #run(id, chain) {
         while (chain.pending !== null) {
+            // Everything but a clear waits while a clear is outstanding (see
+            // #pushClear). `continue` rather than falling through: while we
+            // waited, the clear may have dropped this very operation, and a
+            // later push may have put a new one in its place.
+            if (id !== CLEAR_ID && this.#clearGate !== null) { await this.#clearGate; continue; }
             const op = chain.pending, settle = chain.settle;
             chain.pending = null; chain.settle = null;
+            // Claimed, so outstandingKind() keeps answering for this key while
+            // the round trip below is in progress -- that window is exactly the
+            // one the read path's guard exists to cover.
+            chain.inflight = op;
+            // A clear goes out only once the wire is empty: a set still in
+            // flight would otherwise land after it and put back what it
+            // removed. Deliberately outside the bounded attempt below -- this
+            // is waiting for OUR OWN earlier work, each piece of which is
+            // already bounded, not for the adapter.
+            if (id === CLEAR_ID) await this.#wireDrain();
             // #bytes/#count keep counting `op` through the whole round trip,
             // not just while it sits queued: it is decremented below, after
             // the op settles, not here. If it were freed the moment #run
@@ -157,6 +311,7 @@ class L3Queue {
             // the queue's outstanding work without limit even though every
             // individual key looked "idle" the instant after its push().
             let outcome = false;
+            this.#onWire++;
             // `now` is a user-supplied constructor option -- untrusted input
             // like any other. #run is invoked fire-and-forget (push() does
             // not await or .catch it), so a throw escaping this whole block
@@ -213,7 +368,13 @@ class L3Queue {
             } catch (e) {
                 this.stats.failed++; this.#report(e, op); outcome = false;
             }
+            if (--this.#onWire === 0) { const w = this.#wireIdle; this.#wireIdle = []; for (const r of w) r(); }
             this.#bytes -= op.bytes; this.#count--;
+            chain.inflight = null;
+            // Released BEFORE settle(), so a caller resuming on the clear's
+            // promise finds the queue accepting work again rather than one
+            // still holding everything back.
+            if (id === CLEAR_ID) { for (const s of op.superseded) s(outcome); this.#disarmGate(); }
             settle(outcome);
             if (this.#count === 0) { const w = this.#idle; this.#idle = []; for (const r of w) r(); }
         }
