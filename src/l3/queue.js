@@ -95,7 +95,7 @@ function withDeadline(promise, ms, what, timers) {
 }
 
 class L3Queue {
-    #adapter; #maxBytes; #retryMs; #onError; #now;
+    #adapter; #maxBytes; #retryMs; #onError; #onShed; #now;
     // id -> { pending: op|null, inflight: op|null, settle: fn|null, busy: bool }.
     // `pending` is queued but not yet sent; `inflight` is the one on the wire.
     // Both are needed, and neither substitutes for the other, because the read
@@ -126,9 +126,9 @@ class L3Queue {
     #wireIdle = [];
     stats = { shed: 0, failed: 0, retried: 0, coalesced: 0 };
 
-    constructor(adapter, { maxBytes = 8 << 20, retryMs = 2000, onError = null, now = Date.now } = {}) {
+    constructor(adapter, { maxBytes = 8 << 20, retryMs = 2000, onError = null, onShed = null, now = Date.now } = {}) {
         this.#adapter = adapter; this.#maxBytes = maxBytes; this.#retryMs = retryMs;
-        this.#onError = onError; this.#now = now;
+        this.#onError = onError; this.#onShed = onShed; this.#now = now;
     }
 
     // The cache this queue belongs to is going away.
@@ -193,6 +193,15 @@ class L3Queue {
         if (op.kind === 'clear') return this.#pushClear(op);
         if (this.#bytes + op.bytes > this.#maxBytes) {
             this.stats.shed++;
+            // A shed op never reaches #run, so #report/onError never fires for
+            // it -- onError means "abandoned after being sent", and a shed op
+            // was never sent at all. Without a separate hook, a write refused
+            // by L3 and a write this process refused to even queue look
+            // identical from the outside: both resolve `false` and neither
+            // reports through `onError`. An operator watching for one cannot
+            // tell it from the other, and the two have different fixes (a
+            // slow/unreachable L3 versus a queue that is genuinely full).
+            if (this.#onShed) { try { this.#onShed(op); } catch { /* a listener must not break the queue */ } }
             return Promise.resolve(false);
         }
         const id = op.key;

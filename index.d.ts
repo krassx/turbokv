@@ -272,18 +272,60 @@ export interface CacheStats {
     l3Hits?: number;
     /** Reads L3 did not answer: absent, failed, or refused by a pending clear. */
     l3Misses?: number;
+    /** Also counted in `l3Misses`: an L3 `get` returned a value this cache's
+     *  `storage` mode cannot represent (e.g. a Buffer where the codec expects
+     *  its own encoding). Reported through `onL3Error`; nothing is written to
+     *  L1 or L2, so the bad value cannot poison the key for anyone else. */
+    l3BadValues?: number;
     /** Writes handed to the L3 queue. */
     l3Sets?: number;
-    /** L3 writes abandoned past `l3RetryMs`, or shed past `l3QueueMaxBytes`. */
+    /** L3 writes abandoned past `l3RetryMs`. Does NOT cover a write shed on
+     *  the spot past `l3QueueMaxBytes` -- see `l3Shed`, which is the number
+     *  that moves when this one does not: a shed write never reaches the
+     *  adapter, so it is never "abandoned" and never reported through
+     *  `onL3Error` either. */
     l3SetFailed?: number;
-    /** L3 deletes abandoned past `l3RetryMs`. */
+    /** L3 deletes abandoned past `l3RetryMs`. Same `l3Shed` carve-out as
+     *  `l3SetFailed`. */
     l3DeleteFailed?: number;
+    /** Writes and deletes refused before ever reaching the L3 queue, because
+     *  the queue was already at `l3QueueMaxBytes`. The local write still
+     *  stands (`l3FailTtlMs` caps how long it may disagree with L3, same as
+     *  an abandoned write); this counter is what tells "L3 is refusing my
+     *  writes" (`l3SetFailed`/`l3DeleteFailed`) apart from "I am shedding
+     *  them before they are even sent" (`l3Shed`) -- different causes,
+     *  different fixes. A `clear` is never shed and never counted here. */
+    l3Shed?: number;
+    /** Bytes currently outstanding in the per-process L3 queue -- queued plus
+     *  in flight, the same quantity `l3QueueMaxBytes` bounds. A live gauge,
+     *  not a cumulative counter: it goes up and down as writes and deletes
+     *  are sent and settle. */
+    l3QueueBytes?: number;
     /** Failed L3 writes whose local copy was re-timed to `l3FailTtlMs`. */
     l3FailTtlApplied?: number;
-    /** L3 hits returned to the caller but not promoted, because the key was
-     *  invalidated while the read was in flight or the ring could not rule it
-     *  out. Ordinary contention, not an error. */
+    /** A worker's attempt to re-time its local copy to `l3FailTtlMs` that
+     *  never confirmed landing in the arena within the retry window -- the
+     *  submission it depends on was itself shed or never drained. The value
+     *  it was capping is left with whatever expiry it already had, which may
+     *  be none. */
+    l3FailTtlUnapplied?: number;
+    /** L3 hits returned to the caller but not promoted, because SOMEONE ELSE
+     *  changed the key while the read was in flight, or the ring could not
+     *  rule out that they did. Ordinary contention, not an error. Does NOT
+     *  cover this process's own outstanding write for the key -- see
+     *  `l3PromotionsBlockedSelf`, split out so self-inflicted traffic does
+     *  not show up in the number an operator watches for contention from
+     *  elsewhere. */
     l3PromotionsBlocked?: number;
+    /** L3 hits returned to the caller but not promoted, because THIS process
+     *  itself still had a write for the key queued or in flight to L3 when
+     *  the read completed -- L3 was still serving the value that write
+     *  supersedes. This is why `get()` and `getAsync()` can disagree about a
+     *  key: while a `minLevel: L3` write for it is outstanding, `get()`
+     *  returns `undefined` (nothing is stored locally) while `getAsync()`
+     *  returns whatever L3 still holds. Deliberate; see the `LevelOption`
+     *  and decision 69's "one exception" in DESIGN.md. */
+    l3PromotionsBlockedSelf?: number;
     /** L3 hits not promoted because the key cannot live in L1 or L2 at all
      *  (an unpaired surrogate the arena cannot hash). */
     l3UnhashableKeys?: number;

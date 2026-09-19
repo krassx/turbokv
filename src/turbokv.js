@@ -462,6 +462,24 @@ class TurboKV {
                     else if (op.kind === 'delete') this.stats.l3DeleteFailed = (this.stats.l3DeleteFailed || 0) + 1;
                     this.#reportL3(e, op);
                 },
+                // A shed op is refused before it is ever sent, so onError above
+                // never sees it -- that hook means "abandoned after being sent".
+                // Without this, `l3SetFailed`/`l3DeleteFailed` never move for a
+                // write this process shed on the spot, and an operator cannot
+                // tell "L3 is refusing my writes" from "I am shedding them
+                // before they are sent" -- different causes, different fixes.
+                onShed: () => { this.stats.l3Shed = (this.stats.l3Shed || 0) + 1; },
+            });
+            // A live gauge, not a snapshot: bytes currently outstanding (queued
+            // plus in flight) in the L3 queue, read straight from it on every
+            // access. `stats` is a single persistent object that existing code
+            // mutates in place (`this.stats.xxx++`), so this is a getter
+            // property on that same object rather than a plain field computed
+            // once -- computing it once would go stale the instant the queue's
+            // own #bytes changed.
+            Object.defineProperty(this.stats, 'l3QueueBytes', {
+                get: () => this.#queue.pendingBytes,
+                enumerable: true,
             });
         }
         // `|| 0` also mapped an explicit 0 to the primary role. That is only
@@ -1779,8 +1797,15 @@ class TurboKV {
     //
     // Returns '' to promote, or the name of the counter to bump. The reasons are
     // unrelated events and an operator watching one is misled by the other:
-    // `l3PromotionsBlocked` is ordinary contention -- this key changed, or the
-    // ring cannot rule out that it did -- `l3UnhashableKeys` is a key that can
+    // `l3PromotionsBlocked` is contention from SOMEONE ELSE -- this key changed
+    // and the ring caught it, or the ring cannot rule out that it did --
+    // `l3PromotionsBlockedSelf` is this SAME process's own outstanding write
+    // (see below): both are "blocked, but the value handed back", so folding
+    // them together was tempting, but an operator watching for contention on a
+    // hot key would see their own write traffic counted alongside it, with no
+    // way to tell which fraction is which -- the same reason `l3UnhashableKeys`
+    // and `l3DeletedWhileReading` were split out rather than folded into
+    // `l3PromotionsBlocked` too. `l3UnhashableKeys` is a key that can
     // never live in L1 or L2 at all, whatever the ring says, and
     // `l3DeletedWhileReading` is a prevented resurrection, the one reason that
     // also changes the answer the caller gets (see #fetchFromL3), and
@@ -1824,7 +1849,13 @@ class TurboKV {
             const at = this.#deletedAt.get(key);
             if (at !== undefined && at > mark) return 'l3DeletedWhileReading';
         }
-        if (owed === 'set') return 'l3PromotionsBlocked';
+        // Counted apart from `l3PromotionsBlocked`: this is not the ring
+        // reporting that someone else changed the key, it is this same
+        // process's own write still on its way to L3. Folding it into the
+        // shared counter would put self-inflicted traffic in the same number
+        // an operator watches for contention from elsewhere. See the counter
+        // note above #promotionBlock.
+        if (owed === 'set') return 'l3PromotionsBlockedSelf';
         // A CLEAR THIS PROCESS ISSUED, asked before the degraded bail-out
         // below rather than after it. l3ClearsInFlight needs no arena, and on
         // a degraded worker it is the ONLY clear guard left -- decision 70

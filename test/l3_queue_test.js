@@ -104,6 +104,33 @@ const hold = () => { const t = setInterval(() => {}, 1000); return () => clearIn
         ok(q.pendingBytes <= 100 + 30, `pending bytes stay bounded (${q.pendingBytes})`);
     }
 
+    // 6b. F12: onShed fires exactly once per shed op, synchronously with the
+    //     shed -- the hook turbokv.js uses to surface stats.l3Shed, which
+    //     onError cannot cover because a shed op is never sent and never
+    //     reaches #run at all.
+    {
+        const f = makeFake(); f.latency.set('set', 50);
+        const shedOps = [];
+        const q = new L3Queue(f.adapter, { maxBytes: 30, onShed: (op) => shedOps.push(op.key) });
+        // push() runs #run synchronously up to its first real await, so 'first'
+        // is already on the wire -- and #bytes still at 30 -- by the time the
+        // next two pushes are made, with no await between them to let it drain.
+        const first = q.push({ kind: 'set', key: 'first', value: 'v', bytes: 30 });
+        const second = q.push({ kind: 'set', key: 'second', value: 'v', bytes: 30 });
+        const third = q.push({ kind: 'set', key: 'third', value: 'v', bytes: 30 });
+        ok(shedOps.length === 2, `both pushes past the bound shed synchronously (${shedOps.length})`);
+        const [, a, b] = await Promise.all([first, second, third]);
+        ok(a === false && b === false, 'both pushes past the bound are shed');
+        ok(shedOps.length === 2, `onShed fired once per shed, not per push overall (${shedOps.length})`);
+        ok(shedOps[0] === 'second' && shedOps[1] === 'third',
+           `and named the op that was actually shed (${shedOps})`);
+        // A listener that throws must not break the queue, same contract as
+        // onError.
+        const q2 = new L3Queue(f.adapter, { maxBytes: 1, onShed: () => { throw new Error('boom'); } });
+        ok(await q2.push({ kind: 'set', key: 'x', value: 'v', bytes: 30 }) === false,
+           'a throwing onShed listener does not break the shed path');
+    }
+
     // 7. clear retries past the budget, because until it lands we serve misses
     {
         const f = makeFake();

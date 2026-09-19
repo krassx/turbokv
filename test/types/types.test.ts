@@ -104,7 +104,12 @@ const l3Sets: number | undefined = c.stats.l3Sets;
 const l3SetFailed: number | undefined = c.stats.l3SetFailed;
 const l3DeleteFailed: number | undefined = c.stats.l3DeleteFailed;
 const l3FailTtl: number | undefined = c.stats.l3FailTtlApplied;
+const l3FailTtlGaveUp: number | undefined = c.stats.l3FailTtlUnapplied;
+const l3Bad: number | undefined = c.stats.l3BadValues;
+const l3Shed: number | undefined = c.stats.l3Shed;
+const l3QueueBytes: number | undefined = c.stats.l3QueueBytes;
 const l3Blocked: number | undefined = c.stats.l3PromotionsBlocked;
+const l3BlockedSelf: number | undefined = c.stats.l3PromotionsBlockedSelf;
 const l3Unhashable: number | undefined = c.stats.l3UnhashableKeys;
 const l3DelReading: number | undefined = c.stats.l3DeletedWhileReading;
 const l3Clearing: number | undefined = c.stats.l3ClearedWhileReading;
@@ -116,7 +121,8 @@ const released: number = TurboKV.releaseWorker({ t: 'tc', id: 1, n: 'attach-nonc
 TurboKV.releaseWorker(1);
 const anyHit: boolean = (c.stats.l3Hits ?? 0) > 0;
 void [l3Hits, l3Misses, l3Sets, l3SetFailed, l3DeleteFailed, l3FailTtl,
-     l3Blocked, l3Unhashable, l3DelReading, l3Clearing, released, anyHit];
+     l3FailTtlGaveUp, l3Bad, l3Shed, l3QueueBytes,
+     l3Blocked, l3BlockedSelf, l3Unhashable, l3DelReading, l3Clearing, released, anyHit];
 
 // --- the adapter contract matches spec section 4 ---------------------------
 //

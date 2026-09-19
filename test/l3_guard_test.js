@@ -112,7 +112,14 @@ if (process.env.TCG_ROLE === 'worker') {
         const got = await read;
         ok(got === 'OLD', `the caller still receives what L3 said (${got})`);
         ok(c.get('k') === 'NEW', `the newer local value is NOT overwritten (${c.get('k')})`);
-        ok(c.stats.l3PromotionsBlocked === 1, `the blocked promotion is counted (${c.stats.l3PromotionsBlocked})`);
+        // This block came from OUR OWN outstanding write for the key (the
+        // `set` above, still on the wire), not from the ring reporting a
+        // change from elsewhere -- so it counts apart from `l3PromotionsBlocked`,
+        // in `l3PromotionsBlockedSelf`. See the split note above #promotionBlock.
+        ok(c.stats.l3PromotionsBlockedSelf === 1,
+           `the self-write block is counted separately (${c.stats.l3PromotionsBlockedSelf})`);
+        ok(c.stats.l3PromotionsBlocked === undefined,
+           `and NOT as contention from elsewhere (${c.stats.l3PromotionsBlocked})`);
         c.close();
     }
 
@@ -252,11 +259,21 @@ if (process.env.TCG_ROLE === 'worker') {
         ok(c.get('m') === undefined, `and evicts the local copies (${c.get('m')})`);
         const got = await c.getAsync('m');
         ok(got === 'v1', `the caller still receives what L3 actually holds right now (${got})`);
+        // `get()` said `undefined` two lines up; `getAsync()` just said 'v1'.
+        // That is decision 69's one written-down exception to "the sync and
+        // async forms never disagree about this process's own state" -- both
+        // are honest about this process's own in-flight write, from two
+        // different vantage points, not an accidental contradiction.
         ok(c.get('m') === undefined, `but the superseded value is NOT promoted into L1 (${c.get('m')})`);
         ok(native.get('m') === undefined,
            `nor into the shared arena, where willCache:false means nothing would invalidate it (${native.get('m')})`);
-        ok(c.stats.l3PromotionsBlocked === 1,
-           `counted as contention on this key (${c.stats.l3PromotionsBlocked})`);
+        // Our own outstanding write, not the ring reporting someone else's
+        // change -- counted in l3PromotionsBlockedSelf, apart from
+        // l3PromotionsBlocked, for the same reason as the case above.
+        ok(c.stats.l3PromotionsBlockedSelf === 1,
+           `counted as self-contention on this key (${c.stats.l3PromotionsBlockedSelf})`);
+        ok(c.stats.l3PromotionsBlocked === undefined,
+           `and NOT folded into contention from elsewhere (${c.stats.l3PromotionsBlocked})`);
         c.close();
     }
 

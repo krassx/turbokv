@@ -372,8 +372,42 @@ let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++
         ok(c.get('ft2') === 'v', 'and is still served locally');
         ok(c.stats.l3FailTtlApplied === 1, `the cap is applied to a shed write too (${c.stats.l3FailTtlApplied})`);
         ok(f.calls.filter(x => x[0] === 'set').length === 0, 'the shed write never reached the adapter');
+        // F12: a shed write is a different event from an abandoned one -- L3
+        // never even saw it, so it must not be silently invisible or counted
+        // as though L3 had refused it.
+        ok(c.stats.l3Shed === 1, `the shed write is counted, apart from an abandoned one (${c.stats.l3Shed})`);
+        ok(c.stats.l3SetFailed === undefined,
+           `and NOT as an L3-side failure -- different cause, different fix (${c.stats.l3SetFailed})`);
         await delay(140);
         ok(c.get('ft2') === undefined, `a shed write reverts on the same schedule (${c.get('ft2')})`);
+        c.close();
+    }
+
+    // 24c. l3Shed keeps counting past the first write.
+    {
+        const f = makeFake();
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter, l3QueueMaxBytes: 1 });
+        ok(await c.setAsync('sh1', 'v') === false, 'shed');
+        ok(await c.setAsync('sh2', 'v') === false, 'shed again');
+        ok(c.stats.l3Shed === 2, `two sheds, not one (${c.stats.l3Shed})`);
+        c.close();
+    }
+
+    // 24d. l3QueueBytes is a LIVE gauge of what the queue currently holds --
+    //      not a value copied once and left to go stale as ops settle. This
+    //      is what an operator actually wants: how close to l3QueueMaxBytes
+    //      the queue is running right now, as opposed to l3Shed's
+    //      after-the-fact count of what already got refused.
+    {
+        const f = makeFake();
+        f.latency.set('set', 40);
+        const c = TurboKV.open({ storage: 'bytes', l3: f.adapter });
+        ok(c.stats.l3QueueBytes === 0,
+           `nothing outstanding before any write (${c.stats.l3QueueBytes})`);
+        const p = c.setAsync('live', 'v');
+        ok(c.stats.l3QueueBytes > 0, `bytes outstanding while the write is in flight (${c.stats.l3QueueBytes})`);
+        await p;
+        ok(c.stats.l3QueueBytes === 0, `and back to zero once it settles (${c.stats.l3QueueBytes})`);
         c.close();
     }
 
