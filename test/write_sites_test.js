@@ -47,7 +47,7 @@ const ALLOWED = new Set([
     '#publishArenaSet', '#publishArenaDel', '#publishArenaClear',
     '#publishRingSet', '#publishRingDel',
     '#publishOutbox', '#publishOutboxOp',
-    '#retimeArena', '#retimeRing',
+    '#retimeArena', '#retimeRing', '#retimeOutbox',
 ]);
 
 // A class member declaration at the top level of the class body: four spaces,

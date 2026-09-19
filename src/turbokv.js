@@ -1036,6 +1036,10 @@ class TurboKV {
     // #deletedAt -- the position is the whole content of that guard, and a
     // wrong one is invisible from outside.
     __unsafeDeletedAtOf(key) { return this.#deletedAt.get(key); }
+    // Test-only: is a cap outstanding for THIS key. The count alone is fragile
+    // in any test that also writes other keys through a failing L3, which is
+    // most of them -- every such write defers a cap of its own.
+    __unsafeHasCap(key) { return this.#l3Caps.has(key); }
 
     // Test and shutdown helper: resolves when this process has no L3 work left.
     drainL3() { return this.#queue ? this.#queue.drain() : Promise.resolve(); }
@@ -2191,7 +2195,8 @@ class TurboKV {
             TurboKV.#dropOthers(key, this);
             return true;
         }
-        return this.#ringIdx >= 0 && this.#retimeRing(key, enc, cap);
+        if (this.#ringIdx >= 0) return this.#retimeRing(key, enc, cap);
+        return this.#retimeOutbox(key, enc, cap);
     }
 
     // Local first, then L3. L3-first was rejected: when the remote is
@@ -3333,10 +3338,15 @@ class TurboKV {
     }
     // The IPC fallback. This is the one publish that is not strictly
     // CONFIRMED: flush() can still shed the batch under congestion. It cancels
-    // anyway, and that is the safe direction here -- a lost cap costs bounded
-    // divergence, while a cap left outstanding is ordered behind a write that
-    // did reach the arena through applyBatch and puts the old value back over
-    // it, which is a resurrection. The window is real across INSTANCES: a
+    // anyway, and the honest accounting of that choice is the opposite way
+    // round from what it looks like. A cap that arrives LATE re-publishes the
+    // value with `ttlMs = cap`, so it clears itself within l3FailTtlMs --
+    // bounded. A cap that is LOST leaves the value L3 refused resident with no
+    // expiry at all -- unbounded. So this trades an unbounded divergence for
+    // the certainty of never putting an old value back over a newer one, and
+    // it does so because that is the ranking this whole system is built on: a
+    // miss is the failure mode it accepts, a stale value is not. The cost is
+    // real and it is chosen, not avoided. The window is real across INSTANCES: a
     // handle on the ring holds the cap while a sibling opened with
     // `transport: 'ipc'` writes the same key, and two channels have no
     // ordering between them.
@@ -3361,6 +3371,24 @@ class TurboKV {
     #retimeRing(key, enc, cap) {
         if (!native.submitSet(key, enc, cap)) return false;
         this.#ringDoorbell();
+        return true;
+    }
+    // ONE MEMBER PER TRANSPORT, which is the whole point of naming the family.
+    // The publish family had an arena route, a ring route and an IPC route;
+    // the retime family had only the first two, so on a `transport: 'ipc'`
+    // worker the cap had nowhere to go and `l3FailTtlMs` simply did not exist:
+    // a value L3 had explicitly refused sat in the SHARED arena with no expiry,
+    // forever, and the only trace was an l3FailTtlUnapplied counter. That is
+    // the same convergence promise decision 68 makes, unkept on one transport.
+    //
+    // Like #publishOutbox, this one is queued rather than confirmed -- flush()
+    // can shed the batch -- so #stepCap's `sent` means "handed over" here
+    // rather than "accepted by the ring". A shed retime leaves the entry to
+    // time out on its window, which is the same outcome as before this route
+    // existed, for the subset of cases where the batch is dropped.
+    #retimeOutbox(key, enc, cap) {
+        this.#outbox.push('s', key, enc, cap);
+        this.#schedule(encodedBytes(enc) + key.length + 48);
         return true;
     }
 

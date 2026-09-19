@@ -86,6 +86,54 @@ if (process.env.TCC_ROLE === 'worker') {
     return;
 }
 
+// ------------------------------------------------ worker, ipc transport ----
+// THE RETIME FAMILY NEEDS ONE MEMBER PER TRANSPORT. The publish family has an
+// arena route, a ring route and an IPC route; the retime family had only the
+// first two, so on a `transport: 'ipc'` worker the cap had nowhere to go and
+// l3FailTtlMs simply did not exist -- a value L3 had explicitly refused sat in
+// the SHARED arena with no expiry, forever, and the only trace was a counter.
+// The same convergence promise decision 68 makes, unkept on one transport.
+if (process.env.TCC_ROLE === 'ipc') {
+    (async () => {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const w = TurboKV.attachWorker(process.env.TCC_ARENA, 1,
+            { storage: 'bytes', transport: 'ipc', l3: f.adapter, l3RetryMs: 10, l3FailTtlMs: 300 });
+        ok(w.transport === 'ipc', `the worker is on the IPC transport (${w.transport})`);
+        ok(await w.setAsync('refused', 'REFUSED-BY-L3') === false, 'the L3 write failed');
+
+        // Non-vacuous in both directions: the write must actually reach L2,
+        // and it must be there UNCAPPED first -- otherwise "it has a deadline
+        // now" would pass for a key that was never written, or for one the
+        // original write had already bounded.
+        for (let i = 0; i < 80 && native.get('refused') === undefined; i++) { await sleep(25); w.get('poke'); }
+        ok(native.get('refused') === 'REFUSED-BY-L3', `the write reached L2 (${native.get('refused')})`);
+        ok(native.lastTtlRemainingMs() === 0, 'and is resident with no expiry');
+
+        let ttl = 0, gone = false;
+        for (let i = 0; i < 80; i++) {
+            await sleep(25); w.get('poke');
+            if (native.get('refused') === undefined) { gone = true; break; }
+            ttl = native.lastTtlRemainingMs();
+            if (ttl > 0) break;
+        }
+        ok(ttl > 0 || gone,
+           `the cap reaches L2 over IPC too (ttlRemaining ${ttl}${gone ? ', already expired' : ''})`);
+        ok(ttl <= 300, `and it is the cap, not the value's own life (${ttl})`);
+        ok((w.stats.l3FailTtlUnapplied || 0) === 0,
+           `nothing is abandoned (${w.stats.l3FailTtlUnapplied || 0})`);
+
+        // And it converges, which is the promise the counter was standing in
+        // for.
+        for (let i = 0; i < 40 && w.get('refused') !== undefined; i++) await sleep(25);
+        ok(w.get('refused') === undefined, `the value L3 refused is gone (${w.get('refused')})`);
+        w.close();
+        console.log(fail ? `  ${fail} failed (ipc)` : '  [l3-cap] ipc-transport cases passed');
+        process.exit(fail ? 1 : 0);
+    })();
+    return;
+}
+
 // ------------------------------------------------- worker, shed and ipc ----
 // A SHED WRITE MUST NOT CANCEL A CAP, and an IPC write MUST. Both are one
 // branch inside one publish helper now, which is the point of the refactor --
@@ -101,7 +149,7 @@ if (process.env.TCC_ROLE === 'shed') {
         await a.drainL3();
         await sleep(20);
         a.__unsafePauseCaps();                  // nothing races the assertions below
-        ok(a.__unsafeCapState().caps === 1, `a cap is outstanding (${a.__unsafeCapState().caps})`);
+        ok(a.__unsafeHasCap('capped'), 'a cap is outstanding for the key');
 
         // Saturate the ring. The primary was started with maintenance off, so
         // nothing drains it.
@@ -110,11 +158,30 @@ if (process.env.TCC_ROLE === 'shed') {
         const before = a.stats.writesShed;
         a.set('capped', 'NEWER');               // shed: nothing reaches the ring
         ok(a.stats.writesShed > before, 'the write to the capped key is shed too');
-        ok(a.__unsafeCapState().caps === 1,
-           `a shed write does not cancel the cap (${a.__unsafeCapState().caps})`);
-        // The promotion path shares #publishRingSet, so it shares this branch.
-        f.store.set('capped', { value: 'L3VAL', expiresAt: 0 });
-        ok(a.__unsafeCapState().caps === 1, 'and still does after a shed promotion');
+        ok(a.__unsafeHasCap('capped'), 'a shed write does not cancel the cap');
+        // A SHED PROMOTION, actually issued. The promotion path shares
+        // #publishRingSet, so it shares the branch above -- but an assertion
+        // that only seeds the fake L3 and never reads claims something it does
+        // not test, and stayed green with the fix reverted.
+        //
+        // Its own instance, with a cap short enough that the read guard makes
+        // the key miss locally; the ring is already saturated, so the
+        // promotion that follows is shed.
+        const p2 = TurboKV.attachWorker(process.env.TCC_ARENA, 1,
+            { storage: 'bytes', l3: f.adapter, l3RetryMs: 5, l3FailTtlMs: 40 });
+        p2.set('shedpromo', 'OURS');
+        await p2.drainL3();
+        await sleep(20);
+        p2.__unsafePauseCaps();
+        ok(p2.__unsafeHasCap('shedpromo'), 'a second cap is outstanding');
+        await sleep(60);                        // past the 40ms cap
+        ok(p2.get('shedpromo') === undefined, `the key misses locally (${p2.get('shedpromo')})`);
+        f.store.set('shedpromo', { value: 'L3VAL', expiresAt: 0 });
+        const promoted = await p2.getAsync('shedpromo');
+        ok(promoted === 'L3VAL', `the read goes through to L3 (${promoted})`);
+        ok(p2.stats.writesShed > 0 || a.stats.writesShed > 0, 'the ring is still full, so that promotion was shed');
+        ok(p2.__unsafeHasCap('shedpromo'), 'a shed promotion does not cancel the cap either');
+        p2.close();
 
         // THE IPC FALLBACK, from a sibling instance. Those writes reach the
         // arena through applyBatch, on a channel with no ordering against the
@@ -124,8 +191,7 @@ if (process.env.TCC_ROLE === 'shed') {
             { storage: 'bytes', transport: 'ipc' });
         ok(ipc.transport === 'ipc', `the sibling negotiated the ipc transport (${ipc.transport})`);
         ipc.set('capped', 'VIA-IPC');
-        ok(a.__unsafeCapState().caps === 0,
-           `an IPC write cancels the cap (${a.__unsafeCapState().caps})`);
+        ok(!a.__unsafeHasCap('capped'), 'an IPC write cancels the cap');
         ipc.close();
 
         a.close();
@@ -438,6 +504,23 @@ if (process.env.TCC_ROLE === 'slow') {
             kid.on('exit', (c) => resolve(c));
         });
         ok(code === 0, `the shed/ipc cases passed (child exited ${code})`);
+        await primary.close();
+    }
+
+    // The IPC-transport case. The parent has to route the batches itself --
+    // this is a plain fork, not a cluster, so install() has no channel to wire.
+    {
+        const arena = ARENA + 'i';
+        const primary = TurboKV.createPrimary(arena, 16 << 20, 1 << 14,
+            { storage: 'bytes', maintenanceMs: 25 });
+        const code = await new Promise((resolve) => {
+            const kid = fork(__filename, [], {
+                env: { ...process.env, TCC_ROLE: 'ipc', TCC_ARENA: arena }, stdio: 'inherit',
+            });
+            kid.on('message', (m) => { if (TurboKV.isCacheMessage(m)) TurboKV.applyBatch(m); });
+            kid.on('exit', (c) => resolve(c));
+        });
+        ok(code === 0, `the ipc-transport cases passed (child exited ${code})`);
         await primary.close();
     }
 
