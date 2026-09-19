@@ -288,6 +288,19 @@ class TurboKV {
                                    // #l1Drop already removed the #byHash entry, so without this
                                    // a deleted key stayed suppressed even after another worker
                                    // recreated it
+    // Keys THIS instance removed, with the invalidation-ring position at which
+    // the removal became visible. #pendingDel answers "has my removal been
+    // applied yet"; this answers the different question the promotion guard
+    // asks -- "was this key removed AFTER the read in my hand started" -- and it
+    // has to outlive #pendingDel, which is cleared the moment the removal
+    // lands. Without it, a delete that both began and landed during one
+    // getAsync left the guard with only a ring hash to go on, which says "this
+    // key changed" and not "you removed it", so the caller was handed the value
+    // it had just deleted while get() answered undefined for the same key.
+    //
+    // Populated only when an adapter is attached: with no L3 there is nothing
+    // to promote and nothing to guard.
+    #deletedAt = new Map();
     #doorbellPending = false;           // retained FIFO cursor into #l1; see #oldestEntry
     #l1Max;
     #outbox = [];
@@ -1240,7 +1253,7 @@ class TurboKV {
         const r = native.ringRead(this.#cursor, 512);
         if (!r) return;                            // detached mid-drain
         if (r.wrapped) {                       // fell too far behind: flush wholesale
-            this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear();
+            this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear(); this.#deletedAt.clear();
             this.#cursor = r.head;
             return;
         }
@@ -1256,6 +1269,11 @@ class TurboKV {
             const pk = this.#pendingDelHash.get(r.hashes[i]);
             if (pk !== undefined) {              // the primary applied our delete; L2 is authoritative
                 this.#pendingDel.delete(pk); this.#pendingDelHash.delete(r.hashes[i]);
+                // The mark stops answering here, so the promotion guard needs
+                // the position it stopped at: a read that started before this
+                // record must still be refused, or it would promote -- and
+                // return -- the value this worker removed. See #deletedAt.
+                this.#noteDeleted(pk, this.#cursor + i + 1);
             }
             const k = this.#byHash.get(r.hashes[i]);
             if (k !== undefined) {
@@ -1451,6 +1469,32 @@ class TurboKV {
         return this.#queue !== null && this.#queue.outstandingKind(key) === 'delete';
     }
 
+    // Mark a key as removed-but-not-applied. Every route that submits a removal
+    // from a worker goes through here, so the 4096 bound -- and the rule that
+    // the mark is only taken when a removal was ACTUALLY submitted -- is stated
+    // once rather than at each call site.
+    //
+    // The bound is a wholesale flush rather than an eviction of the oldest
+    // entry: the marks have no useful order, and a Set that quietly dropped one
+    // key at a time would hide the condition. Losing marks costs stale reads
+    // until the invalidations arrive; growing without bound costs the process.
+    #markPendingDel(key, keyHash) {
+        if (this.#pendingDel.size >= 4096) { this.#pendingDel.clear(); this.#pendingDelHash.clear(); }
+        this.#pendingDel.add(key);
+        this.#pendingDelHash.set(keyHash, key);
+    }
+
+    // Record that `key` was removed, and where on the invalidation ring that
+    // removal became visible. See #deletedAt. Same wholesale-flush bound and
+    // the same reasoning: a dropped entry costs one blocked promotion, not
+    // correctness, and the entry is useless anyway once the ring head has
+    // passed it.
+    #noteDeleted(key, at) {
+        if (this.#queue === null) return;        // no adapter: nothing promotes, nothing to guard
+        if (this.#deletedAt.size >= 4096) this.#deletedAt.clear();
+        this.#deletedAt.set(key, at);
+    }
+
     // How many clears the CLUSTER has handed to L3 and not seen land, read
     // from the arena header (Header::l3ClearGen). This is the half of the
     // clear guard that crosses a process boundary; l3ClearsInFlight above is
@@ -1506,6 +1550,18 @@ class TurboKV {
         // what the caller is told.
         const owed = this.#queue === null ? undefined : this.#queue.outstandingKind(key);
         if (owed === 'delete' || (this.#pendingDel.size && this.#pendingDel.has(key))) return 'l3DeletedWhileReading';
+        // A REMOVAL OF OURS THAT HAS ALREADY COMPLETED, but completed after this
+        // read started. Neither check above can see it: the queue let go of the
+        // operation when L3 acknowledged it, and #pendingDel was cleared when
+        // the arena applied it. The ring still carries the record, but a hash
+        // match only says "this key changed", which blocks the promotion and
+        // leaves the caller holding the value it deleted while get() answers
+        // undefined. Remembering where our own removal landed is what tells the
+        // two apart. See #deletedAt.
+        if (this.#deletedAt.size) {
+            const at = this.#deletedAt.get(key);
+            if (at !== undefined && at > mark) return 'l3DeletedWhileReading';
+        }
         if (owed === 'set') return 'l3PromotionsBlocked';
         // A degraded worker has no arena to read the ring from, so it cannot
         // know what happened and must refuse. Refusing costs a promotion, not
@@ -1804,9 +1860,15 @@ class TurboKV {
             // same way a queued delete is, so local reads MISS until the ring
             // confirms it landed. A miss is the failure mode this system is
             // built around; a stale value is not.
-            if (this.#id !== 0) {
-                this.#pendingDel.add(key);
-                this.#pendingDelHash.set(native.hashKey(key), key);
+            //
+            // `minLevel: 3` is deliberately NOT marked here. It writes nothing
+            // locally, so the record that would clear the mark is the eviction
+            // below -- which is only published if it is actually submitted, and
+            // is not submitted at all on a degraded worker. Marking here left
+            // those keys permanently unreadable. The minLevel-3 branch takes
+            // the mark itself, at the point where it knows.
+            if (this.#id !== 0 && minLevel !== 3) {
+                this.#markPendingDel(key, keyHash);
             }
         }
         // `minLevel: L3` means NOTHING is written locally -- spec 5.2, and the
@@ -1827,10 +1889,23 @@ class TurboKV {
                 native.del(key, 0);
                 TurboKV.#dropOthers(key, this);
             } else if (!this.#primaryDead) {
-                // A worker already marked the key pendingDel above, so its own
-                // reads miss until the eviction comes back around the ring.
-                if (this.#ringIdx >= 0) { if (native.submitDel(key)) this.#ringDoorbell(); }
-                else { this.#outbox.push('d', key, null, 0); this.#schedule(key.length + 48); }
+                // MARKED ONLY WHEN THE EVICTION IS ACTUALLY SUBMITTED. The mark
+                // exists so this worker's reads miss until the eviction comes
+                // back around the ring, and only a submitted eviction ever
+                // produces that record. An eviction shed by a full ring, or
+                // skipped because the primary is gone, leaves a mark nothing
+                // can clear -- and a marked key is unreadable from every tier,
+                // L3 included, for the life of the worker.
+                if (this.#ringIdx >= 0) {
+                    if (native.submitDel(key)) { this.#markPendingDel(key, keyHash); this.#ringDoorbell(); }
+                    else {
+                        this.stats.writesShed = (this.stats.writesShed || 0) + 1;
+                        this.lastError = 'submission ring full; L2 eviction shed';
+                    }
+                } else {
+                    this.#markPendingDel(key, keyHash);
+                    this.#outbox.push('d', key, null, 0); this.#schedule(key.length + 48);
+                }
             }
             this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
             return true;
@@ -1965,6 +2040,15 @@ class TurboKV {
             const had = native.del(key, 0);
             this.#l1Drop(key);
             TurboKV.#dropOthers(key, this);
+            // The removal is applied to the arena synchronously here, so its
+            // ring position is exactly the head that follows it -- and that is
+            // true whether or not the key was present, because the removal is
+            // published either way (see storeDelete). A read already in flight
+            // marked an earlier head, so the comparison in #promotionBlock
+            // tells the two apart.
+            if (this.#queue !== null && storeReady && !this.#primaryDead) {
+                try { this.#noteDeleted(key, native.ringHead()); } catch { /* detached */ }
+            }
             this.#lastQueued = this.#queue
                 ? this.#queue.push({ kind: 'delete', key, originId: this.#originId(), bytes: key.length + 48 })
                 : null;
@@ -1981,9 +2065,8 @@ class TurboKV {
         // comes back around. Bounded: if the primary is not applying our
         // deletes, dropping the record only costs us a stale read, whereas
         // growing without bound costs the process.
-        if (this.#pendingDel.size >= 4096) { this.#pendingDel.clear(); this.#pendingDelHash.clear(); }
-        this.#pendingDel.add(key);
-        this.#pendingDelHash.set(native.hashKey(key), key);
+        const keyHash = native.hashKey(key);
+        this.#markPendingDel(key, keyHash);
         // The L3 half, shared by every worker path below. Same contract as
         // #queueSet: the sync caller ignores the promise, deleteAsync awaits
         // it. L3 is the store of record for a worker's delete -- there is no
@@ -1994,7 +2077,19 @@ class TurboKV {
             : null;
         if (this.#ringIdx >= 0) {
             if (native.submitDel(key)) this.#ringDoorbell();
-            else this.stats.writesShed = (this.stats.writesShed || 0) + 1;
+            else {
+                this.stats.writesShed = (this.stats.writesShed || 0) + 1;
+                this.lastError = 'submission ring full; L2 delete shed';
+                // NOTHING WAS SUBMITTED, so no invalidation record will ever
+                // come back to clear the mark -- and a marked key is
+                // unreadable from every tier including L3, permanently, while
+                // its entry counts toward the wholesale flush that then drops
+                // real pending deletes. The honest state is the one a shed
+                // write already has: the removal did not reach L2, which is
+                // counted and reported rather than hidden behind a local miss
+                // that never ends.
+                this.#pendingDel.delete(key); this.#pendingDelHash.delete(keyHash);
+            }
             return had;
         }
         this.#outbox.push('d', key, null, 0);
@@ -2023,7 +2118,7 @@ class TurboKV {
     // Drops only this process's L1. The shared arena is untouched, so the next
     // read simply repopulates it.
     clearLocal() {
-        this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear();
+        this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear(); this.#deletedAt.clear();
     }
 
     // Wipes the shared arena AND every worker's L1, via a flush record on the
