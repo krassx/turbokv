@@ -107,10 +107,11 @@ const l3FailTtl: number | undefined = c.stats.l3FailTtlApplied;
 const l3Blocked: number | undefined = c.stats.l3PromotionsBlocked;
 const l3Unhashable: number | undefined = c.stats.l3UnhashableKeys;
 const l3DelReading: number | undefined = c.stats.l3DeletedWhileReading;
-const l3Clearing: number | undefined = c.stats.l3ClearsInFlight;
+const l3Clearing: number | undefined = c.stats.l3ClearedWhileReading;
+const released: number = TurboKV.releaseWorker(1);
 const anyHit: boolean = (c.stats.l3Hits ?? 0) > 0;
 void [l3Hits, l3Misses, l3Sets, l3SetFailed, l3DeleteFailed, l3FailTtl,
-     l3Blocked, l3Unhashable, l3DelReading, l3Clearing, anyHit];
+     l3Blocked, l3Unhashable, l3DelReading, l3Clearing, released, anyHit];
 
 // --- the adapter contract matches spec section 4 ---------------------------
 //

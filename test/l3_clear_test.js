@@ -40,8 +40,8 @@ const load = () => { try { return JSON.parse(fs.readFileSync(FILE, 'utf8')); } c
 const save = (o) => fs.writeFileSync(FILE, JSON.stringify(o));
 // `clearMs` is what holds the clear in flight while the assertions run. It is
 // the whole point: a clear that lands instantly leaves no window to test.
-const fileL3 = (clearMs) => ({
-    async get(k) { const s = load(); return k in s ? { value: s[k] } : undefined; },
+const fileL3 = (clearMs, getMs = 0) => ({
+    async get(k) { if (getMs) await sleep(getMs); const s = load(); return k in s ? { value: s[k] } : undefined; },
     async set(k, v) { const s = load(); s[k] = v; save(s); },
     async delete(k) { const s = load(); delete s[k]; save(s); },
     async clear() { await sleep(clearMs); save({}); },
@@ -57,7 +57,7 @@ const waitFor = (target, t) => new Promise((resolve) => {
 // --- the worker half -------------------------------------------------------
 if (process.env.TCC_ROLE === 'worker') {
     (async () => {
-        const w = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l3: fileL3(400) });
+        const w = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l3: fileL3(400, 200) });
         const say = (t) => process.send({ t });
 
         // PHASE 1: this worker clears. Its L3 clear takes 400ms, and the
@@ -84,6 +84,24 @@ if (process.env.TCC_ROLE === 'worker') {
         ok(got === undefined,
            `a worker misses while ANOTHER process's clear is in flight (${got})`);
         say('phase2-read');
+
+        // PHASE 3: THE HEADER LAG. A worker cannot write the arena header, so
+        // its generation is opened by the primary when it applies the batch --
+        // and a read this worker already had in flight when it called
+        // clearAll() lands inside that window. The primary holds the batch
+        // here to make that window deterministic; in production it is one
+        // scheduled flush wide. Only the process-local counter can cover it,
+        // which is why the promotion guard has to consult BOTH.
+        say('phase3');
+        await waitFor(process, 'holding');
+        const read = w.getAsync('zz');           // 200ms in the adapter
+        await sleep(20);
+        w.clearAll();                            // local counter armed; the header is not
+        const lagged = await read;
+        ok(lagged === undefined,
+           `a read already in flight when THIS process cleared still misses (${lagged})`);
+        ok(w.get('zz') === undefined, `and nothing was promoted (${w.get('zz')})`);
+        say('phase3-read');
 
         await waitFor(process, 'bye');
         await w.close();
@@ -112,8 +130,8 @@ if (process.env.TCC_ROLE === 'worker') {
         ok(got === undefined, `the read misses rather than serving what the clear removes (${got})`);
         ok(c.get('c') === undefined, `and nothing is promoted (${c.get('c')})`);
         ok(native.get('c') === undefined, `not into the shared arena either (${native.get('c')})`);
-        ok(c.stats.l3ClearsInFlight === 1,
-           `counted as a clear in flight, not as key contention (${c.stats.l3ClearsInFlight})`);
+        ok(c.stats.l3ClearedWhileReading === 1,
+           `counted as blocked by the clear, not as key contention (${c.stats.l3ClearedWhileReading})`);
 
         // AND IT DISARMS AGAIN once the clear lands -- a guard that latched
         // would pass every assertion above for the wrong reason, and would
@@ -147,8 +165,8 @@ if (process.env.TCC_ROLE === 'worker') {
         const got = await read;
         ok(got === undefined, `a clear that came and went during the read still blocks it (${got})`);
         ok(c.get('g') === undefined, `and nothing is promoted (${c.get('g')})`);
-        ok(c.stats.l3ClearsInFlight === 1,
-           `counted as the clear it was (${c.stats.l3ClearsInFlight})`);
+        ok(c.stats.l3ClearedWhileReading === 1,
+           `counted as the clear it was (${c.stats.l3ClearedWhileReading})`);
         ok(c.stats.l3PromotionsBlocked === undefined,
            `and not also as key contention (${c.stats.l3PromotionsBlocked})`);
         await c.close();
@@ -185,10 +203,14 @@ if (process.env.TCC_ROLE === 'worker') {
     });
     const say = (t) => { if (kid.connected) kid.send({ t }); };
 
+    // Phase 3 holds the worker's batches instead of applying them, which is
+    // the header lag stretched out far enough to assert on.
+    let held = null;
+
     kid.on('message', async (m) => {
         // The worker's clearAll travels as an ordinary batch, exactly as it
         // does in a cluster; this is the primary applying it.
-        if (TurboKV.isCacheMessage(m)) { TurboKV.applyBatch(m); return; }
+        if (TurboKV.isCacheMessage(m)) { if (held) held.push(m); else TurboKV.applyBatch(m); return; }
 
         if (m.t === 'cleared') {
             ok(primary.get('k') === undefined, `the worker's clear emptied L2 (${primary.get('k')})`);
@@ -213,6 +235,25 @@ if (process.env.TCC_ROLE === 'worker') {
             TurboKV.drainSubmissions(8192);
             ok(native.get('m') === undefined,
                `no worker promotion reached L2 during the primary's clear (${native.get('m')})`);
+            return;
+        }
+        if (m.t === 'phase3') {
+            // This primary's own clear must be FULLY settled first, or the
+            // header would still be armed and would mask the window under
+            // test.
+            await primary.drainL3();
+            ok(native.l3ClearsInFlight() === 0, 'no clear is outstanding anywhere before phase 3');
+            save({ zz: 'v' });                   // only L3 holds it: L2 was cleared
+            held = [];                           // ... and now the primary stops applying batches
+            say('holding');
+            return;
+        }
+        if (m.t === 'phase3-read') {
+            for (const b of held) TurboKV.applyBatch(b);
+            held = null;
+            TurboKV.drainSubmissions(8192);
+            ok(native.get('zz') === undefined,
+               `nothing the worker read inside the lag reached L2 (${native.get('zz')})`);
             say('bye');
         }
     });

@@ -801,10 +801,28 @@ class TurboKV {
         const attach = w => {
             if (!w || wired.has(w)) return;
             wired.add(w);
+            // The writer ids this channel has actually used. A worker that
+            // vanishes mid-clear cannot send the `-` that closes its clear
+            // generation, and an open generation makes every process on the
+            // box serve L3 misses for every key -- so when the channel goes
+            // away the primary settles what that worker still owed. Learned
+            // from the batches themselves rather than assumed to be
+            // `worker.id`: the id is the caller's to choose (it is the ring's
+            // writer id), and this must reconcile the id that actually opened
+            // the generation.
+            const ids = new Set();
             w.on('message', m => {
                 if (m && m.t === RING_MSG) { TurboKV.drainSubmissions(); return; }
-                if (TurboKV.isCacheMessage(m)) TurboKV.applyBatch(m);
+                if (TurboKV.isCacheMessage(m)) { ids.add(m.id); TurboKV.applyBatch(m); }
             });
+            // Both, and idempotent by construction: a disconnect usually
+            // precedes an exit, and releaseWorker settles nothing the second
+            // time. A worker that merely disconnects can no longer deliver a
+            // `-` either, so waiting for 'exit' would hold the guard armed for
+            // no benefit.
+            const gone = () => { for (const id of ids) TurboKV.releaseWorker(id); };
+            w.on('exit', gone);
+            w.on('disconnect', gone);
         };
         cluster.on('online', attach);
         cluster.on('fork', attach);
@@ -1383,7 +1401,7 @@ class TurboKV {
             // Every other reason leaves the caller
             // with what L3 returned -- blocking changes only what is stored
             // locally, never what this caller observes.
-            if (why === 'l3DeletedWhileReading' || why === 'l3ClearsInFlight') return undefined;
+            if (why === 'l3DeletedWhileReading' || why === 'l3ClearedWhileReading') return undefined;
             return this.#decodeFromL3(rec.value);
         }
         this.#fillFromL3(key, rec, level);
@@ -1429,9 +1447,13 @@ class TurboKV {
     // never live in L1 or L2 at all, whatever the ring says, and
     // `l3DeletedWhileReading` is a prevented resurrection, the one reason that
     // also changes the answer the caller gets (see #fetchFromL3), and
-    // `l3ClearsInFlight` is a clear SOMEWHERE IN THE CLUSTER that L3 has not
-    // applied yet -- an operator seeing that number wants to know a flush is
-    // still landing, not to have it counted as per-key contention.
+    // `l3ClearedWhileReading` is a clear SOMEWHERE IN THE CLUSTER that was
+    // handed to L3 while this read was in flight and has not been applied
+    // there yet -- an operator seeing that number wants to know a flush is
+    // still landing, not to have it counted as per-key contention. It is a
+    // COUNT OF BLOCKED READS, deliberately not named after the arena gauge
+    // `native.l3ClearsInFlight()`, which measures a level rather than
+    // counting events.
     #promotionBlock(key, mark, clearMark) {
         // WHAT THIS PROCESS ITSELF STILL OWES L3, asked first and asked of the
         // queue rather than the ring.
@@ -1471,7 +1493,16 @@ class TurboKV {
         // the only signal that crosses a process boundary; `clearMark` catches
         // a clear that both began and settled inside this one read, where the
         // in-flight count has already gone back to zero.
-        if (this.#sharedClearsInFlight() > 0 || native.l3ClearGen() !== clearMark) return 'l3ClearsInFlight';
+        //
+        // BOTH HALVES, exactly as the entry guard asks them. The header lags a
+        // worker by one flush (see #openClearGen), and a read this worker
+        // already had in flight when it called clearAll() lands inside that
+        // lag: asking only the header there returns the value this process's
+        // own clear is erasing -- no resurrection into the arena, but a direct
+        // contradiction of "no exception for reads that started first", and of
+        // the entry guard, which has been answering misses since the call.
+        if (l3ClearsInFlight > 0 || this.#sharedClearsInFlight() > 0 ||
+            native.l3ClearGen() !== clearMark) return 'l3ClearedWhileReading';
         const h = native.hashKey(key);
         // A key the arena cannot even hash -- a lone surrogate -- has no ring
         // record to compare against, and `get` already treats it as never
@@ -2028,17 +2059,30 @@ class TurboKV {
         this.#schedule(48);
     }
 
-    // Close it again. Flushed immediately rather than batched: until this
-    // reaches the primary EVERY process in the cluster is serving L3 misses,
-    // and a worker that has just flushed its cache may have nothing else to
-    // say for a long time. Reached after close() too -- a clear retries
-    // indefinitely, but close() stops the retry loop and the queue settles
-    // the op (see #closeL3), which is what keeps a clear that never lands
-    // from arming this guard for the life of the arena.
-    #settleClearGen() {
+    // Close it again -- and it has to actually LEAVE this process, because
+    // while it sits in the outbox every process in the cluster is serving L3
+    // misses for every key.
+    //
+    // It is scheduled like any other op, and then CHASED. flush() defers a
+    // whole batch whenever the IPC send window is full, and nothing re-arms
+    // the flush until the next write -- which, for a worker that has just
+    // flushed its cache, is exactly the "nothing else to say" case: the `-`
+    // sat in the outbox with no timer behind it, stalled until traffic that
+    // might never come. So while it is still queued, an unref'd timer keeps
+    // trying. Unref'd because a settle must never be the reason a process
+    // cannot exit, and it stops the moment the outbox drains or the channel
+    // is gone -- after which the primary's own reconciliation (see
+    // releaseWorker) is what settles what this process could not.
+    //
+    // Reached after close() too: a clear retries indefinitely, but close()
+    // stops the retry loop and the queue settles the op (see #closeL3).
+    #settleClearGen(resend = false) {
         if (this.#id === 0) { TurboKV.#l3ClearSettle(); return; }
-        this.#outbox.push('-', '', null, 0);
+        if (!resend) { this.#outbox.push('-', '', null, 0); this.#schedule(48); }
         this.flush();
+        if (this.#outbox.length === 0 || !process.connected) return;
+        const t = setTimeout(() => this.#settleClearGen(true), 50);
+        if (t.unref) t.unref();
     }
 
     // The header writes themselves, on the primary. Wrapped because both are
@@ -2049,6 +2093,57 @@ class TurboKV {
     // worth throwing out of a promise chain nobody awaits.
     static #l3ClearBegin() { try { native.l3ClearBegin(); } catch { /* no arena to guard */ } }
     static #l3ClearSettle() { try { native.l3ClearSettle(); } catch { /* no arena to guard */ } }
+
+    // WHAT EACH WORKER HAS OPENED AND NOT SETTLED, on the primary: writerId ->
+    // count. Two jobs, and neither is bookkeeping for its own sake.
+    //
+    // 1. A worker that VANISHES mid-clear -- SIGKILL, a crash, a container
+    //    stop -- never sends its `-`. Without this the generation stays open
+    //    for the life of the arena and every process on the box serves L3
+    //    misses for every key, permanently. The primary settles what the
+    //    worker still owed when the channel goes away (see releaseWorker).
+    // 2. `-` is a lever that DISARMS a cluster-wide guard, and it arrives over
+    //    the same IPC channel any worker holds. Before this, a worker could
+    //    only wipe; now it could un-guard someone else's clear. Counting per
+    //    writer makes that an accounting rule rather than a new permission: a
+    //    worker can settle exactly as many generations as it opened, and one
+    //    whose `-` does not match a `+` of its own changes nothing.
+    //
+    // The primary's own clears are NOT tracked here. They do not travel over
+    // IPC, so neither job applies: there is no channel to lose and no message
+    // to forge, and if the primary dies the arena dies with it.
+    static #clearGensOwed = new Map();
+
+    static #l3ClearOpenFor(id) {
+        TurboKV.#clearGensOwed.set(id, (TurboKV.#clearGensOwed.get(id) || 0) + 1);
+        TurboKV.#l3ClearBegin();
+    }
+
+    // Returns false when this writer has nothing open -- a `-` that matches no
+    // `+` of its own settles nothing at all.
+    static #l3ClearSettleFor(id) {
+        const owed = TurboKV.#clearGensOwed.get(id) || 0;
+        if (owed <= 0) return false;
+        if (owed === 1) TurboKV.#clearGensOwed.delete(id);
+        else TurboKV.#clearGensOwed.set(id, owed - 1);
+        TurboKV.#l3ClearSettle();
+        return true;
+    }
+
+    // A worker is gone: settle every clear generation it still owed, so its
+    // disappearance does not leave the cluster serving L3 misses forever.
+    // Returns how many were settled.
+    //
+    // install() calls this on 'exit' and 'disconnect'. It is public for the
+    // same reason applyBatch is: a primary that wires the IPC channel itself,
+    // without cluster, has to be able to do the whole job -- and reconciling a
+    // dead worker is part of the job. Idempotent: a second call settles
+    // nothing, so 'exit' after 'disconnect' is free.
+    static releaseWorker(id) {
+        let n = 0;
+        while (TurboKV.#l3ClearSettleFor(id)) n++;
+        return n;
+    }
 
     // clearAll(), then L3. Identical effects to clearAll(); the only
     // difference is that this one can wait for L3 (and, unlike a set or a
@@ -2324,8 +2419,22 @@ class TurboKV {
             // Window full AND our own buffer is full: shed rather than grow
             // without bound. The value stays in this worker's L1, it just does
             // not reach L2, so other workers see a miss, never a wrong value.
-            this.stats.writesShed = (this.stats.writesShed || 0) + this.#outbox.length / 4;
-            this.#outbox = [];
+            //
+            // A CLEAR-GENERATION OP IS NOT SHED WITH THE REST. Shedding a
+            // write costs one key its place in L2 and the value is still in
+            // L1; shedding the `-` that closes a clear generation leaves
+            // EVERY process in the cluster serving L3 misses for EVERY key
+            // until this worker happens to write again. They carry no key and
+            // no value, so keeping them cannot be what grows this buffer --
+            // one per clearAll, and a clear is not a hot-path operation.
+            const keep = [];
+            for (let i = 0; i < this.#outbox.length; i += 4) {
+                const op = this.#outbox[i];
+                if (op === '+' || op === '-') keep.push(op, '', null, 0);
+            }
+            this.stats.writesShed = (this.stats.writesShed || 0) +
+                                    (this.#outbox.length - keep.length) / 4;
+            this.#outbox = keep;
             this.#outboxBytes = 0;
             this.lastError = 'IPC send window full; L2 writes shed';
             return;
@@ -2409,8 +2518,8 @@ class TurboKV {
             // writer -- does it. '+' arrives in the same batch as the 'c' it
             // belongs to and immediately before it; '-' arrives once that
             // worker's adapter has actually applied the clear.
-            else if (op === '+') TurboKV.#l3ClearBegin();
-            else if (op === '-') TurboKV.#l3ClearSettle();
+            else if (op === '+') TurboKV.#l3ClearOpenFor(msg.id);
+            else if (op === '-') TurboKV.#l3ClearSettleFor(msg.id);
         }
     }
 

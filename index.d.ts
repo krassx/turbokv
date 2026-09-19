@@ -290,11 +290,13 @@ export interface CacheStats {
     /** L3 hits discarded because this process deleted the key while the read
      *  was in flight. */
     l3DeletedWhileReading?: number;
-    /** L3 hits not promoted because a `clearAll()` -- issued by ANY process
-     *  sharing this arena, not necessarily this one -- had been handed to L3
-     *  and had not landed yet. Promoting there would put back exactly what the
-     *  clear is removing. */
-    l3ClearsInFlight?: number;
+    /** L3 hits discarded because a `clearAll()` -- issued by ANY process
+     *  sharing this arena, not necessarily this one -- was handed to L3 while
+     *  this read was in flight and had not landed there yet. Serving that
+     *  value, or promoting it, would put back exactly what the clear is
+     *  removing. A count of blocked reads, not a measure of how many clears
+     *  are outstanding. */
+    l3ClearedWhileReading?: number;
     [k: string]: unknown;
 }
 
@@ -369,6 +371,16 @@ export declare class TurboKV<T = unknown> {
      *  Only call this for messages {@link isCacheMessage} accepted, and only on
      *  the primary. `install()` does exactly this for you. */
     static applyBatch(m: unknown): void;
+
+    /** Tell the primary that the worker writing under `id` is gone, so any L3
+     *  `clear` it had in flight is settled rather than left blocking L3 reads
+     *  in every process for the life of the arena. Returns how many were
+     *  settled, and is idempotent.
+     *
+     *  `install()` calls this on a worker's `'exit'` and `'disconnect'`. Call
+     *  it yourself only if you route cluster messages yourself, the way
+     *  {@link applyBatch} is called -- the two are a pair. */
+    static releaseWorker(id: number): number;
 
     /** Undefined when no arena is attached (before open, or after close). */
     static arenaStats(): ArenaStats | undefined;

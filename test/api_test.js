@@ -102,7 +102,7 @@ c.close();
 // a new helper cannot drift onto it unnoticed.
 {
     const DECLARED_STATICS = [
-        'createPrimary', 'attachWorker', 'open', 'install', 'isCacheMessage', 'applyBatch',
+        'createPrimary', 'attachWorker', 'open', 'install', 'isCacheMessage', 'applyBatch', 'releaseWorker',
         'arenaStats', 'submitStats', 'primaryAgeMs', 'autoSize',
         'defaultName', 'hasCompression', 'deepFreeze', 'assertFastCodec',
         'JSON_CODEC', 'V8_CODEC', 'drainSubmissions', 'heapGuardPace', 'L1', 'L2', 'L3',
