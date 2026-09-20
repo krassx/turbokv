@@ -195,5 +195,133 @@ for (const m of L3_METHODS) {
     ok(calls.length === 1, `#publishL3Derived() has exactly one call site (${calls.length})`);
 }
 
+// --- EVERY MARK IS TAKEN AND RELEASED BY KIND ---------------------------
+//
+// A worker carries two marks: "I REMOVED this key and the primary has not
+// applied it" and "I WROTE this key and it has not landed". They used to be
+// ONE set, `#pendingDel`, taken for a delete AND for a `minLevel: 2` set --
+// and every consumer then had to guess which it was looking at. The third
+// adversarial pass found four defects, one per guess: a cap that read a set's
+// mark as a pending delete and skipped itself, a wrapped-ring reconciliation
+// that keeps a mark on exactly the condition that means a WRITE has landed, a
+// self-mark released by any record at all, and a set recorded as a removal for
+// the promotion guard.
+//
+// The kind now lives in the RECEIVER: `this.#pendingDel` or
+// `this.#pendingWrite`, each a PendingMarks built with its kind. There is no
+// way to take or release a mark without having chosen one -- unless a later
+// edit reintroduces one, which is what this section is for. Same one-level
+// textual scan, same known limits, same reason: the behaviours are pinned in
+// review4_regression_test.js, and the behaviours were pinned each round
+// before, while the next round found the next site.
+{
+    const MARK_SETS = ['#pendingDel', '#pendingWrite'];
+    const MUTATORS = ['.mark(', '.release(', '.releaseUpTo('];
+    // The mark sets are built once each, and say which kind they are.
+    const built = text.split('\n').filter(l => !/^\s*\/\//.test(l) && l.includes('new PendingMarks('));
+    ok(built.length === 2, `there are exactly two mark sets (${built.length})`);
+    ok(built.filter(l => l.includes("PendingMarks('delete')")).length === 1, 'one for removals');
+    ok(built.filter(l => l.includes("PendingMarks('write')")).length === 1, 'one for writes');
+
+    // Every mutation names one of them ON THE SAME LINE. A helper that took
+    // the set as a parameter, or picked it from a flag, would land here.
+    let member2 = '<module scope>';
+    const mutations = [];
+    const strayMut = [];
+    const lines2 = text.split('\n');
+    // Inside PendingMarks itself the receiver is `this`, and that class IS the
+    // kind: it is constructed with one and never changes it. Everything from
+    // its declaration to the cache class is therefore skipped.
+    const classFrom = lines2.findIndex(l => /^class PendingMarks \{/.test(l));
+    const classTo = lines2.findIndex(l => /^class TurboKV \{/.test(l));
+    ok(classFrom >= 0 && classTo > classFrom, 'PendingMarks is declared above the cache');
+    for (let i = 0; i < lines2.length; i++) {
+        const m = MEMBER.exec(lines2[i]);
+        if (m) member2 = m[1];
+        if (i >= classFrom && i < classTo) continue;
+        const code = lines2[i].replace(/^\s*\/\/.*$/, '');
+        if (!MUTATORS.some(v => code.includes(v))) continue;
+        mutations.push([member2, i + 1]);
+        if (!MARK_SETS.some(set => code.includes(set + '.'))) strayMut.push([member2, i + 1, code.trim()]);
+    }
+    ok(mutations.length >= 6, `the scanner finds the mark mutations at all (${mutations.length})`);
+    ok(strayMut.length === 0,
+       strayMut.length === 0
+           ? 'every mark is taken or released on a set that names its kind'
+           : `marks mutated without naming a kind: ` +
+             strayMut.map(([n, l, c]) => `${c} in ${n}() at line ${l}`).join('; '));
+    // ...and BOTH kinds are actually mutated, or the check above passes for a
+    // build that quietly went back to one set.
+    for (const set of MARK_SETS) {
+        const n = lines2.filter(l => !/^\s*\/\//.test(l) && MUTATORS.some(v => l.includes(v)) && l.includes(set + '.')).length;
+        ok(n >= 2, `${set} is both taken and released (${n} sites)`);
+    }
+
+    // No aliasing: a local holding "whichever set" is how the kind stops being
+    // visible at the call site even though the receiver names it.
+    const aliases = lines2.filter(l => !/^\s*\/\//.test(l) && /(=|\()\s*this\.#pending(Del|Write)\s*[;,)]/.test(l));
+    ok(aliases.length === 0,
+       aliases.length === 0 ? 'no call site aliases a mark set into a variable'
+                            : `a mark set is aliased: ${aliases.map(l => l.trim()).join('; ')}`);
+
+    // THE CONSUMERS ASK THE QUESTION THEY MEAN.
+    //
+    //   #deletedHere   -- removals only. Its callers refuse to ask L3 at all,
+    //                     which is right for a key we removed and wrong for
+    //                     one we have just written.
+    //   #unappliedHere -- the ONE question that wants either, said out loud.
+    //   the cap        -- neither: the primary's compare answers it, one hop
+    //                     later, where it can be answered synchronously.
+    const bodyCode = (name) => {
+        const b = bodyOf(name);
+        return b === null ? null : b.split('\n').map(l => l.replace(/^\s*\/\/.*$/, '')).join('\n');
+    };
+    {
+        const b = bodyCode('#deletedHere');
+        ok(b !== null, '#deletedHere() exists');
+        ok(b !== null && b.includes('#pendingDel.has('), '#deletedHere() asks the removal mark');
+        ok(b !== null && !b.includes('#pendingWrite'), '#deletedHere() does NOT ask the write mark');
+    }
+    {
+        const b = bodyCode('#unappliedHere');
+        ok(b !== null, '#unappliedHere() exists');
+        ok(b !== null && b.includes('#pendingDel.has(') && b.includes('#pendingWrite.has('),
+           '#unappliedHere() asks both, which is what it is for');
+        const callers = lines2.filter(l => !/^\s*\/\//.test(l) && l.includes('#unappliedHere(') && !l.includes('#unappliedHere(key) {'));
+        ok(callers.length >= 2, `and it has the read-path callers (${callers.length})`);
+    }
+    {
+        const b = bodyCode('#capL2AfterL3Failure');
+        ok(b !== null, '#capL2AfterL3Failure() exists');
+        ok(b !== null && !MARK_SETS.some(set => b.includes(set)),
+           'the cap consults no mark: the primary compares the arena instead');
+    }
+
+    // A BATCH THAT IS DROPPED RELEASES WHAT IT CARRIED, on every route out.
+    // Only the shed branch did, so a synchronous send throw -- one bigint
+    // under JSON serialization does it for a whole batch -- left a delete
+    // marked forever. There are four drop routes in flush(); each must pair
+    // with a release, and a fifth added later fails here.
+    {
+        const b = bodyOf('flush');
+        ok(b !== null, 'flush() exists');
+        const fl = (b || '').split('\n');
+        const releases = fl.filter(l => !/^\s*\/\//.test(l) && l.includes('#releaseBatchMarks('));
+        ok(releases.length === 4, `flush() releases marks on every route out (${releases.length} of 4)`);
+        const drops = [];
+        for (let i = 0; i < fl.length; i++) {
+            if (/^\s*\/\//.test(fl[i])) continue;
+            if (!/flushDropped = \(/.test(fl[i]) && !/writesShed = \(this\.stats\.writesShed \|\| 0\) \+ shed/.test(fl[i])) continue;
+            const near = fl.slice(Math.max(0, i - 14), i + 8).join('\n');
+            drops.push([i + 1, near.includes('#releaseBatchMarks(')]);
+        }
+        ok(drops.length === 4, `the scanner found every drop site (${drops.length})`);
+        const unpaired = drops.filter(([, paired]) => !paired);
+        ok(unpaired.length === 0,
+           unpaired.length === 0 ? 'and each one is paired with a release'
+                                 : `a batch is dropped without releasing its marks, near flush() line ${unpaired.map(d => d[0]).join(', ')}`);
+    }
+}
+
 console.log(fail ? `  ${fail} FAILURES` : '  [write-sites] all passed');
 process.exit(fail ? 1 : 0);
