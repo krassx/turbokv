@@ -174,11 +174,27 @@ scripts/                          build helpers
   have landed, and `stats.l3FailTtlUnconfirmed` counts those whose outcome the
   worker could not establish. **Watch both, and expect the second one.** The
   proof needs the invalidation ring to still reach back to the moment the cap
-  was taken; the ring holds at most 65536 records, on the order of 100ms of
-  primary writes under load, against roughly 7 seconds from a cap's mark to its
+  was taken; the ring holds `ringCap` records — `min(65536, 4% of the arena / 16
+  bytes)`, rounded down to a power of two with a floor of 8192, so **32768 at
+  the 16MB default and 8192 on a 2MB arena** — on the order of 100ms of primary
+  writes under load, against roughly 7 seconds from a cap's mark to its
   retirement at the default `l3FailTtlMs`. So on a busy box `Unapplied` goes
   quiet and `Unconfirmed` becomes the normal bucket — an operator watching only
   the first would see nothing during exactly the outage this exists for.
+- **`transport: 'ipc'`, `minLevel: 2` or `3`, and a lapped ring**: a worker that
+  falls a full `ringCap` behind the invalidation ring has to flush what it is
+  holding, and it must then decide whether its own submitted-but-unapplied
+  writes have landed. On the default `'shm'` transport it *knows*: the
+  submission ring is single-producer, so the primary's consumer index answers
+  exactly, and a write that has not been applied keeps missing locally. On
+  `'ipc'` nothing acknowledges a batch, so the question is unanswerable and the
+  mark is dropped — and that worker can then read **L2's previous value** for a
+  key it wrote at `minLevel: 2` or `3` and was told succeeded. It is not one
+  read: it lasts until something else replaces or invalidates the key. Nothing
+  has to be broken to reach it — a *synchronous* write burst on the primary
+  turns no event loop, so its doorbell never fires and its 500ms backstop never
+  runs, and ~8300 records is a full lap on a 2MB arena. Stay on `'shm'` if you
+  use `minLevel` above 1.
 
 The full design, decision log and measurements — including what was built and
 rejected — are in [DESIGN.md](DESIGN.md).

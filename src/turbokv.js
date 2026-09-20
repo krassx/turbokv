@@ -408,6 +408,14 @@ const ATTACH_NONCE = `${process.pid}.${Date.now().toString(36)}.${Math.random().
 //         past its own record is one nothing can ever clear.
 //   seq   a process-wide, monotonic mark number, so a batch that is dropped
 //         releases the marks IT took and not a newer mark for the same key.
+//   sub   the SUBMISSION ring position just past our own record, read from
+//         native.submitHead() immediately after the push. The submission ring
+//         is SPSC with this worker as the producer, so the primary's consumer
+//         index answers "has my record been applied?" exactly, with no
+//         guessing from the arena -- see #reconcileWrites, which is the one
+//         place that needs an answer the invalidation ring cannot give.
+//         -1 when the question is unanswerable: the IPC fallback, whose
+//         batches are acked by nothing, and any push with no ring claimed.
 //
 // Zero for `at` when the head cannot be read (degraded, detached): every
 // record then clears the mark, which is the behaviour this replaces and the
@@ -436,7 +444,7 @@ class PendingMarks {
     // order, not leave a fresh mark in an old slot -- `Map.set` on a key
     // already present keeps its FIRST-insertion position, which would evict
     // exactly the keys most likely to still need the mark.
-    mark(key, hash, at) {
+    mark(key, hash, at, sub = -1) {
         this.byKey.delete(key);
         if (this.byKey.size >= PENDING_MARK_MAX) {
             const oldest = this.byKey.entries().next();
@@ -446,8 +454,16 @@ class PendingMarks {
                     this.byHash.delete(oldest.value[1].hash);
             }
         }
-        this.byKey.set(key, { hash, at, seq: ++markSeq });
+        this.byKey.set(key, { hash, at, seq: ++markSeq, sub });
         this.byHash.set(hash, key);
+    }
+    // Where on the SUBMISSION ring this mark's record ends, or -1 when that is
+    // unknowable. `undefined` means there is no such mark -- a caller
+    // iterating a slice has to tell "released under me" from "nothing to
+    // compare", which is the distinction #reconcileRemovals makes with has().
+    submittedAt(key) {
+        const m = this.byKey.get(key);
+        return m === undefined ? undefined : m.sub;
     }
     // Move an existing mark to the BACK of the order without changing it --
     // not a re-mark: the position it was taken at is what a record is compared
@@ -521,6 +537,12 @@ class TurboKV {
     // reconciliation is budgeted and has to resume across drains. See
     // #reconcileRemovals.
     #reconcileOwed = 0;
+    // The same, for WRITE marks, against the submission ring's consumer index
+    // rather than the arena. Separate from #reconcileOwed because it is a
+    // different question with a different answer source, and folding the two
+    // into one counter is precisely the overloading this pass exists to undo.
+    // See #reconcileWrites.
+    #writeOwed = 0;
     #doorbellPending = false;           // retained FIFO cursor into #l1; see #oldestEntry
     #l1Max;
     #outbox = [];
@@ -1594,6 +1616,7 @@ class TurboKV {
         // anyway, so this costs nothing.
         const head = native.ringHead();
         if (this.#reconcileOwed > 0) this.#reconcileRemovals(head);
+        if (this.#writeOwed > 0) this.#reconcileWrites();
         if (head === this.#cursor) return;
         const r = native.ringRead(this.#cursor, 512);
         if (!r) return;                            // detached mid-drain
@@ -1639,19 +1662,36 @@ class TurboKV {
             // undefined from every tier -- L3 included, never asked -- on this
             // worker, permanently. `has() === false` says no less: the arena
             // holds nothing for the key, so there is no older value for the
-            // mark to protect anyone from and a read misses anyway. Neither
-            // answer justifies keeping a write mark, so a wrap RELEASES them,
-            // and no arena call is made for them at all.
+            // mark to protect anyone from and a read misses anyway.
             //
-            // Its residue, stated rather than left to be found: a write this
-            // primary has genuinely not drained, whose predecessor is still
-            // resident, can be read from L2 once after a wrap. That needs the
-            // primary to append a full ring of records -- 65536 -- while never
-            // draining a submission ring, which is the case where its own
-            // doorbell and its 500ms backstop have both stopped working. The
-            // alternative is a mark nothing can ever clear, which is the
-            // permanent failure above, and this system's ranking puts one
-            // possible stale read below an unreadable key.
+            // SO A WRITE MARK IS NOT ASKED OF THE ARENA AT ALL -- it is asked
+            // of the SUBMISSION RING'S CONSUMER INDEX, which answers the
+            // precise question instead of a proxy for it. The ring is SPSC
+            // with this worker as the producer, so the primary's `tail` past
+            // our own record means it drained and applied that record, and
+            // nothing else does. Released iff it did; KEPT otherwise -- and a
+            // kept mark is re-examined on every later drain (see
+            // #reconcileWrites), so it cannot become the permanently
+            // unreadable key above. A wrap used to release them all, which is
+            // where the residue below came from.
+            //
+            // THE RESIDUE THAT IS LEFT, and the honest size of it. The IPC
+            // fallback has no consumer index: a batch handed to process.send
+            // is acked by nothing, so "did the primary apply my write" is
+            // genuinely unanswerable there and the mark is released, exactly
+            // as it used to be for both transports. A `minLevel: 2` write an
+            // IPC worker has submitted and the primary has not applied can
+            // therefore be read from L2 at its PREVIOUS value after a wrap --
+            // and it is not one read: it persists until something else
+            // replaces or invalidates that key. The threshold is `ringCap`
+            // records appended by the primary, NOT 65536: store.h sizes the
+            // ring as min(65536, 4% of the arena / 16 bytes), rounded down to
+            // a power of two with a floor of 8192 -- so 32768 at the 16MB
+            // default and 8192 on a 2MB arena. No failure is needed to reach
+            // it: a synchronous write burst on the primary turns no event
+            // loop, so its doorbell never fires and its 500ms backstop never
+            // runs, and ~8300 records on a small arena is enough. README says
+            // the same thing where it lists what to watch for.
             //
             // #deletedAt and #l3Caps need no reconciliation: the first is
             // compared against ring POSITIONS, which are monotonic and which
@@ -1659,7 +1699,8 @@ class TurboKV {
             // the second resolves against the arena on its own timer, which a
             // wrap tells it nothing about.
             this.#dropCachedValues();
-            this.#pendingWrite.clear();
+            this.#writeOwed = this.#pendingWrite.size;
+            if (this.#writeOwed) this.#reconcileWrites();
             this.#reconcileOwed = this.#pendingDel.size;
             if (this.#reconcileOwed) this.#reconcileRemovals(r.head);
             this.#cursor = r.head;
@@ -1966,8 +2007,8 @@ class TurboKV {
 
     // See the wrapped branch of #drain. Keeps only the REMOVAL marks the arena
     // still justifies, and hands the rest to #deletedAt so a read already in
-    // flight cannot promote what they were protecting. Write marks are not
-    // reconciled at all -- the wrap branch says why.
+    // flight cannot promote what they were protecting. Write marks have their
+    // own pass below, because they have their own question.
     #reconcileRemovals(head) {
         // A BUDGETED SLICE, resumed on later drains. #drain() runs from get()
         // AND has(), and a ring that keeps lapping between reads makes every
@@ -2001,6 +2042,97 @@ class TurboKV {
             this.#noteDeleted(key, head);
         }
         if (this.#reconcileOwed < 0 || this.#pendingDel.size === 0) this.#reconcileOwed = 0;
+    }
+
+    // The same job for WRITE marks after a wrap, and it asks a different thing
+    // of a different place.
+    //
+    // A removal's question is "does the arena still hold the key", because a
+    // removal that landed removed it. A write's landing is "the key is held",
+    // which the arena also says for a write that has NOT landed and whose
+    // predecessor is still resident -- so the arena cannot answer this one at
+    // all, in either direction. That is why a wrap used to simply drop every
+    // write mark, and why a `minLevel: 2` write the primary had not applied
+    // went back to reading the value it had replaced.
+    //
+    // THE SUBMISSION RING ANSWERS IT EXACTLY. It is SPSC with this worker as
+    // the producer, so its consumer index is the primary saying, in its own
+    // words, how far it has got; the position just past our own record was
+    // recorded when the record was pushed (see PendingMarks' `sub`). Past it
+    // means applied -- SubmitDrain publishes the index with a release store
+    // after the arena write -- so the mark has done its job and goes. Short of
+    // it means NOT applied, so L2 still holds the value our write supersedes
+    // and the mark stays.
+    //
+    // A KEPT MARK IS NOT A STUCK MARK, which is the failure this must not
+    // reintroduce. It is re-examined on every later drain until the index
+    // passes it, so the only way it outlives the process is a primary that is
+    // alive, holding our record, and never draining -- the same condition
+    // under which a removal mark persists, and one that misses rather than
+    // lying.
+    //
+    // A `sub` of -1 is UNKNOWABLE, not "not yet": the IPC fallback, or a push
+    // with no ring claimed. Released, which is what both transports did
+    // before, and the safe direction between one stale read and a key nothing
+    // can make readable again. Same for a tail we cannot read at all.
+    #reconcileWrites() {
+        const tail = this.#submitTailNow();
+        // Budgeted and resumed exactly like #reconcileRemovals, for the same
+        // reason: a ring that keeps lapping between reads makes every read
+        // wrap again, and this runs on the read path.
+        const slice = [];
+        for (const key of this.#pendingWrite.keys()) {
+            slice.push(key);
+            if (slice.length >= PENDING_MARK_SCAN) break;
+        }
+        for (const key of slice) {
+            const sub = this.#pendingWrite.submittedAt(key);
+            if (sub === undefined) continue;                  // released under us
+            if (sub >= 0 && tail >= 0 && tail < sub) {
+                this.#pendingWrite.touch(key);                // still in flight: keep it
+                continue;
+            }
+            this.#pendingWrite.release(key);
+        }
+        // WHAT IS LEFT, not "what this pass has not looked at yet". A removal
+        // is judged once and for all -- the arena either still holds the key
+        // or does not -- so #reconcileRemovals counts DOWN as it examines. A
+        // write's answer can be "not yet": the primary had not reached our
+        // record when we asked, and the record that would have told us so was
+        // the one the wrap discarded. Counting down would retire such a mark
+        // from reconciliation after a single look and leave it held forever,
+        // which is the unreadable key this is here to avoid. So the pass stays
+        // armed until nothing is outstanding.
+        //
+        // It disarms on its own: an ordinary drain releases marks by their own
+        // records, so the set empties and this goes quiet. Until it does, a
+        // drain costs one extra native read and at most PENDING_MARK_SCAN map
+        // operations -- paid only by a worker that has both lapped the ring
+        // and written at `minLevel` 2 or 3, and it buys back the marks the
+        // primary has already applied, which are misses this worker would
+        // otherwise keep serving.
+        this.#writeOwed = this.#pendingWrite.size;
+    }
+
+    // HOW FAR THE PRIMARY HAS CONSUMED OUR OWN SUBMISSION RING, or -1 when
+    // that cannot be known: no ring claimed (IPC, the primary itself, a
+    // detached worker), or the addon refusing. Never zero as a stand-in --
+    // zero is a real position, and reading "unknowable" as "nothing consumed"
+    // would keep every mark forever.
+    #submitTailNow() {
+        if (this.#ringIdx < 0) return -1;
+        try { return native.submitTail(); } catch { return -1; }
+    }
+
+    // The position just past the record we have only now pushed, for the mark
+    // that is about to be taken for it. Read AFTER the push, unlike the
+    // invalidation-ring position beside it, which is read before: this one is
+    // our own producer index, which nobody else advances, so there is no race
+    // to lose -- and a position read before the push would name our
+    // predecessor's record instead of ours.
+    #submitPosNow() {
+        if (this.#ringIdx < 0) return -1;
+        try { return native.submitHead(); } catch { return -1; }
     }
 
     // Record that `key` was removed, and where on the invalidation ring that
@@ -3012,8 +3144,11 @@ class TurboKV {
                 // it is blocked from PLACING an older value rather than told
                 // the key is deleted. `at` was read before the push above --
                 // the primary can drain and append our record between the two,
-                // and a mark stamped past its own record never clears.
-                if (minLevel !== 1) this.#pendingWrite.mark(key, keyHash, at);
+                // and a mark stamped past its own record never clears. The
+                // SUBMISSION position is read the other way round, after the
+                // push, because it has to name our own record; see
+                // #submitPosNow, and #reconcileWrites for what reads it.
+                if (minLevel !== 1) this.#pendingWrite.mark(key, keyHash, at, this.#submitPosNow());
                 this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);
                 return true;
             }
@@ -3028,6 +3163,9 @@ class TurboKV {
         // The IPC fallback can still be shed later, inside flush(), which is
         // why flush() unmarks what it drops -- the mark cannot be deferred to
         // the send the way the ring's can, because the push IS the handover.
+        // And no submission position: there is no ring, and a batch on the
+        // cluster channel is acked by nothing, so a wrap cannot tell whether
+        // this landed. See #reconcileWrites.
         if (minLevel !== 1) this.#pendingWrite.mark(key, keyHash, at);
         this.#publishOutbox('s', key, enc, ttlMs, encLen + key.length + 48);
         this.#lastQueued = this.#queueSet(key, enc, ttlMs, minLevel);

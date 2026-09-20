@@ -434,6 +434,40 @@ static napi_value SubmitDrain(napi_env env, napi_callback_info info) {
   napi_create_int32(env, applied, &r); return r;
 }
 
+// THIS PROCESS'S OWN RING, both ends, in the ring's monotonic byte space.
+//
+// A worker is the SOLE PRODUCER of the ring it claimed, and the primary is its
+// sole consumer, so between them these two numbers answer a question nothing
+// else in the system can: "has the primary applied the record I pushed?" The
+// worker reads `head` immediately after a push and compares it against `tail`
+// later; `tail >= head-after-push` means the consumer stepped past our record,
+// and SubmitDrain publishes tail with a release store AFTER storeSet/
+// storeDelete, so that also means the arena already holds it.
+//
+// Per-ring, and only OURS -- submitPending and submitStats aggregate across
+// every ring, which cannot answer this for anyone. -1 when no ring is claimed
+// (the IPC fallback, a detached worker, the primary itself), which callers
+// must read as "unknowable" rather than as a position.
+//
+// Both are plain reads of a struct this process already maps. No layout
+// change: `head` and `tail` are the fields SubmitRing has always had.
+static napi_value SubmitHead(napi_env env, napi_callback_info info) {
+  napi_value r;
+  if (!g_submit.base || g_ringIdx < 0) { napi_create_double(env, -1, &r); return r; }
+  // Relaxed: we are the only writer of our own head.
+  double v = (double)g_submit.ring((uint32_t)g_ringIdx)->head.load(std::memory_order_relaxed);
+  napi_create_double(env, v, &r); return r;
+}
+static napi_value SubmitTail(napi_env env, napi_callback_info info) {
+  napi_value r;
+  if (!g_submit.base || g_ringIdx < 0) { napi_create_double(env, -1, &r); return r; }
+  // ACQUIRE, pairing with the consumer's release store in SubmitDrain: if we
+  // see a tail past our record, we must also see the arena the same drain
+  // wrote before publishing it.
+  double v = (double)g_submit.ring((uint32_t)g_ringIdx)->tail.load(std::memory_order_acquire);
+  napi_create_double(env, v, &r); return r;
+}
+
 // Is there anything to drain? Cheap enough to call every event-loop turn.
 static napi_value SubmitPending(napi_env env, napi_callback_info info) {
   napi_value r;
@@ -1114,6 +1148,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("submitClaim", SubmitClaim) FN("submitSet", SubmitSet)
   FN("submitDel", SubmitDel) FN("submitDrain", SubmitDrain)
   FN("submitPending", SubmitPending) FN("submitStats", SubmitStats)
+  FN("submitHead", SubmitHead) FN("submitTail", SubmitTail)
   FN("submitDestroy", SubmitDestroy) FN("submitRelease", SubmitRelease)
   FN("submitMaxValue", SubmitMaxValue)
   FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
