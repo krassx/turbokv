@@ -205,6 +205,28 @@ if (process.env.TCR5_ROLE === 'rejectset') {
 // KeyMaxBytes does not even take NEED_STORE), and #ringMaxValue is read inside
 // #useSubmissionRing, which #recovered calls, and is consulted only while
 // #ringIdx >= 0 -- which nothing but that same function sets.
+//
+// THE HANDSHAKE BELOW IS NOT DECORATION, and getting it wrong is how this test
+// first failed on Windows and only on Windows. A replacement primary calls
+// shmCreate, and on Windows that is CreateFileMappingA, which returns
+// ERROR_ALREADY_EXISTS while ANY process still holds a handle to the name --
+// deliberately, because Windows cannot unlink an object others hold, so an
+// existing name means a live primary (see platform.h, and decision 41, which
+// calls a degraded worker's detach "mandatory, not hygiene" for exactly this).
+// POSIX takes the other branch and shm_unlinks first, so it never noticed.
+//
+// A worker releases its mapping in #degrade -- which unmaps the arena AND
+// destroys its submission segment -- but #degrade only runs from
+// #checkPrimary, inside #drain, which runs on an OPERATION. A worker sitting
+// idle on `await` does none, so it never notices and never lets go. The first
+// version of this test waited on a CLOCK (`sleep(2600)`, past primaryStaleMs)
+// while the child did nothing at all, and re-created the arena with the child
+// still holding it.
+//
+// So the child drives its own degradation and REPORTS it, and the parent
+// creates the replacement only then. The two assertions before that report
+// make the platform property a checked invariant on every platform, rather
+// than something only a Windows runner can tell us about.
 if (process.env.TCR5_ROLE === 'maxvalue') {
     (async () => {
         // 1.5MB: inside the 16MB arena's 4193280B limit and inside the 8MB
@@ -217,7 +239,20 @@ if (process.env.TCR5_ROLE === 'maxvalue') {
         w.get('poke');
         ok(w.set('big', BIG) === true, 'the large arena accepts a 1.5MB value');
 
-        process.send({ step: 'swap' }); await step('swapped');
+        // The parent closes the old primary and waits for us to LET GO.
+        process.send({ step: 'swap' }); await step('closed');
+        for (let i = 0; i < 400 && !w.primaryDead; i++) { w.get('probe'); await sleep(50); }
+        ok(w.primaryDead === true, 'the worker notices the primary is gone -- on an operation, not a clock');
+        // #degrade unmaps the arena and destroys the submission segment, both
+        // synchronously, before it returns. Asserted rather than assumed: it is
+        // the precondition for the replacement primary being able to create the
+        // name at all on Windows.
+        ok(native.stats() === undefined || native.stats() === null,
+           `and RELEASES the arena mapping with it (${JSON.stringify(native.stats())})`);
+        const ss = TurboKV.submitStats();
+        ok(ss === null || ss.enabled === 0, `and the submission segment too (${JSON.stringify(ss)})`);
+        process.send({ step: 'released' }); await step('swapped');
+
         for (let i = 0; i < 400 && (w.stats.recoveries || 0) === 0; i++) { w.get('probe'); await sleep(50); }
         ok((w.stats.recoveries || 0) === 1, `the worker recovered (${w.stats.recoveries || 0})`);
         ok(w.stats.lastRecovery && w.stats.lastRecovery.sameArena === false,
@@ -403,6 +438,11 @@ const lapTheRing = (p) => { for (let i = 0; i < 70000; i++) p.set('filler' + (i 
         // mid-test by a differently sized one, which runChild's single `p` has
         // no shape for. Heartbeats are left on -- a worker cannot notice a
         // death, let alone a recovery, without them.
+        //
+        // The replacement is created ONLY after the child reports it has let
+        // go of the old mapping. On Windows a held handle makes shmCreate
+        // refuse the name outright; on POSIX it would merely be unlinked from
+        // under the child. See the child's comment.
         const arena = ARENA + '6';
         const ringOpts = { storage: 'bytes', submitRings: 2, submitRingBytes: 8 << 20 };
         let p2 = null;
@@ -414,9 +454,9 @@ const lapTheRing = (p) => { for (let i = 0; i < 70000; i++) p.set('filler' + (i 
             kid.on('message', async (m) => {
                 if (TurboKV.isCacheMessage(m)) { TurboKV.applyBatch(m); return; }
                 if (m && m.t === 'tcr') { TurboKV.drainSubmissions(20000); return; }
-                if (m && m.step === 'swap') {
-                    await p1.close();
-                    await sleep(2600);          // > primaryStaleMs: the worker must DEGRADE first
+                if (m && m.step === 'swap') { await p1.close(); kid.send({ step: 'closed' }); }
+                // Not a clock: the child has proved it detached.
+                if (m && m.step === 'released') {
                     p2 = TurboKV.createPrimary(arena, 2 << 20, 1 << 12, ringOpts);
                     kid.send({ step: 'swapped' });
                 }

@@ -146,6 +146,11 @@ scripts/                          build helpers
   reason in `lastError`.
 - **Primary death**: a worker detaches, keeps serving its warm L1, polls, and
   recovers when a heartbeat *advances* — then flushes L1 and re-claims a ring.
+  It notices on its **next operation**, not on a timer, so an idle worker holds
+  its mapping until something touches the cache. On Windows that matters: a
+  replacement primary cannot create the name while any handle is open, so
+  **retry the restart** rather than assuming one attempt after `primaryStaleMs`
+  will take. POSIX unlinks first and hides the difference.
 - **Routing cluster messages yourself**: `TurboKV.install(cluster)` is the easy
   path and does the whole job. If your application owns the primary's `message`
   handler instead, it must pass turbokv's messages to `TurboKV.applyBatch()` —
