@@ -1377,6 +1377,31 @@ class TurboKV {
         // lost write rather than a pending one.
         this.clearLocal();
         this.#cursor = native.ringHead();      // not 0: replaying a ring we already flushed for is waste
+        // RE-READ THE ARENA'S OWN SIZE BOUND. `maxValueBytes()` is geometry --
+        // `dataBytes / 2` less an entry header and the key bound -- and it was
+        // snapshotted in the constructor, from an arena this worker no longer
+        // has. Recovering onto a SMALLER one left the old, larger limit in
+        // place, so `set()` accepted a value the new arena's log allocator
+        // refuses and returned `true` for a write that can never land. That is
+        // the "acked but not applied" shape this whole wave has been closing,
+        // one layer up -- and it is the only route by which a worker
+        // submission reaches storeSet's rejection at all, so the invariant
+        // #reconcileWrites rests on was being falsified by a recovery.
+        //
+        // Unconditionally, not only when the arena id changed: the same arena
+        // yields the same number, so the branch would buy nothing and could
+        // only ever be wrong. Guarded on the value because maxValueBytes()
+        // answers `undefined` when detached (NEED_STORE), and `undefined` here
+        // would make the comparison in set() false for EVERY size -- the
+        // failure this is fixing, with no bound at all instead of a stale one.
+        //
+        // Nothing else in this class needs the same treatment, and that was
+        // checked rather than assumed: #keyMax is KEY_MAX, a compile-time
+        // constant with no arena behind it, and #ringMaxValue is re-read by
+        // #useSubmissionRing on the next line and is consulted only while
+        // #ringIdx >= 0, which nothing else sets.
+        const mv = native.maxValueBytes();
+        if (typeof mv === 'number' && mv > 0) this.#maxValue = mv;
         this.#ringIdx = -1;
         if (this.#transportOpt !== 'ipc' && attachedName) this.#useSubmissionRing(attachedName + '_sub');
         this.#primaryDead = false;

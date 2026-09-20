@@ -189,6 +189,59 @@ if (process.env.TCR5_ROLE === 'rejectset') {
     return;
 }
 
+// ------------- N1c: what a worker snapshots from an arena it no longer has
+//
+// The route that made N1b reachable at all, and a lie to the caller in its own
+// right. A worker reads `native.maxValueBytes()` ONCE, in its constructor, and
+// that number is arena geometry: `dataBytes / 2` less the entry header and the
+// key bound. #recovered() re-reads the ring head, re-claims a submission ring
+// and refreshes #ringMaxValue with it -- and left this one alone. So a worker
+// that recovers onto a SMALLER arena keeps the limit it read from the larger
+// one, accepts a value the new arena's log allocator will refuse, and returns
+// `true` for a write that can never land.
+//
+// It is alone in that class, checked rather than assumed: #keyMax comes from
+// KEY_MAX, a compile-time constant with no arena behind it (binding.cc's
+// KeyMaxBytes does not even take NEED_STORE), and #ringMaxValue is read inside
+// #useSubmissionRing, which #recovered calls, and is consulted only while
+// #ringIdx >= 0 -- which nothing but that same function sets.
+if (process.env.TCR5_ROLE === 'maxvalue') {
+    (async () => {
+        // 1.5MB: inside the 16MB arena's 4193280B limit and inside the 8MB
+        // submission ring's 4193248B one, outside the 2MB arena's 949048B
+        // limit. So the ARENA bound is the only thing that can decide it, and
+        // a pass here cannot be the ring's doing.
+        const BIG = Buffer.alloc(1536 * 1024, 7);
+        const w = TurboKV.attachWorker(process.env.TCR5_ARENA, 1,
+            { storage: 'bytes', primaryStaleMs: 1000 });
+        w.get('poke');
+        ok(w.set('big', BIG) === true, 'the large arena accepts a 1.5MB value');
+
+        process.send({ step: 'swap' }); await step('swapped');
+        for (let i = 0; i < 400 && (w.stats.recoveries || 0) === 0; i++) { w.get('probe'); await sleep(50); }
+        ok((w.stats.recoveries || 0) === 1, `the worker recovered (${w.stats.recoveries || 0})`);
+        ok(w.stats.lastRecovery && w.stats.lastRecovery.sameArena === false,
+           'onto a DIFFERENT arena, which is the whole condition');
+        ok(w.transport === 'shm', 'with its submission ring re-claimed');
+
+        const acked = w.set('big', BIG);
+        ok(acked === false,
+           `a value the new arena cannot hold is REFUSED, not acked (${acked})`);
+        ok(/exceeds the \d+B arena limit/.test(w.lastError || ''),
+           `and the caller is told which limit (${w.lastError})`);
+        ok((w.stats.rejectedSize || 0) >= 1, `counted as a size rejection (${w.stats.rejectedSize})`);
+        // NON-VACUITY: the refreshed limit is the NEW arena's, not zero. A
+        // refresh that simply clamped everything to nothing would pass the
+        // assertion above and break every write the worker makes.
+        ok(w.set('ordinary', 'V') === true, 'while an ordinary write still succeeds');
+        ok(w.set('mid', Buffer.alloc(400 * 1024, 3)) === true,
+           'and so does one that only the OLD limit would have had to allow');
+        process.send({ step: 'bye' }); await step('byebye');
+        done(w, 'recovered-maxvalue');
+    })();
+    return;
+}
+
 // ------------------------------- N2: a pending write is not a pending delete
 //
 // The guard at the bottom of #promotionBlock reports THIS worker's own
@@ -344,6 +397,34 @@ const lapTheRing = (p) => { for (let i = 0; i < 70000; i++) p.set('filler' + (i 
                 if (s === 'drainwrap') { drainAll(); state.drain = false; lapTheRing(p); kid.send({ step: 'drainwrapped' }); }
             }, (p) => { p.set('k2', 'OLD'); });
         ok(code === 0, `the ${role} cases passed (child exited ${code})`);
+    }
+    {
+        // Its own runner: this is the one case where the primary is REPLACED
+        // mid-test by a differently sized one, which runChild's single `p` has
+        // no shape for. Heartbeats are left on -- a worker cannot notice a
+        // death, let alone a recovery, without them.
+        const arena = ARENA + '6';
+        const ringOpts = { storage: 'bytes', submitRings: 2, submitRingBytes: 8 << 20 };
+        let p2 = null;
+        const code = await new Promise((resolve) => {
+            const p1 = TurboKV.createPrimary(arena, 16 << 20, 1 << 14, ringOpts);
+            const kid = fork(__filename, [], {
+                env: { ...process.env, TCR5_ROLE: 'maxvalue', TCR5_ARENA: arena }, stdio: 'inherit',
+            });
+            kid.on('message', async (m) => {
+                if (TurboKV.isCacheMessage(m)) { TurboKV.applyBatch(m); return; }
+                if (m && m.t === 'tcr') { TurboKV.drainSubmissions(20000); return; }
+                if (m && m.step === 'swap') {
+                    await p1.close();
+                    await sleep(2600);          // > primaryStaleMs: the worker must DEGRADE first
+                    p2 = TurboKV.createPrimary(arena, 2 << 20, 1 << 12, ringOpts);
+                    kid.send({ step: 'swapped' });
+                }
+                if (m && m.step === 'bye') kid.send({ step: 'byebye' });
+            });
+            kid.on('exit', async (c) => { if (p2) await p2.close(); resolve(c); });
+        });
+        ok(code === 0, `the recovered-maxvalue cases passed (child exited ${code})`);
     }
     {
         const code = await runChild('rejectset', ARENA + '5', {}, (s, m, p, state, kid) => {
