@@ -302,7 +302,22 @@ export interface CacheStats {
      *  process. It is a transport counter, not a count of data writes; use
      *  `sets`/`deletes` for those. */
     sent?: number;
-    flushes?: number; flushDropped?: number; congested?: number;
+    flushes?: number;
+    /** IPC batches this worker could not hand to the primary: the channel was
+     *  gone, the send threw, or the send's callback reported an error. THE
+     *  WHOLE BATCH IS LOST, not one entry -- `process.send` serialises the
+     *  message as a unit, so a single value the serialiser refuses (a
+     *  `bigint` under the default JSON serialization) drops every other key's
+     *  write in the same batch, all of which already returned `true` from
+     *  `set()`. The values stay in this worker's L1, so its own reads are
+     *  unaffected; other processes see a miss for those keys. A worker that
+     *  writes `bigint` values should be forked with
+     *  `serialization: 'advanced'`, or use the default `shm` transport, where
+     *  values never pass through the channel. Marks taken by the operations
+     *  in a dropped batch are released with it, so a delete in one does not
+     *  leave its key unreadable. */
+    flushDropped?: number;
+    congested?: number;
     rejectedKey?: number; rejectedType?: number; rejectedSize?: number;
     heapShed?: number;
     /** Times this worker re-attached after losing its primary. */
@@ -416,11 +431,13 @@ export interface CacheStats {
      *  itself still had a write for the key queued or in flight to L3 when
      *  the read completed -- L3 was still serving the value that write
      *  supersedes -- or, on a worker, because the key holds a write of this
-     *  worker's own that the primary has not applied yet. That second case
-     *  covers a write L3 has already ACKNOWLEDGED: the queue has let go of
-     *  it and the invalidation ring has no record for it, so without the
-     *  mark an overlapping read answered from the pre-write value put the
-     *  old value back over a write the caller had been told succeeded. This is why `get()` and `getAsync()` can disagree about a
+     *  worker's own that the primary has not applied yet -- whether it is in
+     *  that worker's L1 (`minLevel: 1`) or only in the submission it has not
+     *  seen land (`minLevel: 2`). That second case covers a write L3 has
+     *  already ACKNOWLEDGED: the queue has let go of it and the invalidation
+     *  ring has no record for it, so without the mark an overlapping read
+     *  answered from the pre-write value put the old value back over a write
+     *  the caller had been told succeeded. This is why `get()` and `getAsync()` can disagree about a
      *  key: while a `minLevel: L3` write for it is outstanding, `get()`
      *  returns `undefined` (nothing is stored locally) while `getAsync()`
      *  returns whatever L3 still holds. Deliberate; see the `LevelOption`
@@ -429,8 +446,12 @@ export interface CacheStats {
     /** L3 hits not promoted because the key cannot live in L1 or L2 at all
      *  (an unpaired surrogate the arena cannot hash). */
     l3UnhashableKeys?: number;
-    /** L3 hits discarded because this process deleted the key while the read
-     *  was in flight. */
+    /** L3 hits discarded because this process REMOVED the key while the read
+     *  was in flight -- a `delete`, or the L2 eviction a `minLevel: L3` write
+     *  performs. Removals only: a worker's `minLevel: 2` write used to be
+     *  counted here too, and answered the caller `undefined` for a key it had
+     *  just successfully written. It blocks the placement instead, as
+     *  `l3PromotionsBlockedSelf`. */
     l3DeletedWhileReading?: number;
     /** L3 hits discarded because a `clearAll()` -- issued by ANY process
      *  sharing this arena, not necessarily this one -- was handed to L3 while

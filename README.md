@@ -157,6 +157,19 @@ scripts/                          build helpers
   rejected stays in the shared arena with no expiry, for every process, until
   something overwrites it. Call `TurboKV.releaseWorker()` on `'exit'` and
   `'disconnect'` for the same reason.
+- **`transport: 'ipc'` and the `l3` adapter**: with an adapter attached, prefer
+  the default `'shm'` transport. The primary drains every worker's submission
+  ring before it decides whether an L3 read may be promoted, so a worker's
+  write is never overwritten by the pre-write value L3 was still serving. An
+  IPC-transport worker's write sits in its outbox, or in the cluster channel,
+  where the primary cannot reach it — so for the one hop until that batch is
+  delivered the primary may promote over it. The worker's own value wins once
+  the batch is applied; the window is bounded, not closed.
+- **`bigint` values on `transport: 'ipc'`**: `process.send` serialises a batch
+  as a unit and refuses a `bigint` under the default JSON serialization, so one
+  such value drops **every other key's write in the same batch** — all of which
+  already returned `true`. Fork with `serialization: 'advanced'`, or stay on
+  `'shm'`, where values never touch the channel. `stats.flushDropped` counts it.
 - **Watching for that**: `stats.l3FailTtlUnapplied` counts caps *proven* not to
   have landed, and `stats.l3FailTtlUnconfirmed` counts those whose outcome the
   worker could not establish. **Watch both, and expect the second one.** The

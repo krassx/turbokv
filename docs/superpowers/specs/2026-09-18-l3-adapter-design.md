@@ -444,6 +444,20 @@ Keeping a failed write locally with a short TTL serves through an outage and the
 converges. It is honest about the cost: after the TTL, a write reported as failed
 does revert to L3's older value.
 
+**Both cap rows cover every `minLevel`, including `minLevel: 2` from a worker.**
+That was false in the implementation until wave 5, and silently: a worker's
+`minLevel: 2` write keeps no L1 copy, so its "pending until the primary applies
+it" mark was the same mark a delete takes, and the cap read that mark as *our
+own delete is on its way, there is nothing left to bound* and skipped itself.
+No cap was requested, no counter moved, and the value L3 had refused stayed in
+the shared arena with no expiry while `l3FailTtlApplied` reported success from
+the L1 half. It is the ordinary case during an outage rather than a race: a
+queue over `l3QueueMaxBytes` settles `false` in a microtask, long before any
+invalidation record can clear a mark, so once the queue backs up every
+subsequent `minLevel: 2` write took that path. Nothing is capped at
+`minLevel: L3`, where nothing was written locally to begin with — that row of
+the rule stands as written.
+
 Everything here produces a **miss**, never a stale value, which is the rule the
 code already states in `set()`: *"A miss is the failure mode this system is built
 around; a stale value is not."*
