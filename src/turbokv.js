@@ -3093,18 +3093,34 @@ class TurboKV {
                 // skipped because the primary is gone, leaves a mark nothing
                 // can clear -- and a marked key is unreadable from every tier,
                 // L3 included, for the life of the worker.
-                // A REMOVAL MARK: `minLevel: 3` submits a DELETE of the L2
-                // copy, so what this worker owes L2 is a removal, and the
-                // reconciliation after a wrapped ring must ask the removal's
-                // question about it ("is the key gone yet"), not the write's.
+                // A WRITE MARK, EVEN THOUGH WHAT IS SUBMITTED IS A DELETE.
+                // The mark names what the OPERATION is, not what the record
+                // says, and this operation is a SET: the value is not going
+                // away, it is going one tier down, and the delete only takes
+                // L2's superseded copy out of the way. It was marked as a
+                // removal, and #deletedHere -- which is right to refuse L3 for
+                // a key we deleted -- then refused to ask L3 for a key that by
+                // construction lives ONLY in L3. The write was acked and
+                // unreadable through every form, `get` and `getAsync` alike,
+                // with the adapter never called.
+                //
+                // Everything the mark is actually for still holds: local reads
+                // MISS on L2's older copy until the eviction lands (a write
+                // mark is half of #unappliedHere, exactly as `minLevel: 2` is),
+                // nothing records this as a removal for the promotion guard,
+                // and the wrapped-ring reconciliation asks the submission
+                // ring's consumer index -- which answers "has the primary
+                // applied my record" for a delete record and a set record
+                // alike, so the kind no longer decides where the answer comes
+                // from. See #reconcileWrites.
                 if (this.#ringIdx >= 0) {
-                    if (this.#publishRingDel(key)) this.#pendingDel.mark(key, keyHash, at);
+                    if (this.#publishRingDel(key)) this.#pendingWrite.mark(key, keyHash, at, this.#submitPosNow());
                     else {
                         this.stats.writesShed = (this.stats.writesShed || 0) + 1;
                         this.lastError = 'submission ring full; L2 eviction shed';
                     }
                 } else {
-                    this.#pendingDel.mark(key, keyHash, at);
+                    this.#pendingWrite.mark(key, keyHash, at);
                     this.#publishOutbox('d', key, null, 0, key.length + 48);
                 }
             }

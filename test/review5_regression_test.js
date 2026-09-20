@@ -133,6 +133,76 @@ if (process.env.TCR5_ROLE === 'wrapres' || process.env.TCR5_ROLE === 'wrapresipc
     return;
 }
 
+// -------------------------------------- N3: minLevel 3 rode the delete mark
+//
+// `set(k, v, { minLevel: 3 })` keeps the value out of L1 AND out of L2, so it
+// submits a DELETE of the L2 copy -- and that submission used to take a
+// REMOVAL mark. #deletedHere then answered true, and getAsync refuses to ask
+// L3 at all for a key it believes this worker removed. The value lives only in
+// L3 by construction, so the acked write was unreadable through every form.
+//
+// The mark it wants is the WRITE mark: what is in flight is "L2's copy is
+// superseded", not "this key is gone" -- the key is very much there, one tier
+// down. That keeps local reads MISSING on L2's older copy (which is what the
+// mark is for) while leaving L3 reachable.
+if (process.env.TCR5_ROLE === 'ml3') {
+    (async () => {
+        const f = makeFake();
+        const w = TurboKV.attachWorker(process.env.TCR5_ARENA, 1, { storage: 'bytes', l3: f.adapter });
+        w.get('poke');
+        ok(w.get('m1') === 'V-ARENA-M1', 'the arena holds an older copy of the key');
+
+        // ---- the ASYNC form
+        ok(await w.setAsync('m1', 'L3ONLY', { minLevel: TurboKV.L3 }) === true, 'setAsync(minLevel:3) is acked');
+        ok(f.store.get('m1').value === 'L3ONLY', 'and the value is in L3');
+        const marks = w.__unsafeMarkState();
+        ok(marks.writtenKeys.indexOf('m1') >= 0,
+           `the L2 eviction took a WRITE mark (${JSON.stringify(marks.writtenKeys)})`);
+        ok(marks.pendingKeys.indexOf('m1') < 0,
+           `and NOT a removal mark (${JSON.stringify(marks.pendingKeys)})`);
+        ok(marks.deletedAtKeys.indexOf('m1') < 0,
+           `and nothing recorded it as a removal for the promotion guard (${JSON.stringify(marks.deletedAtKeys)})`);
+
+        ok(w.get('m1') === undefined, 'get() misses: the value was deliberately kept out of L1 and L2');
+        let n = f.calls.filter(c => c[0] === 'get').length;
+        ok(await w.getAsync('m1') === 'L3ONLY',
+           `getAsync reads it back from L3 (${JSON.stringify(await w.getAsync('m1'))})`);
+        ok(f.calls.filter(c => c[0] === 'get').length > n, 'having actually asked the adapter');
+
+        // ---- the SYNC form, same effects
+        ok(w.set('m2', 'L3ONLY2', { minLevel: TurboKV.L3 }) === true, 'set(minLevel:3) is accepted');
+        const m2 = w.__unsafeMarkState();
+        ok(m2.writtenKeys.indexOf('m2') >= 0, `it takes the same WRITE mark (${JSON.stringify(m2.writtenKeys)})`);
+        ok(m2.pendingKeys.indexOf('m2') < 0, 'and no removal mark');
+        for (let i = 0; i < 60 && !f.store.has('m2'); i++) await sleep(10);
+        ok(f.store.has('m2'), 'the queued value reaches L3');
+        ok(w.get('m2') === undefined, 'get() misses for it too');
+        n = f.calls.filter(c => c[0] === 'get').length;
+        ok(await w.getAsync('m2') === 'L3ONLY2',
+           `and getAsync reads it back from L3 (${JSON.stringify(await w.getAsync('m2'))})`);
+        ok(f.calls.filter(c => c[0] === 'get').length > n, 'having asked the adapter for it as well');
+
+        // ---- and once the primary applies the eviction, nothing changes
+        process.send({ step: 'drain' }); await step('drained');
+        await sleep(20); w.get('poke');
+        ok(native.get('m1') === undefined, 'the L2 copy is evicted once the primary drains');
+        ok(w.get('m1') === undefined, 'get() still misses');
+        ok(await w.getAsync('m1') === 'L3ONLY', 'and getAsync still reads L3');
+        ok(w.__unsafeMarkState().writtenKeys.indexOf('m1') < 0, 'the mark is released by its own record');
+
+        // A REAL DELETE still takes the removal mark. Without this the case
+        // above would pass for a build that simply stopped marking.
+        ok(w.delete('d1') === true, 'a real delete is accepted');
+        const m3 = w.__unsafeMarkState();
+        ok(m3.pendingKeys.indexOf('d1') >= 0, `and takes a REMOVAL mark (${JSON.stringify(m3.pendingKeys)})`);
+        ok(m3.writtenKeys.indexOf('d1') < 0, 'not a write mark');
+        n = f.calls.filter(c => c[0] === 'get').length;
+        ok(await w.getAsync('d1') === undefined, 'and getAsync refuses it');
+        ok(f.calls.filter(c => c[0] === 'get').length === n, 'without asking L3, which is what a removal means');
+        done(w, 'minlevel3-mark');
+    })();
+    return;
+}
 // ------------------------------------------------------------------ parent
 function runChild(role, arena, primaryOpts, onStep, before, arenaBytes = 16 << 20, indexSlots = 1 << 14) {
     return new Promise((resolve) => {
@@ -176,6 +246,12 @@ const lapTheRing = (p) => { for (let i = 0; i < 70000; i++) p.set('filler' + (i 
                 if (s === 'drainwrap') { drainAll(); state.drain = false; lapTheRing(p); kid.send({ step: 'drainwrapped' }); }
             }, (p) => { p.set('k2', 'OLD'); });
         ok(code === 0, `the ${role} cases passed (child exited ${code})`);
+    }
+    {
+        const code = await runChild('ml3', ARENA + '4', {}, (s, m, p, state, kid) => {
+            if (s === 'drain') { drainAll(); kid.send({ step: 'drained' }); }
+        }, (p) => { p.set('m1', 'V-ARENA-M1'); p.set('d1', 'V-ARENA-D1'); });
+        ok(code === 0, `the minLevel-3 cases passed (child exited ${code})`);
     }
 
     console.log(fail ? `\n  ${fail} FAILED` : '\n  [review5] all passed');
