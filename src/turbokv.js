@@ -1266,6 +1266,12 @@ class TurboKV {
     // in any test that also writes other keys through a failing L3, which is
     // most of them -- every such write defers a cap of its own.
     __unsafeHasCap(key) { return this.#l3Caps.has(key); }
+    // Test-only: what the L3 QUEUE still owes for this key, which is the first
+    // thing #promotionBlock asks. A test aimed at one of the reasons further
+    // down needs to prove the queue is no longer answering, or it pins nothing
+    // -- the earlier reason would keep the test green through any change to
+    // the later one. See review5_regression_test.js.
+    __unsafeOutstandingKind(key) { return this.#queue === null ? undefined : this.#queue.outstandingKind(key); }
 
     // Test and shutdown helper: resolves when this process has no L3 work left.
     drainL3() { return this.#queue ? this.#queue.drain() : Promise.resolve(); }

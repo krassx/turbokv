@@ -133,6 +133,47 @@ if (process.env.TCR5_ROLE === 'wrapres' || process.env.TCR5_ROLE === 'wrapresipc
     return;
 }
 
+// ------------------------------- N2: a pending write is not a pending delete
+//
+// The guard at the bottom of #promotionBlock reports THIS worker's own
+// undrained `minLevel: 2` write. `l3PromotionsBlockedSelf` blocks the
+// PLACEMENT and still hands the caller what L3 returned;
+// `l3DeletedWhileReading` answers `undefined` and counts a prevented
+// resurrection. Reverting that one token passed all 41 suites.
+//
+// Reaching it needs the L3 queue to have let go of the set already -- so the
+// write is awaited -- and no L1 entry to carry the self-mark, which is exactly
+// what `minLevel: 2` produces.
+if (process.env.TCR5_ROLE === 'blockself') {
+    (async () => {
+        const f = makeFake();
+        f.store.set('b', { value: 'L3OLD', expiresAt: 0 });
+        const w = TurboKV.attachWorker(process.env.TCR5_ARENA, 1, { storage: 'bytes', l3: f.adapter });
+        w.get('poke');
+        ok(await w.setAsync('b', 'NEW', { minLevel: TurboKV.L2 }) === true,
+           'the minLevel-2 write is acked by L3');
+        const m = w.__unsafeMarkState();
+        ok(m.writtenKeys.indexOf('b') >= 0, `and its WRITE mark is still outstanding (${JSON.stringify(m.writtenKeys)})`);
+        ok(m.pendingKeys.indexOf('b') < 0, 'with no removal mark anywhere');
+        ok(w.__unsafeOutstandingKind('b') === undefined,
+           `the L3 queue has let go of it, so the guard reaches the mark (${w.__unsafeOutstandingKind('b')})`);
+
+        const before = f.calls.filter(c => c[0] === 'get').length;
+        const v = await w.getAsync('b');
+        ok(f.calls.filter(c => c[0] === 'get').length === before + 1, 'the read did reach L3');
+        // The reason blocks the PLACEMENT ONLY.
+        ok(v === 'NEW', `and the caller is handed what L3 returned (${JSON.stringify(v)})`);
+        ok((w.stats.l3PromotionsBlockedSelf || 0) >= 1,
+           `counted as this worker's own write (${w.stats.l3PromotionsBlockedSelf})`);
+        ok((w.stats.l3DeletedWhileReading || 0) === 0,
+           `and NOT as a prevented resurrection (${w.stats.l3DeletedWhileReading})`);
+        ok(native.get('b') === 'V-ARENA-B',
+           `nothing was promoted into the shared arena (${JSON.stringify(native.get('b'))})`);
+        done(w, 'promotion-block-self');
+    })();
+    return;
+}
+
 // -------------------------------------- N3: minLevel 3 rode the delete mark
 //
 // `set(k, v, { minLevel: 3 })` keeps the value out of L1 AND out of L2, so it
@@ -203,6 +244,7 @@ if (process.env.TCR5_ROLE === 'ml3') {
     })();
     return;
 }
+
 // ------------------------------------------------------------------ parent
 function runChild(role, arena, primaryOpts, onStep, before, arenaBytes = 16 << 20, indexSlots = 1 << 14) {
     return new Promise((resolve) => {
@@ -246,6 +288,11 @@ const lapTheRing = (p) => { for (let i = 0; i < 70000; i++) p.set('filler' + (i 
                 if (s === 'drainwrap') { drainAll(); state.drain = false; lapTheRing(p); kid.send({ step: 'drainwrapped' }); }
             }, (p) => { p.set('k2', 'OLD'); });
         ok(code === 0, `the ${role} cases passed (child exited ${code})`);
+    }
+    {
+        const code = await runChild('blockself', ARENA + '3', {}, () => {},
+            (p) => { p.set('b', 'V-ARENA-B'); });
+        ok(code === 0, `the promotion-block-self cases passed (child exited ${code})`);
     }
     {
         const code = await runChild('ml3', ARENA + '4', {}, (s, m, p, state, kid) => {
