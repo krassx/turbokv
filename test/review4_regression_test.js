@@ -23,8 +23,10 @@
 // test/write_sites_test.js enforces the SHAPE -- that no site can take or
 // release a mark without choosing a kind -- and this file is the behaviour.
 //
-// F3 is here too, because it is the same lifecycle seen from the other end: a
-// batch dropped by anything but the shed branch left its marks behind.
+// The three independent findings are here too: F3 (a dropped batch that is
+// not the shed branch leaves its marks behind), F4 (the primary's promotion
+// guard is not ordered against a worker's undrained submission), F6 (the
+// cap's value compare is `===`, so NaN and a lone surrogate are never capped).
 //
 // Every worker case runs in a forked child against a real primary: all of
 // them are about the gap between a worker's submission and the moment the
@@ -229,6 +231,34 @@ if (process.env.TCR4_ROLE === 'sendthrow') {
     return;
 }
 
+// ------------------- F4: the primary's promotion vs a worker's submission
+// The primary is the only writer of L3-derived data because its writes are
+// ordered against its own. They were ordered against a WORKER's undrained
+// submission by nothing: the promotion guard walks the invalidation ring, and
+// a submission the primary has not drained has no record there. So the primary
+// promoted the pre-write value over a write the worker had already been told
+// succeeded -- and the promotion's own record then dropped the worker's
+// self-marked L1 entry, so the worker read the old value back.
+if (process.env.TCR4_ROLE === 'promo' || process.env.TCR4_ROLE === 'promodel') {
+    (async () => {
+        const del = process.env.TCR4_ROLE === 'promodel';
+        const f = makeFake();
+        const w = TurboKV.attachWorker(process.env.TCR4_ARENA, 1, { storage: 'bytes', l3: f.adapter });
+        w.get('poke');
+        process.send({ step: 'ready' }); await step('go');      // the primary's L3 get is in flight
+        const acked = del ? await w.deleteAsync('k') : await w.setAsync('k', 'NEW');
+        ok(acked === true, `the worker's ${del ? 'delete' : 'write'} was accepted (${acked})`);
+        ok(w.get('k') === (del ? undefined : 'NEW'), 'and it reads its own operation back');
+        process.send({ step: 'written' }); await step('promoted');
+        const after = w.get('k');                                // drains the promotion's record
+        ok(after === (del ? undefined : 'NEW'),
+           `it STILL reads it back after the primary's promotion (${JSON.stringify(after)})`);
+        process.send({ step: 'checked', arena: native.get('k') }); await step('bye');
+        done(w, del ? 'promotion-vs-delete' : 'promotion-vs-write');
+    })();
+    return;
+}
+
 // ------------------------------------------------------------------ parent
 function runChild(role, arena, primaryOpts, onStep, before, arenaBytes = 16 << 20, indexSlots = 1 << 14) {
     return new Promise((resolve) => {
@@ -257,6 +287,44 @@ function runChild(role, arena, primaryOpts, onStep, before, arenaBytes = 16 << 2
 const drainAll = () => { let g = 0; while (TurboKV.drainSubmissions(8192) > 0 && ++g < 200); };
 
 (async () => {
+    // --- F6: the cap's value compare -------------------------------------
+    //
+    // `sameStored` was `===`, so a value whose stored form is not identical to
+    // its submitted form answered "the arena no longer holds this" and the cap
+    // was skipped as 'moot' -- silently, with neither failure bucket moving.
+    // Two values do that, and both round-trip through the arena perfectly:
+    // NaN (which is not === itself) and a string with a lone surrogate (which
+    // UTF-8 cannot carry, so it comes back as U+FFFD).
+    {
+        const f = makeFake();
+        f.fail.set('set', new Error('l3 down'));
+        const c = TurboKV.createPrimary(ARENA + 'a', 4 << 20, 1 << 12,
+            { storage: 'bytes', maintenance: false, l3: f.adapter, l3RetryMs: 20, l3FailTtlMs: 300 });
+        const cases = [['ctl', 'plain'], ['nan', NaN], ['neg0', -0], ['sur', 'ab\uD800cd'],
+                       ['big', 5n], ['num', 1.5], ['nul', null], ['buf', Buffer.from('xyz')]];
+        for (const [k, v] of cases) {
+            ok(await c.setAsync(k, v) === false, `the L3 write for ${k} failed`);
+            native.get(k);
+            const rem = native.lastTtlRemainingMs();
+            ok(rem > 0 && rem <= 300, `and its L2 copy is capped (${k}: ${rem})`);
+        }
+        ok(c.stats.l3FailTtlApplied === cases.length,
+           `every one of them is counted (${c.stats.l3FailTtlApplied} of ${cases.length})`);
+        ok((c.stats.l3FailTtlUnapplied || 0) === 0, 'and none as lost');
+        await sleep(400);
+        for (const [k] of cases)
+            ok(native.get(k) === undefined, `${k} converges away at the cap`);
+        await c.close();
+    }
+
+    // The same compare guards the WORKER's read guard (#capExpired), which
+    // asks "is the arena still holding the value L3 refused, past its
+    // deadline". A primary-side handle cannot reach it, but the fold itself
+    // is a pure function of the two values and is exercised above in both
+    // directions: `neg0` still caps (so the fix did not switch to Object.is,
+    // which would have split -0 from 0 and stopped capping it) and `ctl`
+    // still caps (so it is not now capping everything regardless).
+
     // A cache with NO ADAPTER takes none of these paths.
     {
         const c = TurboKV.createPrimary(ARENA + 'b', 4 << 20, 1 << 12,
@@ -325,6 +393,51 @@ const drainAll = () => { let g = 0; while (TurboKV.drainSubmissions(8192) > 0 &&
             (p) => { p.set('d', 'V-ARENA'); p.set('m2', 'V-ARENA-M2'); });
         ok(code === 0, `the send-threw cases passed (child exited ${code})`);
     }
+    for (const role of ['promo', 'promodel']) {
+        // A slow, SNAPSHOT-FIRST adapter: the value is read when the request
+        // is issued, and the reply is released by the test -- so the primary's
+        // L3 reply predates the worker's operation by construction.
+        const f = makeFake();
+        f.store.set('k', { value: 'OLD', expiresAt: 0 });
+        let release = null;
+        f.adapter.get = async (key) => {
+            const rec = f.store.get(key);
+            await new Promise(r => { release = r; });
+            return rec ? { value: rec.value } : undefined;
+        };
+        let readP = null, primary = null;
+        const del = role === 'promodel';
+        const code = await runChild(role, ARENA + (del ? '8' : '7'), { l3: f.adapter },
+            async (s, m, p, state, kid) => {
+                primary = p;
+                if (s === 'ready') {
+                    readP = p.getAsync('k');
+                    await sleep(5);
+                    // The primary stops servicing the doorbell: the worker's
+                    // operation is in its submission ring and nowhere else.
+                    state.drain = false;
+                    kid.send({ step: 'go' });
+                }
+                if (s === 'written') {
+                    release();
+                    const v = await readP;
+                    ok(v === 'OLD', `the primary's own read still returns what L3 gave it (${JSON.stringify(v)})`);
+                    ok(native.get('k') === (del ? undefined : 'NEW'),
+                       `but it did not promote that over the worker's operation (${JSON.stringify(native.get('k'))})`);
+                    ok((p.stats.l3PromotionsBlocked || 0) >= 1,
+                       `the guard blocked it, having drained the ring first (${p.stats.l3PromotionsBlocked})`);
+                    kid.send({ step: 'promoted' });
+                }
+                if (s === 'checked') {
+                    ok(m.arena === (del ? undefined : 'NEW'),
+                       `and L2 still holds the worker's own result (${JSON.stringify(m.arena)})`);
+                    kid.send({ step: 'bye' });
+                }
+            });
+        ok(code === 0, `the ${role} cases passed (child exited ${code})`);
+        if (primary) { /* closed by runChild */ }
+    }
+
     console.log(fail ? `\n  ${fail} FAILED` : '\n  [review4] all passed');
     process.exit(fail ? 1 : 0);
 })();

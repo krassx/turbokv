@@ -30,6 +30,25 @@ function hasLoneSurrogate(s) {
     return false;
 }
 
+// The same folding, applied rather than rejected. A VALUE may contain a lone
+// surrogate -- only keys are refused at the boundary -- and UTF-8 has no way
+// to carry one, so what comes back out of the arena is U+FFFD where it went
+// in. Anything comparing a submitted value against the stored one has to
+// compare the STORED form of both. See sameStored.
+function foldLoneSurrogates(s) {
+    if (!hasLoneSurrogate(s)) return s;                    // the overwhelming case: no copy
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c < 0xD800 || c > 0xDFFF) { out += s[i]; continue; }
+        if (c > 0xDBFF) { out += '\uFFFD'; continue; }     // lone low surrogate
+        const n = s.charCodeAt(i + 1);
+        if (n >= 0xDC00 && n <= 0xDFFF) { out += s[i] + s[i + 1]; i++; continue; }
+        out += '\uFFFD';                                   // unpaired high surrogate
+    }
+    return out;
+}
+
 // Mutating methods that bypass Object.freeze because they operate on internal
 // slots rather than properties. Shadowed on frozen values so a mutation raises
 // instead of silently corrupting the cached object. See deepFreeze.
@@ -207,10 +226,33 @@ function encodedBytes(enc) {
 // content -- a binary value read back out of L2 is a different Buffer object
 // than the one that went in, so `===` would answer "no" for every binary value
 // and the caller would skip a step it should have taken.
+//
+// `===` IS NOT THE RIGHT COMPARE FOR THE REST EITHER, and the two cases it
+// gets wrong are both silent: the caller (the l3FailTtlMs cap) reads a false
+// answer as 'moot' -- "the arena no longer holds this, there is nothing to
+// bound" -- so nothing is capped, nothing is counted, and the value L3
+// refused stays resident with no expiry.
+//
+//   NaN  -- `NaN !== NaN`, so a cached NaN was never capped. It round-trips
+//     through the arena perfectly; only the comparison failed.
+//   a lone surrogate -- UTF-8 cannot carry one, so `'ab\uD800cd'` is stored,
+//     and read back, as `'ab' + U+FFFD + 'cd'`. The submitted and stored forms differ
+//     by construction, for every such value.
+//
+// Both are answered by comparing the STORED forms: fold the submitted string
+// the way the arena folds it, and treat two NaNs as the one value they are.
+// -0 stays equal to 0 -- `Object.is` would have split them, and the arena
+// does not, so using it here would have STOPPED capping a value that caps
+// correctly today.
 function sameStored(a, b) {
     if (Buffer.isBuffer(a) || Buffer.isBuffer(b))
         return Buffer.isBuffer(a) && Buffer.isBuffer(b) && a.equals(b);
-    return a === b;
+    if (a === b) return true;
+    if (typeof a === 'number' && typeof b === 'number')
+        return Number.isNaN(a) && Number.isNaN(b);
+    if (typeof a === 'string' && typeof b === 'string')
+        return foldLoneSurrogates(a) === foldLoneSurrogates(b);
+    return false;
 }
 
 // The storage presets. Anything else is a misconfiguration, not a mode.
@@ -2150,6 +2192,31 @@ class TurboKV {
         // own clear is erasing -- no resurrection into the arena, but a direct
         // contradiction of "no exception for reads that started first", and of
         // the entry guard, which has been answering misses since the call.
+        // THE RING IS ONLY AS COMPLETE AS THE PRIMARY HAS MADE IT.
+        //
+        // Every check from here down is the ring answering "did anyone else
+        // change this key". It cannot see a WORKER's operation that is still
+        // sitting in its submission ring, because a record for it exists only
+        // once the primary has drained and applied it -- and the primary is
+        // the one process that can do something about that. The architectural
+        // rule made the primary the only writer of L3-derived data on the
+        // ground that its writes are ordered against its own; they were
+        // ordered against a worker's undrained submission by nothing, so the
+        // primary promoted the pre-write value over a write a worker had
+        // already been told succeeded, and over a delete it had already been
+        // told succeeded. Draining first is the same lever applyBatch pulls
+        // before it applies a cap, for the same reason, and it turns "no
+        // record exists yet" into "a record exists, at or past the mark".
+        //
+        // ONLY THE PRIMARY, and only when it owns a submission segment: a
+        // worker cannot drain anything, and an IPC-transport worker's batch
+        // has no equivalent lever on this side at all -- see the report and
+        // decision 69. The cost is one drain per promotion, which is work
+        // this process was going to do on the next doorbell regardless.
+        if (this.#id === 0 && submitName !== null) {
+            let guard = 0;
+            while (TurboKV.drainSubmissions(8192) > 0 && ++guard < 512);
+        }
         const h = native.hashKey(key);
         // A key the arena cannot even hash -- a lone surrogate -- has no ring
         // record to compare against, and `get` already treats it as never
