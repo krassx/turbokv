@@ -414,6 +414,29 @@ for (const m of L3_METHODS) {
            '#reconcileRemovals() asks the arena, and only the arena');
         ok(rw !== null && /#submitTailNow\(/.test(rw) && !/native\.has\(/.test(rw),
            '#reconcileWrites() asks the submission ring, and not the arena');
+
+        // THE ONE COMPARISON THE WHOLE MECHANISM RESTS ON, and the one thing
+        // above cannot see. Inverting it -- `tail < sub` to `tail > sub` --
+        // leaves every ledger entry and both pairings intact, and turns the
+        // fix inside out: marks for writes the primary HAS applied are kept
+        // (the key goes unreadable) and marks for writes it has NOT are
+        // released (the superseded value is served). The behavioural test
+        // catches it; so should the choke point, because this is the line a
+        // refactor is most likely to "tidy".
+        const rwl = (rw || '').split('\n');
+        const keepAt = rwl.findIndex(l => l.includes('#pendingWrite.touch('));
+        const relAt = rwl.findIndex(l => l.includes('#pendingWrite.release('));
+        ok(keepAt > 0 && relAt > keepAt,
+           `#reconcileWrites() keeps in a guarded branch and releases after it (keep@${keepAt}, release@${relAt})`);
+        const cond = keepAt > 0 ? rwl[keepAt - 1] : '';
+        ok(/tail\s*<\s*sub/.test(cond),
+           `a mark is KEPT only while the consumer index is SHORT of its record (${cond.trim() || '<none>'})`);
+        ok(/sub\s*>=\s*0/.test(cond) && /tail\s*>=\s*0/.test(cond),
+           'and both -1 sentinels gate that branch, so an unknowable position RELEASES');
+        // Belt and braces: the opposite comparison must not appear anywhere in
+        // the body, so it cannot be smuggled in on a second line.
+        ok(!/tail\s*>=?\s*sub/.test(rw || ''),
+           'and the opposite comparison appears nowhere in the body');
     }
     {
         // #promotionBlock's two mark reasons are NOT interchangeable:
