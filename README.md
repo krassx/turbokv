@@ -195,6 +195,20 @@ scripts/                          build helpers
   turns no event loop, so its doorbell never fires and its 500ms backstop never
   runs, and ~8300 records is a full lap on a 2MB arena. Stay on `'shm'` if you
   use `minLevel` above 1.
+- **The submission segment is mutually trusted; the arena is not.** Workers map
+  the *arena* read-only, which is the isolation that matters, but they map the
+  **submission segment read-write** — one ring each, in one shared mapping. A
+  buggy or hostile worker could always scribble anywhere in it and, because the
+  primary snapshots its geometry once and bounds-checks every record, the worst
+  it could do was lose *its own* writes. That is no longer quite the limit: the
+  wrapped-ring fix above has each worker read its ring's consumer index to
+  decide whether its write landed, so a worker that forges **another** worker's
+  index can make that worker release a mark early and read a superseded value
+  once, after a lap. The blast radius went from one worker's writes to one
+  worker's reads. There is no trusted channel to check it against, and the
+  trade buys a real stale read closed on the default transport for every
+  correctly behaving process. If you run untrusted code in a worker, it does
+  not belong in this cluster.
 
 The full design, decision log and measurements — including what was built and
 rejected — are in [DESIGN.md](DESIGN.md).

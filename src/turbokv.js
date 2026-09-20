@@ -2125,6 +2125,12 @@ class TurboKV {
     // detached worker), or the addon refusing. Never zero as a stand-in --
     // zero is a real position, and reading "unknowable" as "nothing consumed"
     // would keep every mark forever.
+    //
+    // TRUSTED, and that is a widening of the trust model rather than an
+    // oversight: the submit segment is mapped read-write by every worker, so a
+    // hostile one can forge this and cost us one stale read after a wrap. It
+    // used to be able to cost only its own writes. See the TRUST note at the
+    // top of submit.h and the limitation in README.
     #submitTailNow() {
         if (this.#ringIdx < 0) return -1;
         try { return native.submitTail(); } catch { return -1; }

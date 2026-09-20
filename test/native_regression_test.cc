@@ -337,6 +337,51 @@ int main() {
     shmUnlink(NM3);
   }
 
+  // --- A REJECTED SET PUBLISHES NOTHING; A DELETE ALWAYS PUBLISHES --------
+  //
+  // The premise SubmitDrain's rejection branch rests on, asserted rather than
+  // read off the source. A worker's mark is retired by a ring record, and its
+  // wrapped-ring reconciliation trusts the submission ring's consumer index to
+  // mean "applied" -- so a storeSet that fails silently, with `tail` advancing
+  // over it, is a mark released for a write the arena never took. The drain
+  // compensates by deleting the key, and it can only do that because
+  // storeDelete appends unconditionally.
+  {
+    const char* NM4 = "/tcrejectpub";
+    shmUnlink(NM4);
+    Store t;
+    if (!t.create(NM4, 4u << 20, 1u << 12, MODE_LOG2)) { ok(false, "create failed"); }
+    else {
+      storeSet(t, (const uint8_t*)"k", 1, (const uint8_t*)"OLD", 3, 3, FLAG_STRING, 0, 0);
+      const uint64_t before = t.h->ringHead.load(std::memory_order_acquire);
+      // logAlloc refuses anything over half the data region, which is the
+      // reachable rejection: a worker that recovered onto a smaller arena
+      // still carries the old #maxValue and can submit one.
+      std::vector<uint8_t> big((size_t)(t.h->dataBytes / 2) + 64, 'x');
+      const bool stored = storeSet(t, (const uint8_t*)"k", 1, big.data(),
+                                   (uint32_t)big.size(), (uint32_t)big.size(),
+                                   FLAG_STRING, 0, 0);
+      ok(!stored, "an oversized set is refused by the log allocator");
+      ok(t.h->ringHead.load(std::memory_order_acquire) == before,
+         "and publishes NO ring record, so nothing can retire a mark for it");
+      uint8_t buf[64]; ReadResult rr;
+      ok(storeGet(t, (const uint8_t*)"k", 1, buf, sizeof buf, &rr, 0),
+         "while the predecessor it did not replace is still resident -- the stale read");
+
+      // The line the drain uses to undo that, and the property that makes it
+      // work for a key that is present AND for one that is not.
+      ok(storeDelete(t, (const uint8_t*)"k", 1, 0), "deleting it reports the key was there");
+      ok(t.h->ringHead.load(std::memory_order_acquire) == before + 1, "and publishes a record");
+      ok(!storeGet(t, (const uint8_t*)"k", 1, buf, sizeof buf, &rr, 0), "the predecessor is gone");
+      ok(!storeDelete(t, (const uint8_t*)"absent", 6, 0),
+         "deleting an absent key reports it was not there");
+      ok(t.h->ringHead.load(std::memory_order_acquire) == before + 2,
+         "and STILL publishes a record: the bool is presence, never success");
+      t.destroy();
+    }
+    shmUnlink(NM4);
+  }
+
   s.destroy(); shmUnlink(NM);
   printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
   return fails ? 1 : 0;

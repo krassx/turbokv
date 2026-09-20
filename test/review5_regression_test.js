@@ -133,6 +133,62 @@ if (process.env.TCR5_ROLE === 'wrapres' || process.env.TCR5_ROLE === 'wrapresipc
     return;
 }
 
+// -------------------- N1b: the drain must MAKE "tail past it" mean "applied"
+//
+// The wave-6 review's first note, and it is the load-bearing half of N1's
+// lever. `storeSet` returns false on a logAlloc or findFreeSlot rejection and
+// never reaches `ringAppend` on that path, but SubmitDrain ignored the return
+// and advanced `tail` anyway. So the consumer index said "consumed" for a
+// record that was consumed and DROPPED, and after a wrap #reconcileWrites
+// released the mark for it -- L2 kept the predecessor, and this worker read
+// the value its own acked write replaced.
+//
+// Note the asymmetry, because it is what makes this a wrap-only stale read:
+// WITHOUT a wrap the same rejection publishes no record, so the mark is never
+// cleared and the worker keeps missing. Safe, but it also means the mark is
+// never cleared AT ALL -- a permanent local miss for that key.
+//
+// The drain now DELETES the key when a set is rejected, which is the answer to
+// both: L2 holds nothing rather than a superseded value, and storeDelete
+// always appends a record, so the mark clears the ordinary way and every other
+// process's L1 copy of the superseded value is invalidated with it.
+//
+// The rejection is forced with __unsafeRejectDrainSets, because it is
+// unreachable through the public API for a worker whose #maxValue came from
+// this arena -- see the hook's comment for the one route that does reach it.
+if (process.env.TCR5_ROLE === 'rejectset') {
+    (async () => {
+        const w = TurboKV.attachWorker(process.env.TCR5_ARENA, 1, { storage: 'bytes' });
+        w.get('poke');
+        ok(w.get('r1') === 'OLD' && w.get('r2') === 'OLD2', 'the arena holds the values these writes will replace');
+
+        // ---- rejected, NO wrap. The mark has to be let go of, or the key is
+        // unreadable on this worker for as long as it lives.
+        ok(w.set('r1', 'NEW', { minLevel: TurboKV.L2 }) === true, 'a minLevel-2 write is accepted');
+        process.send({ step: 'reject-drain' }); await step('reject-drained');
+        ok(w.get('r1') === undefined,
+           `the rejected write leaves nothing to read, not the superseded value (${JSON.stringify(w.get('r1'))})`);
+        ok(w.__unsafeMarkState().writtenKeys.indexOf('r1') < 0,
+           `and the mark is released rather than stuck forever (${JSON.stringify(w.__unsafeMarkState().writtenKeys)})`);
+
+        // ---- rejected, THEN a wrap. This is the stale read: the mark is
+        // released because the consumer index passed the record, and the
+        // record is the one thing that would have said it never landed.
+        ok(w.set('r2', 'NEW2', { minLevel: TurboKV.L2 }) === true, 'a second minLevel-2 write is accepted');
+        process.send({ step: 'reject-wrap' }); await step('reject-wrapped');
+        const after = w.get('r2');
+        ok(after === undefined,
+           `after a wrap a rejected write still reads as a MISS, never as the value it replaced (${JSON.stringify(after)})`);
+        ok(w.has('r2') === false, 'has() agrees');
+        // And the shared arena agrees with both of them: this is not a local
+        // suppression papering over a value every other process still sees.
+        process.send({ step: 'report', arena1: native.get('r1'), arena2: native.get('r2') });
+        await step('bye');
+        done(w, 'rejected-set');
+    })();
+    return;
+}
+
 // ------------------------------- N2: a pending write is not a pending delete
 //
 // The guard at the bottom of #promotionBlock reports THIS worker's own
@@ -288,6 +344,26 @@ const lapTheRing = (p) => { for (let i = 0; i < 70000; i++) p.set('filler' + (i 
                 if (s === 'drainwrap') { drainAll(); state.drain = false; lapTheRing(p); kid.send({ step: 'drainwrapped' }); }
             }, (p) => { p.set('k2', 'OLD'); });
         ok(code === 0, `the ${role} cases passed (child exited ${code})`);
+    }
+    {
+        const code = await runChild('rejectset', ARENA + '5', {}, (s, m, p, state, kid) => {
+            // One rejection, then drain: tail advances past a record the arena
+            // never took.
+            if (s === 'reject-drain') { native.__unsafeRejectDrainSets(1); drainAll(); kid.send({ step: 'reject-drained' }); }
+            if (s === 'reject-wrap') {
+                native.__unsafeRejectDrainSets(1); drainAll();
+                state.drain = false; lapTheRing(p);
+                kid.send({ step: 'reject-wrapped' });
+            }
+            if (s === 'report') {
+                ok(m.arena1 === undefined,
+                   `the shared arena holds nothing for the rejected write either (${JSON.stringify(m.arena1)})`);
+                ok(m.arena2 === undefined,
+                   `nor for the one a wrap followed (${JSON.stringify(m.arena2)})`);
+                kid.send({ step: 'bye' });
+            }
+        }, (p) => { p.set('r1', 'OLD'); p.set('r2', 'OLD2'); });
+        ok(code === 0, `the rejected-set cases passed (child exited ${code})`);
     }
     {
         const code = await runChild('blockself', ARENA + '3', {}, () => {},

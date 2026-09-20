@@ -29,6 +29,16 @@
 // head-tail is clamped to the ring capacity, which a producer can never
 // legitimately exceed. A bad worker can still corrupt its own ring and lose its
 // own writes; it must not be able to fault, hang, or misdirect the primary.
+//
+// ONE THING WIDENED THAT BLAST RADIUS, deliberately. A worker now reads its own
+// ring's `tail` to decide whether the primary applied a write it still holds a
+// mark for (see #reconcileWrites in turbokv.js), so a worker that forges
+// ANOTHER worker's `tail` can make that worker release a mark early and serve a
+// superseded value once, after a wrapped ring. There is no trusted channel to
+// check an index against, and clamping it to [head - cap, head] does not help:
+// the forgery that matters is a plausible one. It buys a real stale read closed
+// for every correctly behaving process on the default transport. README lists
+// it with the other limitations. Untrusted code does not belong in a worker.
 #pragma once
 #include <atomic>
 #include <stdint.h>
