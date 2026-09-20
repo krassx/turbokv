@@ -214,6 +214,36 @@ for (const m of L3_METHODS) {
 // textual scan, same known limits, same reason: the behaviours are pinned in
 // review4_regression_test.js, and the behaviours were pinned each round
 // before, while the next round found the next site.
+//
+// THE FOURTH PASS FOUND THE OTHER HALF OF THE SAME SHAPE, and found it here.
+// This section only ever watched the MUTATORS -- mark, release, releaseUpTo --
+// plus three consumers named one at a time. So `matchAt`, `has`, `clear` and
+// `touch` were invisible: swapping `#pendingDel.matchAt` for
+// `#pendingWrite.matchAt` inside #drain passed this guard outright, and it is
+// precisely the kind confusion the split exists to prevent -- a WRITE's record
+// would then be handed to #deletedAt and counted as a prevented resurrection.
+// #drain and #promotionBlock, the two members where a kind confusion changes
+// what a caller is TOLD, were not inspected at all. The ledger below watches
+// every mention of either set, by member and by verb, and the pairings after
+// it watch the two places where the kind decides the answer.
+//
+// WHAT IT STILL CANNOT SEE, so nobody mistakes it for a proof:
+//   - It reads text, one level deep, exactly as the sections above do. A
+//     consumer moved into a new helper shows up under the helper's name, which
+//     the ledger reports as an unexpected entry -- loud, but it is the ledger
+//     noticing a NEW NAME, not the guard understanding the move.
+//   - It checks WHICH set a line names and, for the two pairings, what that
+//     same line returns. It does not read the condition. `if
+//     (!this.#pendingWrite.has(key)) return 'l3PromotionsBlockedSelf';` passes
+//     every check here and is exactly backwards.
+//   - A kind confusion that never names a set -- reaching a mark's `kind`
+//     field, or holding an entry object -- is outside it entirely.
+//   - The ledger is a TABLE, so every legitimate new mark site fails it once
+//     and has to be added deliberately. That is the point, and it is also the
+//     only thing keeping it honest: a ledger maintained by widening it until
+//     it stops complaining is worth nothing.
+// The behavioural halves are review4_regression_test.js and
+// review5_regression_test.js. Neither kind of test is sufficient alone.
 {
     const MARK_SETS = ['#pendingDel', '#pendingWrite'];
     const MUTATORS = ['.mark(', '.release(', '.releaseUpTo('];
@@ -264,6 +294,63 @@ for (const m of L3_METHODS) {
        aliases.length === 0 ? 'no call site aliases a mark set into a variable'
                             : `a mark set is aliased: ${aliases.map(l => l.trim()).join('; ')}`);
 
+    // THE LEDGER: every member that touches a mark set, and which verbs it
+    // uses on which kind. The mutator scan above says a line names A kind; this
+    // says WHICH, per member, for every verb rather than three named ones -- so
+    // swapping the kind inside a consumer moves an entry and fails here even
+    // though the line still names a set.
+    //
+    // An exact table, and deliberately so. A new mark site is a change to how
+    // this worker accounts for what it owes, which is where four consecutive
+    // rounds of review each found a defect; it should cost a line here and a
+    // moment's thought about which kind it is.
+    const LEDGER = {
+        '__unsafeMarkState': 'del.keys del.size write.keys write.size',
+        '#drain':            'del.matchAt del.release del.size write.matchAt write.release write.size',
+        '#deletedHere':      'del.has',
+        '#unappliedHere':    'del.has write.has',
+        '#reconcileRemovals': 'del.has del.keys del.release del.size del.touch',
+        '#reconcileWrites':  'write.keys write.release write.size write.submittedAt write.touch',
+        '#promotionBlock':   'del.has write.has',
+        'set':               'del.release write.mark write.release',
+        'delete':            'del.mark del.release',
+        'clearLocal':        'del.clear write.clear',
+        '#releaseBatchMarks': 'del.releaseUpTo write.releaseUpTo',
+    };
+    {
+        let member3 = '<module scope>';
+        const actual = new Map();
+        for (let i = 0; i < lines2.length; i++) {
+            const m = MEMBER.exec(lines2[i]);
+            if (m) member3 = m[1];
+            if (i >= classFrom && i < classTo) continue;      // inside PendingMarks itself
+            const code = lines2[i].replace(/^\s*\/\/.*$/, '');
+            for (const [set, tag] of [['#pendingDel', 'del'], ['#pendingWrite', 'write']]) {
+                const re = new RegExp(set.replace('#', '#') + '\\.(\\w+)', 'g');
+                let g;
+                while ((g = re.exec(code)) !== null) {
+                    if (!actual.has(member3)) actual.set(member3, new Set());
+                    actual.get(member3).add(tag + '.' + g[1]);
+                }
+            }
+        }
+        // Non-vacuity: the extractor finds the sites at all, and more than one
+        // member's worth. A regex that matched nothing would pass every diff
+        // below by reporting an empty ledger against an empty expectation.
+        ok(actual.size >= 8, `the ledger extractor finds the mark consumers (${actual.size} members)`);
+        const names = new Set([...actual.keys(), ...Object.keys(LEDGER)]);
+        const wrong = [];
+        for (const n of names) {
+            const got = actual.has(n) ? [...actual.get(n)].sort().join(' ') : '<absent>';
+            const want = LEDGER[n] === undefined ? '<absent>' : LEDGER[n];
+            if (got !== want) wrong.push(`${n}: expected [${want}], found [${got}]`);
+        }
+        ok(wrong.length === 0,
+           wrong.length === 0
+               ? `every mark site uses the kind and the verb the ledger records (${actual.size} members)`
+               : `the mark ledger no longer matches the source:\n      ${wrong.join('\n      ')}`);
+    }
+
     // THE CONSUMERS ASK THE QUESTION THEY MEAN.
     //
     //   #deletedHere   -- removals only. Its callers refuse to ask L3 at all,
@@ -295,6 +382,60 @@ for (const m of L3_METHODS) {
         ok(b !== null, '#capL2AfterL3Failure() exists');
         ok(b !== null && !MARK_SETS.some(set => b.includes(set)),
            'the cap consults no mark: the primary compares the arena instead');
+    }
+
+    // WHERE THE KIND DECIDES WHAT A CALLER IS TOLD. Two places, and in both of
+    // them the ledger above is satisfied by the WRONG answer: the line still
+    // names a set, it just names the other one, or does the other thing with
+    // what it got.
+    {
+        // #drain retires a record against both sets. Only the REMOVAL's match
+        // may be handed to #deletedAt -- that is the promotion guard's record
+        // of "you deleted this key", and a landed WRITE put there made an
+        // in-flight getAsync answer undefined and counted the set as
+        // l3DeletedWhileReading, a counter named for the opposite event.
+        const b = bodyCode('#drain');
+        ok(b !== null, '#drain() exists');
+        const dl = (b || '').split('\n');
+        const dAt = dl.findIndex(l => l.includes('#pendingDel.matchAt('));
+        const wAt = dl.findIndex(l => l.includes('#pendingWrite.matchAt('));
+        const nAt = dl.findIndex(l => l.includes('#noteDeleted('));
+        ok(dAt >= 0 && wAt >= 0, `#drain() asks both sets for the record it is retiring (${dAt}, ${wAt})`);
+        ok(nAt > dAt && nAt < wAt,
+           `and only the REMOVAL's match reaches #deletedAt (del@${dAt}, note@${nAt}, write@${wAt})`);
+        // The two reconciliations ask DIFFERENT sources, which is the whole
+        // reason there are two: a removal's landing is a fact about the arena,
+        // a write's is a fact about the submission ring's consumer index, and
+        // each read the other way round is a defect this campaign has already
+        // shipped once.
+        const rr = bodyCode('#reconcileRemovals'), rw = bodyCode('#reconcileWrites');
+        ok(rr !== null && rw !== null, 'both reconciliations exist');
+        ok(rr !== null && /native\.has\(/.test(rr) && !/submitTail|#submitTailNow/.test(rr),
+           '#reconcileRemovals() asks the arena, and only the arena');
+        ok(rw !== null && /#submitTailNow\(/.test(rw) && !/native\.has\(/.test(rw),
+           '#reconcileWrites() asks the submission ring, and not the arena');
+    }
+    {
+        // #promotionBlock's two mark reasons are NOT interchangeable:
+        // l3DeletedWhileReading changes the ANSWER (the caller is told
+        // undefined, and a prevented resurrection is counted), while
+        // l3PromotionsBlockedSelf blocks only the placement and still hands
+        // back what L3 returned. Reverting the second to the first passed
+        // every suite before review5 pinned it; this is the source-level half.
+        const b = bodyCode('#promotionBlock');
+        ok(b !== null, '#promotionBlock() exists');
+        const pl = (b || '').split('\n');
+        const dLine = pl.find(l => l.includes('#pendingDel.has('));
+        const wLine = pl.find(l => l.includes('#pendingWrite.has('));
+        ok(dLine !== undefined && /'l3DeletedWhileReading'/.test(dLine),
+           `the REMOVAL mark answers l3DeletedWhileReading (${(dLine || '<absent>').trim()})`);
+        ok(wLine !== undefined && /'l3PromotionsBlockedSelf'/.test(wLine),
+           `and the WRITE mark answers l3PromotionsBlockedSelf (${(wLine || '<absent>').trim()})`);
+        // ...and they are two different strings, or the pair above passes for
+        // a build that folded the reasons back together.
+        ok(dLine !== undefined && wLine !== undefined &&
+           !/'l3PromotionsBlockedSelf'/.test(dLine) && !/'l3DeletedWhileReading'/.test(wLine),
+           'and neither line carries the other reason');
     }
 
     // A BATCH THAT IS DROPPED RELEASES WHAT IT CARRIED, on every route out.
