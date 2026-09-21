@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 #
 # Configure npm trusted publishing (OIDC) for this package, and retire the
-# bootstrap token afterwards.
+# token that predates it.
 #
-# WHY A SCRIPT AND NOT A README SECTION: the order matters and two of the steps
-# are irreversible. A trusted publisher can only be attached to a package that
-# ALREADY EXISTS on the registry, so the first version has to be published with
-# a token -- and that token then has to be destroyed, because it is a
-# long-lived credential whose whole purpose has just been taken over by OIDC.
-# Doing those in the wrong order leaves either a package nobody can publish to
-# or a token nobody remembers to revoke.
+# WHY A SCRIPT AND NOT A README SECTION: the order matters and one of the steps
+# is irreversible. A trusted publisher can only be attached to a package that
+# ALREADY EXISTS on the registry, so something else has to create it -- and that
+# something can no longer be a CI token. npm restricts tokens that bypass 2FA to
+# STAGING a publish, and staging cannot bring a package into being; a token run
+# fails with E_STAGE_REQUIRED. So the first version is published from a
+# developer machine behind an interactive 2FA challenge, carrying binaries taken
+# from a green CI run, and every version after it is published by the workflow
+# over OIDC with provenance.
 #
 # Authentication is npm's browser OAuth flow (`npm login --auth-type=web`), and
 # `npm trust` additionally demands an interactive 2FA challenge every time --
@@ -141,32 +143,68 @@ if step 3; then
         ok "$PKG_NAME is published (latest: $(npm view "$PKG_NAME" version))"
     else
         warn "$PKG_NAME is not on the registry yet"
-        info "A trusted publisher attaches to an EXISTING package, so the first"
-        info "version must be published with the bootstrap token. That publish has"
-        info "to run in CI rather than from here: the tarball ships prebuilt"
-        info "binaries for six platform targets, and this machine can only build"
-        info "one of them. A local 'npm publish' would ship a package that"
-        info "compiles from source everywhere else -- and on Bun, not at all."
+        info "A trusted publisher attaches to an EXISTING package, so some other"
+        info "credential has to create this one. That credential cannot be a CI"
+        info "token any more: npm restricts tokens that bypass 2FA to STAGING a"
+        info "publish, and staging cannot bring a package into being. A token run"
+        info "gets E_STAGE_REQUIRED -- 'this token can only publish to a staging"
+        info "area, and \"$PKG_NAME\" does not exist yet'."
+        echo
+        info "So the first publish happens HERE, behind the interactive 2FA the"
+        info "registry is asking for. The binaries do not: the tarball carries"
+        info "prebuilds for six platform targets and this machine can build one,"
+        info "so they are taken from a green release run, where each was built"
+        info "on its own platform and ran the suite there."
+        echo
+        warn "This first version publishes WITHOUT provenance -- that attestation"
+        warn "is signed from CI's OIDC identity, which a local publish has no way"
+        warn "to present. Every release after this one is published by the"
+        warn "workflow over OIDC and carries it."
         echo
 
         if [ "$CHECK_ONLY" = 1 ]; then
-            warn "--check: would offer to trigger the bootstrap publish"
-        elif ! gh secret list --repo "$GH_REPO" 2>/dev/null | grep -q "^$BOOTSTRAP_SECRET"; then
-            die "the $BOOTSTRAP_SECRET secret is gone from $GH_REPO, so the bootstrap publish cannot authenticate.
-Add a granular npm token with publish rights as $BOOTSTRAP_SECRET, or publish the first version by hand."
-        elif confirm "Trigger the bootstrap publish of $PKG_NAME@$PKG_VERSION now? (npm publishes cannot be taken back)"; then
-            info "dispatching release.yml with publish=true bootstrap=true"
-            gh workflow run "$WORKFLOW_FILE" --repo "$GH_REPO" -f publish=true -f bootstrap=true
-            sleep 6
-            RUN_ID="$(gh run list --repo "$GH_REPO" --workflow "$WORKFLOW_FILE" --limit 1 --json databaseId --jq '.[0].databaseId')"
-            info "watching run $RUN_ID (the prebuild matrix takes a few minutes)"
-            gh run watch "$RUN_ID" --repo "$GH_REPO" --exit-status || die "the bootstrap publish failed -- see the run log"
-            npm view "$PKG_NAME" version >/dev/null 2>&1 \
-                || die "the run succeeded but $PKG_NAME is still not on the registry"
-            PKG_EXISTS=1
-            ok "$PKG_NAME@$(npm view "$PKG_NAME" version) is published"
+            warn "--check: would assemble prebuilds from CI and publish from here"
         else
-            die "stopping: the trusted publisher cannot be configured until the package exists"
+            RUN_ID="$(gh run list --repo "$GH_REPO" --workflow "$WORKFLOW_FILE" \
+                --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+            [ -n "$RUN_ID" ] || die "no successful $WORKFLOW_FILE run to take prebuilds from -- run it first (publish=false builds them without publishing)"
+            info "taking prebuilds from run $RUN_ID"
+
+            ART_DIR="$(mktemp -d)"
+            gh run download "$RUN_ID" --repo "$GH_REPO" --dir "$ART_DIR" --pattern 'prebuild-*' \
+                || die "could not download the prebuild artifacts (they expire after 7 days)"
+            rm -rf prebuilds && mkdir -p prebuilds
+            for d in "$ART_DIR"/prebuild-*/; do cp -R "$d"* prebuilds/; done
+            rm -rf "$ART_DIR"
+
+            COUNT="$(find prebuilds -name '*.node' | wc -l | tr -d ' ')"
+            # The same count the workflow enforces before it publishes. A missing
+            # platform is worse than no publish: that platform silently falls back
+            # to a source build, and on Bun gets nothing at all.
+            [ "$COUNT" -eq 6 ] || die "expected 6 prebuilds, assembled $COUNT"
+            find prebuilds -name '*.node' | sort | sed 's/^/    /'
+            ok "six prebuilds assembled"
+
+            # Proves the tarball's binary is the one that gets loaded, not a
+            # local build left over in build/ -- the check the workflow runs on
+            # every platform, run here on this one.
+            rm -rf build
+            node -e "
+              const p = require('node-gyp-build').path('.');
+              if (!p.includes('prebuilds')) { console.error('resolved ' + p + ', not a prebuild'); process.exit(1); }
+              if (typeof require('node-gyp-build')('.').create !== 'function') { console.error('addon has no create()'); process.exit(1); }
+              console.log('    loaded ' + p);
+            " || die "the assembled prebuild does not load"
+            ok "it loads, and it is the prebuild that loaded"
+
+            npm pack --dry-run
+            if confirm "Publish $PKG_NAME@$PKG_VERSION from here? (npm publishes cannot be taken back)"; then
+                npm publish --access public || die "the publish failed"
+                PKG_EXISTS=1
+                ok "$PKG_NAME@$PKG_VERSION is published"
+            else
+                die "stopping: the trusted publisher cannot be configured until the package exists"
+            fi
         fi
     fi
 fi
@@ -222,9 +260,10 @@ if step 6; then
     elif [ "$CHECK_ONLY" = 1 ]; then
         warn "--check: $BOOTSTRAP_SECRET still exists and would be offered for deletion"
     else
-        info "OIDC is configured, so the token is now a credential with no job and"
-        info "an indefinite life. Deleting the secret also disarms the workflow's"
-        info "bootstrap path, which is the point: it can never authenticate again."
+        info "OIDC is configured, so the token is a credential with no job and an"
+        info "indefinite life. It never had one to lose, in fact: npm refuses a"
+        info "2FA-bypass token the create, and refuses it trust operations too."
+        info "A secret that cannot do anything is still a secret that can leak."
         if confirm "Delete the $BOOTSTRAP_SECRET secret from $GH_REPO?"; then
             gh secret delete "$BOOTSTRAP_SECRET" --repo "$GH_REPO"
             ok "$BOOTSTRAP_SECRET deleted"
