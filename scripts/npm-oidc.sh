@@ -22,6 +22,7 @@
 #   scripts/npm-oidc.sh              # run every step, skipping what is already done
 #   scripts/npm-oidc.sh --check      # report state, change nothing
 #   scripts/npm-oidc.sh --from 3     # resume at step 3
+#   scripts/npm-oidc.sh --yes        # answer the prompts, for a caller with no terminal
 #
 # Every step is idempotent: re-running after a failure picks up where it stopped.
 
@@ -37,10 +38,12 @@ NPM_MIN="11.5.1"                            # npm's floor for OIDC publishing
 NODE_MIN="22.14.0"                          # and Node's
 
 CHECK_ONLY=0
+ASSUME_YES=0
 FROM_STEP=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) CHECK_ONLY=1 ;;
+        --yes|-y) ASSUME_YES=1 ;;
         --from) FROM_STEP="${2:?--from needs a step number}"; shift ;;
         -h|--help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -59,10 +62,28 @@ die()  { printf '\n\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 # on that answer.
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
+# Asks, from whatever the caller actually has. /dev/tty is the right source
+# when it exists -- it reaches the human even with stdin redirected -- but it
+# does NOT always exist: a wrapper that runs this script without a controlling
+# terminal gets "Device not configured", and under `set -u` the unread variable
+# then takes the script down one line later, mid-flow and after the work.
+# So: the terminal if there is one, stdin if that is interactive, and otherwise
+# a refusal that names the way through instead of a crash.
 confirm() {
     [ "$CHECK_ONLY" = 1 ] && { warn "--check: would ask -- $1"; return 1; }
+    [ "$ASSUME_YES" = 1 ] && { info "--yes: $1"; return 0; }
+    local reply=""
     printf '\n  %s [y/N] ' "$1"
-    read -r reply </dev/tty
+    if [ -c /dev/tty ] && { : </dev/tty; } 2>/dev/null; then
+        read -r reply </dev/tty || reply=""
+    elif [ -t 0 ]; then
+        read -r reply || reply=""
+    else
+        echo
+        warn "nothing to ask on: no controlling terminal and stdin is not one."
+        warn "Run this from a terminal, or pass --yes to answer the prompts."
+        return 1
+    fi
     [ "$reply" = "y" ] || [ "$reply" = "Y" ]
 }
 
@@ -279,7 +300,7 @@ if step 6; then
     else
         info "OIDC is configured, so the token is a credential with no job and an"
         info "indefinite life. It never had one to lose, in fact: npm refuses a"
-        info "2FA-bypass token the create, and refuses it trust operations too."
+        info "2FA-bypass token both the create and the trust operations."
         info "A secret that cannot do anything is still a secret that can leak."
         if confirm "Delete the $BOOTSTRAP_SECRET secret from $GH_REPO?"; then
             gh secret delete "$BOOTSTRAP_SECRET" --repo "$GH_REPO"
