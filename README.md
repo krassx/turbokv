@@ -9,8 +9,8 @@ primary through per-worker shared-memory submission rings rather than the cluste
 IPC channel.
 
 ```js
-const { TurboKV } = require('turbokv');
-// or: import { TurboKV } from 'turbokv';
+const { TurboKV } = require('@krassx/turbokv');
+// or: import { TurboKV } from '@krassx/turbokv';
 
 // primary, before forking
 const cache = TurboKV.open();
@@ -77,7 +77,7 @@ platform serves every supported Node major:
 Anything not listed falls back to compiling from source at install time, which
 needs a compiler and Python, exactly as before.
 
-> **Bun:** this used to need `"trustedDependencies": ["turbokv"]`, because
+> **Bun:** this used to need `"trustedDependencies": ["@krassx/turbokv"]`, because
 > Bun blocks lifecycle scripts by default and the addon was therefore never
 > compiled. With prebuilds it no longer does — `bun add` still reports
 > "Blocked 1 postinstall", and the package works anyway, because the binary is
@@ -108,15 +108,24 @@ its identity to npm directly, so there is no long-lived token in repository
 secrets to leak, steal or forget to rotate, and provenance is attached
 automatically.
 
-One exception: a trusted publisher is configured in an *existing* package's
-settings, so the first version cannot use it. Publish once via
-`workflow_dispatch` with `bootstrap: true` (which uses `NPM_TOKEN`), then:
+One exception: a trusted publisher is configured on a package that *already
+exists*, so the first version cannot use it — and cannot use a token either.
+npm restricts a token that bypasses 2FA to **staging** a publish, and staging
+cannot bring a package into being; a CI token attempting it gets
+`E_STAGE_REQUIRED`. So the first version is published from a developer machine,
+behind the interactive 2FA the registry asks for, carrying the binaries from a
+green release run rather than whatever one machine can build.
 
-1. npmjs.com → the package → Settings → Trusted Publisher → GitHub Actions
-2. organization `krassx`, repository `turbokv`, workflow `release.yml`
-3. delete the `NPM_TOKEN` secret and revoke the token
+`scripts/npm-oidc.sh` does that and the setup around it: it checks the
+preconditions, logs in through npm's browser OAuth flow, assembles the six
+prebuilds from the CI run **for the commit being published**, publishes, runs
+`npm trust github` to attach the trusted publisher, verifies it, and offers to
+delete the `NPM_TOKEN` secret. Run it from a terminal, or with `--yes` from
+something that has none.
 
-After that the bootstrap path cannot authenticate at all, which is the point.
+That first version ships **without provenance**: the attestation is signed from
+CI's OIDC identity, which a local publish has no way to present. Every release
+after it goes through the workflow and carries one.
 
 [tp]: https://docs.npmjs.com/trusted-publishers/
 

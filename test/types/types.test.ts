@@ -4,8 +4,8 @@
 // everything type-checks fine and is worthless. tsc reports TS2578 for an
 // UNUSED expect-error, so this file only passes when each of those really is
 // an error and every line above them really is not.
-import { TurboKV, Cache, MSG } from 'turbokv';
-import type { CacheOptions, StorageMode, Codec, CacheStats, L3Adapter, L3SetOptions } from 'turbokv';
+import { TurboKV, Cache, MSG } from '@krassx/turbokv';
+import type { CacheOptions, StorageMode, Codec, CacheStats, L3Adapter, L3SetOptions } from '@krassx/turbokv';
 
 // --- inference -------------------------------------------------------------
 const c = TurboKV.createPrimary<{ a: number }>('/t', 1, 1, { storage: 'bytes' });

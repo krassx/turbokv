@@ -1,5 +1,5 @@
 {
-  "name": "turbokv",
+  "name": "@krassx/turbokv",
   "version": "0.1.0",
   "description": "Layered in-memory KV cache for Node.js clusters: per-process L1 with a byte budget over a shared-memory L2 the primary owns and workers map read-only.",
   "license": "MIT",

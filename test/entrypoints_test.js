@@ -18,7 +18,7 @@ const ROOT = path.join(__dirname, '..');
 const EXPECTED = ['TurboKV', 'Cache', 'MSG'];
 
 (async () => {
-    // --- CommonJS: require('turbokv')
+    // --- CommonJS: require('@krassx/turbokv')
     const cjs = require(path.join(ROOT, 'index.js'));
     ok(typeof cjs.TurboKV === 'function', 'cjs: TurboKV is exported');
     ok(cjs.Cache === cjs.TurboKV, 'cjs: Cache is the same class as TurboKV');
@@ -28,7 +28,7 @@ const EXPECTED = ['TurboKV', 'Cache', 'MSG'];
     ok(cjs.TurboKV.native === undefined,
        'cjs: the addon is NOT reachable from the public surface');
 
-    // --- ESM: import 'turbokv'
+    // --- ESM: import '@krassx/turbokv'
     const esm = await import(pathToFileURL(path.join(ROOT, 'index.mjs')).href);
     for (const name of EXPECTED) {
         ok(esm[name] !== undefined, `esm: ${name} is a named export`);

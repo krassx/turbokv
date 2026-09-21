@@ -2,7 +2,7 @@
 //
 // index.d.ts describes a CommonJS module, because the package is
 // "type": "commonjs". Under node16/nodenext TypeScript therefore models it as
-// `module.exports`, and `import TurboKV from 'turbokv'` in an ESM
+// `module.exports`, and `import TurboKV from '@krassx/turbokv'` in an ESM
 // consumer binds the whole namespace object rather than the class:
 //
 //   error TS2339: Property 'createPrimary' does not exist on type
