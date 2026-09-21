@@ -186,13 +186,39 @@ jobs:
       - name: What would ship
         run: npm pack --dry-run
 
+      # A release workflow that hard-fails on a re-run is a trap you find out
+      # about during an incident: re-running a red release, or tagging a version
+      # that was published by hand, stops at the registry's "you cannot publish
+      # over an existing version" rather than at something that reads as
+      # deliberate. Asking first turns that into a skip with a notice, and
+      # leaves every other step -- prebuilds, the load check, the smoke test --
+      # doing its job.
+      #
+      # If this check itself cannot reach the registry it answers "not
+      # published" and the publish proceeds, failing exactly as it does today.
+      # The check is here to make a KNOWN republish legible, not to be the thing
+      # that decides whether publishing is safe.
+      - name: Is this version already published?
+        id: published
+        shell: bash
+        run: |
+          name=$(node -p "require('./package.json').name")
+          ver=$(node -p "require('./package.json').version")
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$name@$ver is already on the registry -- skipping the publish step"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+            echo "$name@$ver is not published yet"
+          fi
+
       # Trusted publishing (OIDC). No token exists to leak, steal or forget to
       # rotate: npm verifies this workflow's identity against the trusted
       # publisher configured on the package, and provenance is attached without
       # asking. NODE_AUTH_TOKEN must NOT be set here -- if it is, npm uses it and
       # the OIDC path is silently skipped.
       - name: Publish (trusted publishing)
-        if: ${{ startsWith(github.ref, 'refs/tags/v') && !inputs.bootstrap }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && !inputs.bootstrap && steps.published.outputs.already == 'false' }}
         run: npm publish --access public
 
       # One-time path for the FIRST version. A trusted publisher is configured in
@@ -201,7 +227,7 @@ jobs:
       # trusted publisher, then delete the NPM_TOKEN secret -- after which this
       # step can never authenticate again, which is the point.
       - name: Publish (bootstrap, token)
-        if: ${{ inputs.bootstrap }}
+        if: ${{ inputs.bootstrap && steps.published.outputs.already == 'false' }}
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
