@@ -302,10 +302,15 @@ if (process.env.TCR_ROLE === 'shed') {
     // key too.
     {
         const store = new Map([['only3', 'L3ONLY']]);
-        // Reads the store AT CALL TIME and then takes 120ms to answer: a real
-        // round trip that observed the value before the delete was issued.
+        // Reads the store AT CALL TIME and answers only when this test says
+        // so: a real round trip that observed the value before the delete was
+        // issued. A gate rather than a sleep, for the reason case K spells out
+        // -- the delete has to settle while this read is still out, and that
+        // must not rest on which of the two is quicker.
+        let openGate;
+        const gate = new Promise((resolve) => { openGate = resolve; });
         const adapter = {
-            async get(k) { const v = store.get(k); await sleep(120); return v === undefined ? undefined : { value: v }; },
+            async get(k) { const v = store.get(k); await gate; return v === undefined ? undefined : { value: v }; },
             async set(k, v) { store.set(k, v); },
             async delete(k) { store.delete(k); },
             async clear() { store.clear(); },
@@ -316,6 +321,7 @@ if (process.env.TCR_ROLE === 'shed') {
         await sleep(10);
         await primary.deleteAsync('only3');             // settles well before the read
         ok(store.has('only3') === false, 'the L3 delete landed while the read was still out');
+        openGate();
         const got = await read;
         ok(native.get('only3') === undefined,
            `the removed value is NOT written back into the shared arena (${native.get('only3')})`);
@@ -492,8 +498,18 @@ if (process.env.TCR_ROLE === 'shed') {
     //    process deleted -- and that must survive a wrap for the same reason.
     {
         const store = new Map([['wrapdel', 'L3ONLY']]);
+        // The read is held open by a GATE THIS TEST OPENS, not by a sleep. The
+        // case only means anything while the read is still in flight, and what
+        // it has to outlast is a fork, ten thousand writes and a drain. Racing
+        // that against a 250ms sleep held on every machine it was written on
+        // and lost on the slowest release runner (macos-15-intel), where the
+        // lap finished first and the non-vacuity check below failed -- doing
+        // exactly its job, on a test that had no business depending on which
+        // was quicker. A gate makes "still in flight" true by construction.
+        let openGate;
+        const gate = new Promise((resolve) => { openGate = resolve; });
         const adapter = {
-            async get(k) { const v = store.get(k); await sleep(250); return v === undefined ? undefined : { value: v }; },
+            async get(k) { const v = store.get(k); await gate; return v === undefined ? undefined : { value: v }; },
             async set(k, v) { store.set(k, v); },
             async delete(k) { store.delete(k); },
             async clear() { store.clear(); },
@@ -519,6 +535,7 @@ if (process.env.TCR_ROLE === 'shed') {
         // 250ms would make every assertion below pass without testing
         // anything.
         ok(settled === false, 'the read was still in flight when the ring lapped');
+        openGate();
         const got = await read;
         ok(got === undefined,
            `a wrapped ring does not make the primary forget its own delete (${JSON.stringify(got)})`);
