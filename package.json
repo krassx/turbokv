@@ -46,6 +46,8 @@
     "index.d.ts",
     "index.d.mts",
     "src/turbokv.js",
+    "src/fastpath.js",
+    "src/l3/",
     "src/native.js",
     "src/binding.cc",
     "src/store.h",

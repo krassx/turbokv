@@ -17,7 +17,7 @@
 #include "vendor/rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
-static const uint32_t TC_LAYOUT = 6;   // 2: BigInt words at 8; 3: tick epoch + arenaId; 4: data region no longer power-of-two; 5: slab state out of Header; 6: namespace table removed
+static const uint32_t TC_LAYOUT = 7;   // 2: BigInt words at 8; 3: tick epoch + arenaId; 4: data region no longer power-of-two; 5: slab state out of Header; 6: namespace table removed; 7: L3 clear generation in the Header
 static const uint32_t FEATURE_LZ4 = 1;
 static const uint64_t HASH_EMPTY = 0;
 static const uint64_t HASH_TOMB  = 1;
@@ -125,6 +125,34 @@ struct Header {
   // rather than silently reporting misses.
   uint32_t features;
   uint64_t readsSkippedNoLz4;
+
+  // L3 CLEAR GENERATION. Appended LAST on purpose: every field above keeps the
+  // offset it had, and the 64-byte rounding in create() absorbs the 16 bytes
+  // (sizeof(Header) 264 -> 280, indexOff 320 either way), so nothing in the
+  // data region moves. TC_LAYOUT still had to go 6 -> 7, because the gate is
+  // not only about offsets: a process built before this change reads an arena
+  // built after it, never looks at these counters, and promotes L3 values
+  // straight over another process's clear -- which is the whole defect. The
+  // layout check is what stops those two builds from sharing an arena.
+  //
+  // `l3ClearGen` counts clears HANDED TO L3, `l3ClearSettled` the ones that
+  // have landed (or that close() gave up on). gen != settled means some
+  // process in this cluster has a clear on its way to L3, so no process may
+  // serve or promote an L3 read: the value it would get back is exactly what
+  // that clear is erasing. Monotonic counters rather than a flag so two
+  // overlapping clears cannot have the first one's completion unblock reads
+  // while the second is still outstanding -- and so a reader can also tell
+  // "a clear began AND finished while I was awaiting L3" by comparing `gen`
+  // against the value it sampled before the await.
+  //
+  // WRITTEN ONLY BY THE PRIMARY. A worker maps this segment PROT_READ, so a
+  // store here is a SIGBUS, not an exception; a worker's clear reaches these
+  // counters through the same IPC batch that already carries its clearAll.
+  // Atomic because they are read by every process while the primary writes
+  // them; acquire/release, since what they guard is a decision made on the
+  // strength of the value read.
+  std::atomic<uint64_t> l3ClearGen;
+  std::atomic<uint64_t> l3ClearSettled;
 };
 
 struct Store {
@@ -220,6 +248,11 @@ struct Store {
 
     h->logHead = 0; h->logTail = 0;
     h->tailPub.store(0, std::memory_order_relaxed);
+    // A fresh arena owes L3 nothing: no clear can be in flight against a cache
+    // that did not exist a moment ago. (memset above already zeroed them; said
+    // explicitly because the guard's whole meaning is "these two are equal".)
+    h->l3ClearGen.store(0, std::memory_order_relaxed);
+    h->l3ClearSettled.store(0, std::memory_order_relaxed);
     h->epochTicksNs = ticksNs();
     h->arenaId = h->epochTicksNs ^ ((uint64_t)platformPid() << 32) ^ nowNs();
     h->primaryPid = platformPid();

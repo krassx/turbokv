@@ -17,6 +17,7 @@ export type {
     StorageMode, Transport, Codec, HeapGuardOptions,
     CacheOptions, PrimaryOptions, OpenOptions, SetOptions, CacheStats,
     ArenaStats, AutoSize, SubmitStats, KeysOptions,
+    L3Adapter, L3GetOptions, L3SetOptions, L3DeleteOptions, L3Record,
 } from './index.js';
 
 export { TurboKV, Cache, MSG } from './index.js';

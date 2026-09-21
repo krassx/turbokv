@@ -347,6 +347,22 @@ static napi_value SubmitDel(napi_env env, napi_callback_info info) {
   napi_get_boolean(env, ok, &r); return r;
 }
 
+// Test-only: force the next N SET records the drain consumes to be treated as
+// a storeSet REJECTION. storeSet fails when logAlloc refuses the block
+// (`need > dataBytes / 2`) or when findFreeSlot cannot place it, and the JS
+// layer's own size check makes the first unreachable for a worker whose
+// #maxValue came from THIS arena -- which is every worker except one that has
+// recovered onto a smaller arena carrying the old limit. Rare, and the drain
+// must still be right on it, because #reconcileWrites now depends on
+// "tail past my record" meaning "applied". Reached only through the addon,
+// like every other __unsafe hook.
+static uint32_t g_rejectDrainSets = 0;
+// Worker submissions the arena refused, and whose key the drain therefore
+// removed. Process-local rather than a SubmitRing field on purpose: adding one
+// there is a TCS_LAYOUT change, and this is the primary's own accounting, not
+// something a worker needs to read. Surfaced through submitStats().
+static uint64_t g_drainRejected = 0;
+
 // primary: submitDrain(maxRecords) -> records applied.
 // Bounded on purpose: draining is synchronous work on the primary's event loop,
 // so an unbounded drain would trade the worker's stall for a primary stall.
@@ -419,8 +435,40 @@ static napi_value SubmitDrain(napi_env env, napi_callback_info info) {
         if (rec.op == SUBMIT_OP_SET) {
           uint32_t ttl = rec.ttlMs > TC_TTL_MAX_MS ? TC_TTL_MAX_MS : rec.ttlMs;
           uint32_t expiresAt = ttl ? nowRelMs(g) + ttl : 0;
-          storeSet(g, k, (uint16_t)rec.keyLen, v, rec.valLen, rec.valLen,
-                   rec.flags, expiresAt, (uint16_t)(i + 1));
+          bool stored;
+          // Test hook, and short-circuiting rather than undoing: the real
+          // rejection returns with "nothing touched yet" and NO ring record,
+          // and a hook that let storeSet run and then deleted would publish
+          // two records and prove nothing about the path it stands in for.
+          if (g_rejectDrainSets > 0) { g_rejectDrainSets--; stored = false; }
+          else stored = storeSet(g, k, (uint16_t)rec.keyLen, v, rec.valLen, rec.valLen,
+                                 rec.flags, expiresAt, (uint16_t)(i + 1));
+          // A REJECTED SET REMOVES THE KEY INSTEAD OF LEAVING ITS PREDECESSOR.
+          //
+          // storeSet returns false without reaching ringAppend, so nothing is
+          // published for it -- and `tail` advances past the record either
+          // way. A worker's #reconcileWrites reads that index after a wrap as
+          // "the primary applied my write" and lets the mark go, and L2 is
+          // then serving the value that write superseded. The worker was told
+          // `true`; the primary's own set() returns false and its caller
+          // knows, which is exactly the difference. A miss is acceptable here
+          // and a stale value is not, so the predecessor goes.
+          //
+          // storeDelete is also what makes the mark clear the ORDINARY way:
+          // it appends a record whether or not the key was present, so the
+          // worker retires its own mark on the record path, every other
+          // process drops its L1 copy of the superseded value, and the case
+          // with NO wrap -- where the mark used to stick for the life of the
+          // worker, since nothing would ever publish a record for it -- is
+          // closed by the same line.
+          //
+          // The delete branch below needs nothing: storeDelete cannot fail,
+          // and its bool is "was the key present", not "did this work". It
+          // appends unconditionally, which is the property this line borrows.
+          if (!stored) {
+            storeDelete(g, k, (uint16_t)rec.keyLen, (uint16_t)(i + 1));
+            g_drainRejected++;
+          }
         } else {
           storeDelete(g, k, (uint16_t)rec.keyLen, (uint16_t)(i + 1));
         }
@@ -432,6 +480,48 @@ static napi_value SubmitDrain(napi_env env, napi_callback_info info) {
     ring->applied.fetch_add((uint64_t)(applied - before), std::memory_order_relaxed);
   }
   napi_create_int32(env, applied, &r); return r;
+}
+
+static napi_value RejectDrainSets(napi_env env, napi_callback_info info) {
+  ARG(1)
+  int32_t n = 0;
+  if (argc > 0) napi_get_value_int32(env, argv[0], &n);
+  g_rejectDrainSets = n < 0 ? 0 : (uint32_t)n;
+  return nullptr;
+}
+
+// THIS PROCESS'S OWN RING, both ends, in the ring's monotonic byte space.
+//
+// A worker is the SOLE PRODUCER of the ring it claimed, and the primary is its
+// sole consumer, so between them these two numbers answer a question nothing
+// else in the system can: "has the primary applied the record I pushed?" The
+// worker reads `head` immediately after a push and compares it against `tail`
+// later; `tail >= head-after-push` means the consumer stepped past our record,
+// and SubmitDrain publishes tail with a release store AFTER storeSet/
+// storeDelete, so that also means the arena already holds it.
+//
+// Per-ring, and only OURS -- submitPending and submitStats aggregate across
+// every ring, which cannot answer this for anyone. -1 when no ring is claimed
+// (the IPC fallback, a detached worker, the primary itself), which callers
+// must read as "unknowable" rather than as a position.
+//
+// Both are plain reads of a struct this process already maps. No layout
+// change: `head` and `tail` are the fields SubmitRing has always had.
+static napi_value SubmitHead(napi_env env, napi_callback_info info) {
+  napi_value r;
+  if (!g_submit.base || g_ringIdx < 0) { napi_create_double(env, -1, &r); return r; }
+  // Relaxed: we are the only writer of our own head.
+  double v = (double)g_submit.ring((uint32_t)g_ringIdx)->head.load(std::memory_order_relaxed);
+  napi_create_double(env, v, &r); return r;
+}
+static napi_value SubmitTail(napi_env env, napi_callback_info info) {
+  napi_value r;
+  if (!g_submit.base || g_ringIdx < 0) { napi_create_double(env, -1, &r); return r; }
+  // ACQUIRE, pairing with the consumer's release store in SubmitDrain: if we
+  // see a tail past our record, we must also see the arena the same drain
+  // wrote before publishing it.
+  double v = (double)g_submit.ring((uint32_t)g_ringIdx)->tail.load(std::memory_order_acquire);
+  napi_create_double(env, v, &r); return r;
 }
 
 // Is there anything to drain? Cheap enough to call every event-loop turn.
@@ -462,6 +552,7 @@ static napi_value SubmitStats(napi_env env, napi_callback_info info) {
 #define SETN(name, val) napi_create_double(env, (val), &v); napi_set_named_property(env, o, name, v);
   SETN("pushed", pushed) SETN("applied", applied) SETN("shed", shed)
   SETN("corrupt", corrupt) SETN("rings", claimed)
+  SETN("rejected", (double)g_drainRejected)
   SETN("enabled", g_submit.base ? 1 : 0) SETN("ringIndex", (double)g_ringIdx)
 #undef SETN
   return o;
@@ -790,6 +881,60 @@ static napi_value ClearAll(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
+// ---- the L3 clear generation (Header::l3ClearGen / l3ClearSettled) --------
+//
+// Deliberately NOT folded into ClearAll: a clearAll with no L3 adapter empties
+// the arena and owes L3 nothing, and must behave exactly as it did before this
+// existed. The generation is opened and closed by the JS layer, which is the
+// only layer that knows whether a clear was handed to an adapter at all.
+
+// A clear has been handed to L3 and has not landed yet. Primary only -- see
+// the Header comment: a worker's clear opens its generation through the IPC
+// batch the primary applies, because a worker cannot write this page.
+static napi_value L3ClearBegin(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
+  g.h->l3ClearGen.fetch_add(1, std::memory_order_release);
+  return nullptr;
+}
+
+// That clear landed, or close() stopped waiting for it.
+static napi_value L3ClearSettle(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
+  // Clamped, never a bare increment. A settle can outlive the arena its
+  // generation was opened against -- a primary restart zeroes both counters
+  // while a worker's clear is still retrying -- and an unclamped increment
+  // would then take `settled` PAST `gen` and underflow the unsigned
+  // difference below into "a clear is in flight" forever. The primary is the
+  // sole writer, so load-then-store needs no CAS.
+  uint64_t gen = g.h->l3ClearGen.load(std::memory_order_acquire);
+  if (g.h->l3ClearSettled.load(std::memory_order_acquire) < gen)
+    g.h->l3ClearSettled.fetch_add(1, std::memory_order_release);
+  return nullptr;
+}
+
+// How many clears this cluster has handed to L3 and not seen land. Readable
+// from a read-only attachment, which is the entire point of putting it here.
+static napi_value L3ClearsInFlight(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  uint64_t gen = g.h->l3ClearGen.load(std::memory_order_acquire);
+  uint64_t done = g.h->l3ClearSettled.load(std::memory_order_acquire);
+  napi_value r;
+  napi_create_double(env, gen > done ? (double)(gen - done) : 0, &r);
+  return r;
+}
+
+// The count of clears STARTED. A reader samples this before awaiting L3 and
+// compares it afterwards, so a clear that both began and settled during one
+// read is still seen -- the in-flight count alone is back to zero by then.
+static napi_value L3ClearGen(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  napi_value r;
+  napi_create_double(env, (double)g.h->l3ClearGen.load(std::memory_order_acquire), &r);
+  return r;
+}
+
 // probe(key) -> int  (index probe + memcmp only; no value copy, no decompress)
 static napi_value Probe(napi_env env, napi_callback_info info) {
   ARG(1)
@@ -1060,9 +1205,13 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("submitClaim", SubmitClaim) FN("submitSet", SubmitSet)
   FN("submitDel", SubmitDel) FN("submitDrain", SubmitDrain)
   FN("submitPending", SubmitPending) FN("submitStats", SubmitStats)
+  FN("submitHead", SubmitHead) FN("submitTail", SubmitTail)
+  FN("__unsafeRejectDrainSets", RejectDrainSets)
   FN("submitDestroy", SubmitDestroy) FN("submitRelease", SubmitRelease)
   FN("submitMaxValue", SubmitMaxValue)
   FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
+  FN("l3ClearBegin", L3ClearBegin) FN("l3ClearSettle", L3ClearSettle)
+  FN("l3ClearsInFlight", L3ClearsInFlight) FN("l3ClearGen", L3ClearGen)
   FN("arenaId", ArenaId) FN("detach", Detach) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("__unsafePokeArena", Poke)
   FN("__unsafeSuppressRefBit", SetSuppressRefBit) FN("__unsafeSecondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("__unsafeBackwardShift", SetBackwardShift) FN("__unsafeClearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)

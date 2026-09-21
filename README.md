@@ -146,6 +146,74 @@ scripts/                          build helpers
   reason in `lastError`.
 - **Primary death**: a worker detaches, keeps serving its warm L1, polls, and
   recovers when a heartbeat *advances* — then flushes L1 and re-claims a ring.
+  It notices on its **next operation**, not on a timer, so an idle worker holds
+  its mapping until something touches the cache. On Windows that matters: a
+  replacement primary cannot create the name while any handle is open, so
+  **retry the restart** rather than assuming one attempt after `primaryStaleMs`
+  will take. POSIX unlinks first and hides the difference.
+- **Routing cluster messages yourself**: `TurboKV.install(cluster)` is the easy
+  path and does the whole job. If your application owns the primary's `message`
+  handler instead, it must pass turbokv's messages to `TurboKV.applyBatch()` —
+  **on both transports**. `'shm'` moves the *writes* off the channel; it does
+  not take a worker off it. A `clearAll()`'s wipe, the two halves of its
+  cluster-wide L3 clear generation, and the conditional re-time a worker asks
+  for when an `l3` write fails all still travel as cluster messages and are
+  applied nowhere else. Route the ring doorbell but not these and a value L3
+  rejected stays in the shared arena with no expiry, for every process, until
+  something overwrites it. Call `TurboKV.releaseWorker()` on `'exit'` and
+  `'disconnect'` for the same reason.
+- **`transport: 'ipc'` and the `l3` adapter**: with an adapter attached, prefer
+  the default `'shm'` transport. The primary drains every worker's submission
+  ring before it decides whether an L3 read may be promoted, so a worker's
+  write is never overwritten by the pre-write value L3 was still serving. An
+  IPC-transport worker's write sits in its outbox, or in the cluster channel,
+  where the primary cannot reach it — so for the one hop until that batch is
+  delivered the primary may promote over it. The worker's own value wins once
+  the batch is applied; the window is bounded, not closed.
+- **`bigint` values on `transport: 'ipc'`**: `process.send` serialises a batch
+  as a unit and refuses a `bigint` under the default JSON serialization, so one
+  such value drops **every other key's write in the same batch** — all of which
+  already returned `true`. Fork with `serialization: 'advanced'`, or stay on
+  `'shm'`, where values never touch the channel. `stats.flushDropped` counts it.
+- **Watching for that**: `stats.l3FailTtlUnapplied` counts caps *proven* not to
+  have landed, and `stats.l3FailTtlUnconfirmed` counts those whose outcome the
+  worker could not establish. **Watch both, and expect the second one.** The
+  proof needs the invalidation ring to still reach back to the moment the cap
+  was taken; the ring holds `ringCap` records — `min(65536, 4% of the arena / 16
+  bytes)`, rounded down to a power of two with a floor of 8192, so **32768 at
+  the 16MB default and 8192 on a 2MB arena** — on the order of 100ms of primary
+  writes under load, against roughly 7 seconds from a cap's mark to its
+  retirement at the default `l3FailTtlMs`. So on a busy box `Unapplied` goes
+  quiet and `Unconfirmed` becomes the normal bucket — an operator watching only
+  the first would see nothing during exactly the outage this exists for.
+- **`transport: 'ipc'`, `minLevel: 2` or `3`, and a lapped ring**: a worker that
+  falls a full `ringCap` behind the invalidation ring has to flush what it is
+  holding, and it must then decide whether its own submitted-but-unapplied
+  writes have landed. On the default `'shm'` transport it *knows*: the
+  submission ring is single-producer, so the primary's consumer index answers
+  exactly, and a write that has not been applied keeps missing locally. On
+  `'ipc'` nothing acknowledges a batch, so the question is unanswerable and the
+  mark is dropped — and that worker can then read **L2's previous value** for a
+  key it wrote at `minLevel: 2` or `3` and was told succeeded. It is not one
+  read: it lasts until something else replaces or invalidates the key. Nothing
+  has to be broken to reach it — a *synchronous* write burst on the primary
+  turns no event loop, so its doorbell never fires and its 500ms backstop never
+  runs, and ~8300 records is a full lap on a 2MB arena. Stay on `'shm'` if you
+  use `minLevel` above 1.
+- **The submission segment is mutually trusted; the arena is not.** Workers map
+  the *arena* read-only, which is the isolation that matters, but they map the
+  **submission segment read-write** — one ring each, in one shared mapping. A
+  buggy or hostile worker could always scribble anywhere in it and, because the
+  primary snapshots its geometry once and bounds-checks every record, the worst
+  it could do was lose *its own* writes. That is no longer quite the limit: the
+  wrapped-ring fix above has each worker read its ring's consumer index to
+  decide whether its write landed, so a worker that forges **another** worker's
+  index can make that worker release a mark early and read a superseded value
+  once, after a lap. The blast radius went from one worker's writes to one
+  worker's reads. There is no trusted channel to check it against, and the
+  trade buys a real stale read closed on the default transport for every
+  correctly behaving process. If you run untrusted code in a worker, it does
+  not belong in this cluster.
 
 The full design, decision log and measurements — including what was built and
 rejected — are in [DESIGN.md](DESIGN.md).

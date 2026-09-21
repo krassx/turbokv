@@ -340,15 +340,37 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
 }
 
 // Remove a key. Sole-writer path, like storeSet.
+//
+// THE RING RECORD IS PUBLISHED WHETHER OR NOT THE KEY WAS HERE. The record does
+// not mean "an entry was unlinked", it means "this key's removal has been
+// applied" -- and a removal of an absent key is applied just as completely as
+// one of a present key. Two things read it and both need the absent case:
+//
+//   - a WORKER holds its own delete in #pendingDel until the record comes back
+//     around, so that its reads miss rather than serve the value the primary
+//     has not removed yet. With no record for an absent key, that mark never
+//     cleared: the key became permanently unreadable in that worker -- L3
+//     included, since the guard refuses to even ask -- and the entry leaked
+//     toward the wholesale flush that then drops REAL pending deletes. A
+//     `minLevel: L3` write takes this same route (it evicts the key from L2),
+//     so one such write poisoned its own key for the life of the worker.
+//   - the L3 promotion guard asks the ring "did anything remove this key while
+//     my read was in flight". A delete that settled at L3 before an overlapping
+//     getAsync returned left no trace anywhere -- the queue had already let go
+//     of it -- so an L3-only key was promoted straight back into the arena.
+//
+// The cost is one ring record per delete of a key this arena does not hold.
+// That record invalidates nothing in any worker's L1 (nothing is filed under
+// that hash), so it costs ring space and a hash compare, not a refetch.
 static inline bool storeDelete(Store &s, const uint8_t *key, uint16_t keyLen, uint16_t writerId) {
   Header *h = s.h;
   uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;
   int64_t slot = s.findSlot(hash, key, keyLen);
-  if (slot < 0) return false;
-  unlinkSlot(s, (uint64_t)slot);
+  const bool had = slot >= 0;
+  if (had) unlinkSlot(s, (uint64_t)slot);
   ringAppend(s, hash, ++h->inserts, writerId);
-  return true;
+  return had;
 }
 
 // Drop everything. The log is NOT rewound: logTail is advanced to logHead so

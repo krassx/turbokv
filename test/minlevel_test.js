@@ -70,6 +70,34 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
         const ws = Object.values(cluster.workers);
         let left = ws.length;
         const done = () => { if (--left === 0) {
+            // --- levels are not contiguous once L3 exists -----------------
+            //
+            // A worker that has lost its primary has L1 and L3 but no L2, so
+            // "clamp down to the highest available level" cannot be computed
+            // as a single ceiling. Run last: these instances share the id-0
+            // arena state with the primary `c` above, and close() on them
+            // tears that arena down -- which would otherwise race the
+            // worker's attachWorker() if run any earlier.
+            {
+                const { makeFake } = require('./l3_fake');
+                const withL3 = new TurboKV({ storage: 'bytes', l3: makeFake().adapter });
+                ok(withL3.__unsafeResolveLevel(3) === 3, 'L3 stays L3 when an adapter is configured');
+                ok(withL3.__unsafeResolveLevel(2) === 2, 'L2 stays L2 while the primary is alive');
+
+                const noL3 = new TurboKV({ storage: 'bytes' });
+                ok(noL3.__unsafeResolveLevel(3) === 2, 'L3 clamps to L2 with no adapter');
+
+                withL3.__unsafeForcePrimaryDead();
+                ok(withL3.__unsafeResolveLevel(3) === 3, 'a degraded worker keeps L3');
+                ok(withL3.__unsafeResolveLevel(2) === 1, 'a degraded worker clamps L2 to L1');
+
+                const deadNoL3 = new TurboKV({ storage: 'bytes' });
+                deadNoL3.__unsafeForcePrimaryDead();
+                ok(deadNoL3.__unsafeResolveLevel(3) === 1, 'no adapter and no primary clamps L3 to L1');
+                ok(deadNoL3.__unsafeResolveLevel(2) === 1, 'no adapter and no primary clamps L2 to L1');
+
+                withL3.close(); noL3.close();
+            }
             native.destroy();
             console.log(fail ? `  ${fail} FAILURES` : '  all passed');
             process.exit(fail ? 1 : 0);

@@ -102,14 +102,15 @@ c.close();
 // a new helper cannot drift onto it unnoticed.
 {
     const DECLARED_STATICS = [
-        'createPrimary', 'attachWorker', 'open', 'install', 'isCacheMessage', 'applyBatch',
+        'createPrimary', 'attachWorker', 'open', 'install', 'isCacheMessage', 'applyBatch', 'releaseWorker',
         'arenaStats', 'submitStats', 'primaryAgeMs', 'autoSize',
         'defaultName', 'hasCompression', 'deepFreeze', 'assertFastCodec',
         'JSON_CODEC', 'V8_CODEC', 'drainSubmissions', 'heapGuardPace', 'L1', 'L2', 'L3',
     ];
     const DECLARED_INSTANCE = [
-        'get', 'set', 'has', 'delete', 'clearLocal', 'clearAll',
-        'keys', 'flush', 'close', 'stopGuard',
+        'get', 'getAsync', 'set', 'setAsync', 'has', 'hasAsync', 'delete', 'deleteAsync',
+        'clearLocal', 'clearAll', 'clearAsync',
+        'keys', 'flush', 'close', 'stopGuard', 'drainL3',
         'stats', 'lastError', 'liveHeapFraction', 'primaryDead', 'storage',
         'transport', 'size', 'l1Size',
     ];
@@ -131,9 +132,21 @@ c.close();
         ...Object.keys(probe),
     ];
     __native.destroy();
-    // __internalOnGc is reachable by necessity: gcNotify() is a module-scope
-    // function declared above the class, so it cannot reach a #private.
-    const extraInst = proto.filter(n => !DECLARED_INSTANCE.includes(n) && !n.startsWith('__internal'));
+    // Two prefixes are reachable by necessity and are NOT API:
+    //
+    //   __internal  gcNotify() is a module-scope function declared above the
+    //               class, so it cannot reach a #private.
+    //   __unsafe    test hooks for state a test cannot otherwise reach
+    //               (#resolveLevel, forcing #primaryDead).
+    //
+    // Both are filtered by prefix rather than listed in DECLARED_INSTANCE.
+    // Listing them made this check pass while breaking the very thing it
+    // exists to enforce -- decision 59's "declared == what index.d.ts
+    // declares" -- because neither is in index.d.ts, so the list and the
+    // declaration file silently disagreed. A prefix says "deliberately not
+    // API"; a list entry says "API", which is the opposite.
+    const extraInst = proto.filter(n => !DECLARED_INSTANCE.includes(n) &&
+                                        !n.startsWith('__internal') && !n.startsWith('__unsafe'));
     const missingInst = DECLARED_INSTANCE.filter(n => !proto.includes(n));
     ok(extraInst.length === 0, `no undeclared instance members (found: ${extraInst.join(', ')})`);
     ok(missingInst.length === 0, `every declared instance member exists (missing: ${missingInst.join(', ')})`);

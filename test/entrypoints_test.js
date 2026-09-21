@@ -55,6 +55,41 @@ const EXPECTED = ['TurboKV', 'Cache', 'MSG'];
     ok(got != null && got.a === 1, 'a cache created through the entry point works');
     require(path.join(ROOT, 'src', 'native')).destroy();
 
+    // --- THE TARBALL MUST CONTAIN WHAT THE ENTRY POINT REQUIRES.
+    //
+    // `files` is a hand-maintained list, and the suite always resolves modules
+    // from the working tree, so a source file added without a `files` entry is
+    // invisible here and fails at require time on the consumer's machine --
+    // `Cannot find module`, for a package that installed cleanly. src/l3/ was
+    // added by the L3 work and never listed; src/fastpath.js had been missing
+    // for longer. Walk what is actually shipped instead of trusting the list.
+    {
+        const fs = require('fs');
+        const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+        const shipped = (rel) => pkg.files.some(f =>
+            f.endsWith('/') ? rel.startsWith(f) : f === rel);
+        const seen = new Set();
+        const missing = [];
+        const walk = (rel) => {
+            if (seen.has(rel)) return;
+            seen.add(rel);
+            if (!shipped(rel)) { missing.push(rel); return; }
+            const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+            for (const m of src.matchAll(/require\(['"](\.[^'"]+)['"]\)|from\s+['"](\.[^'"]+)['"]/g)) {
+                const spec = m[1] || m[2];
+                const base = path.posix.join(path.posix.dirname(rel), spec);
+                for (const cand of [base, base + '.js', base + '.mjs']) {
+                    if (fs.existsSync(path.join(ROOT, cand)) &&
+                        fs.statSync(path.join(ROOT, cand)).isFile()) { walk(cand); break; }
+                }
+            }
+        };
+        walk('index.js');
+        walk('index.mjs');
+        ok(missing.length === 0,
+           `every module the entry points require is in package.json "files" (missing: ${missing.join(', ') || 'none'})`);
+    }
+
     console.log(fail ? `  ${fail} FAILURES` : '  all passed');
     process.exit(fail ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(1); });

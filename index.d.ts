@@ -42,6 +42,82 @@ export interface Codec<T = unknown> {
     decode(encoded: string): T;
 }
 
+/** Options passed to an {@link L3Adapter}'s `get`. */
+export interface L3GetOptions {
+    /** Whether the value will be cached locally (L1/L2) once it is returned.
+     *  A `minLevel: L3` read passes `false`. */
+    willCache?: boolean;
+}
+
+/** Options passed to an {@link L3Adapter}'s `set`. */
+export interface L3SetOptions {
+    /** Time to live in milliseconds. 0 (or absent) means no expiry. */
+    ttlMs?: number;
+    /** @see L3DeleteOptions.originId */
+    originId?: string;
+    /** @see L3GetOptions.willCache */
+    willCache?: boolean;
+}
+
+/** Options passed to an {@link L3Adapter}'s `delete`. */
+export interface L3DeleteOptions {
+    /** Which arena originated the operation: the hex arena id, stable for the
+     *  life of an arena and identical in the primary and every worker mapping
+     *  it. A primary restart changes it, which is correct — a restarted primary
+     *  has an empty cache. Use it to suppress a subscription's echo of this
+     *  box's own writes. `undefined` only on a handle with no arena mapped. */
+    originId?: string;
+}
+
+/** What an L3 `get` resolves with for a key it holds. */
+export interface L3Record<T = unknown> {
+    value: T;
+    /** Milliseconds remaining until expiry, if the key has a TTL. */
+    ttlMs?: number;
+}
+
+/**
+ * A user-supplied remote store behind L1/L2. `get`, `set`, `delete` and
+ * `clear` are required; `has`, `subscribe` and `close` are optional. `has`
+ * falls back to `get` when absent (correct, and it transfers the value
+ * needlessly). Validated once, at construction, so a malformed adapter is a
+ * `TypeError` from `TurboKV.open`/`createPrimary`/`attachWorker`, never a
+ * rejection discovered on the first cache miss.
+ *
+ * **An adapter method must not call back into the cache it belongs to.**
+ * `clear()` in particular must not await a `set`/`get`/`delete`/`clearAsync`
+ * (or their sync forms) issued against the same cache instance: `clearAll`
+ * makes a clear a barrier in the L3 queue (decision 65/66) that waits for
+ * this call to settle, so a `clear()` that waits on a push back into the same
+ * cache deadlocks the two waiting on each other, permanently. Reliably
+ * detecting reentrancy from inside the library costs more than the rule is
+ * worth, so it is a contract obligation instead: implement against a
+ * different client/connection than the one your own reads and writes use, or
+ * queue the callback for a later tick.
+ */
+export interface L3Adapter<T = unknown> {
+    get(key: string, options?: L3GetOptions): Promise<L3Record<T> | undefined | null>;
+    set(key: string, value: T, options?: L3SetOptions): Promise<void>;
+    delete(key: string, options?: L3DeleteOptions): Promise<void>;
+    /** Must not call back into this cache -- see the interface note above. */
+    clear(): Promise<void>;
+    /** Optional: `EXISTS`-shaped check. Falls back to `get` when absent. */
+    has?(key: string): Promise<boolean>;
+    /** Optional: push invalidations for cross-machine staleness. Without it,
+     *  staleness relies on TTL alone. Called only by the primary, and resolves
+     *  with the function that unsubscribes.
+     *
+     *  `onRemoteChange` carries a key another box changed. `onResync` means
+     *  *invalidations were lost*, not "I reconnected": a provider that can
+     *  replay calls it only when entries it never read were trimmed; one that
+     *  cannot calls it on every disconnection, because it genuinely cannot
+     *  tell. */
+    subscribe?(onRemoteChange: (key: string) => void,
+               onResync: () => void): Promise<() => void>;
+    /** Optional: release any resources the adapter holds. */
+    close?(): Promise<void> | void;
+}
+
 /** Bounds L1 by live heap measured after a collection, since the byte budget is
  *  only an estimate. Pass `false` to disable. Driven by a FinalizationRegistry,
  *  which works on Node, Bun and Deno, with a floor-polling backstop for when
@@ -86,7 +162,13 @@ export interface CacheOptions<T = unknown> {
      *  JSON-shaped objects. Default 3. */
     heapFactor?: number;
     heapGuard?: HeapGuardOptions | false;
-    /** @see Transport. Default `'shm'`. */
+    /** @see Transport. Default `'shm'`.
+     *
+     *  `'shm'` moves the WRITES off the cluster channel; it does not take a
+     *  worker off it. A clear, its L3 clear generation, and an `l3FailTtlMs`
+     *  re-time request still travel as a cluster message, so a primary that
+     *  routes messages by hand must call {@link TurboKV.applyBatch} on both
+     *  transports. `install()` does. */
     transport?: Transport;
     /** Bytes a worker may hold in the IPC outbox before shedding. Default 1MB. */
     outboxMaxBytes?: number;
@@ -101,6 +183,56 @@ export interface CacheOptions<T = unknown> {
     maintenanceMs?: number;
     sweepSlots?: number;
     sweepFullPassMs?: number;
+    /** A remote store behind L1/L2. With one attached, the three tiers are
+     *  ONE cache: `clearAll`/`clearAsync` empty it too, and reads fall
+     *  through to it on an L1/L2 miss. Validated once, at construction. */
+    l3?: L3Adapter<T>;
+    /** How long a value stays in the local tiers after its L3 write failed,
+     *  before it reverts to whatever L3 holds. Default 5000ms.
+     *
+     *  Only ever SHORTENS: an entry whose own TTL expires sooner keeps it, and
+     *  a key L2 no longer holds is left alone rather than resurrected.
+     *
+     *  On a WORKER the L2 half is a request the primary applies conditionally,
+     *  and it travels as a cluster message on **both** transports — so a
+     *  primary that routes messages itself must call
+     *  {@link TurboKV.applyBatch} or this option has no L2 half at all, and
+     *  the value L3 refused stays in the shared arena with no expiry.
+     *  `stats.l3FailTtlUnapplied` is what moves when that happens. */
+    l3FailTtlMs?: number;
+    /** TTL applied to a value filled into the local tiers from an L3 read
+     *  that carried none of its own. Default 60000ms. */
+    l3TtlMs?: number;
+    /** Byte bound on the per-process L3 write/delete queue, outstanding
+     *  (queued plus in flight). Past it, non-`clear` ops are shed under the
+     *  same contract as a full submission ring; `clear` is never shed.
+     *  Default 8MB. */
+    l3QueueMaxBytes?: number;
+    /** Time budget, per queued L3 operation, before it is abandoned and
+     *  `onL3Error` fires — and, separately, the bound on EACH individual
+     *  adapter call, so a call that neither resolves nor rejects is treated
+     *  as a failure rather than hanging its caller forever. A `clear`
+     *  ignores the retry budget and retries indefinitely, but each of its
+     *  attempts is still bounded by this.
+     *
+     *  Must be a POSITIVE number; a non-positive or non-finite value throws
+     *  at construction. It would otherwise remove the per-attempt bound
+     *  altogether, and a hung `adapter.clear()` would then never settle —
+     *  leaving every process sharing the arena serving L3 misses for every
+     *  key. `0` means "wait without a bound" for `l3CloseTimeoutMs` only.
+     *  Default 2000ms. */
+    l3RetryMs?: number;
+    /** Called once per abandoned background L3 operation (a queued op past
+     *  its retry budget, or a failed read). Never called synchronously from
+     *  `set`/`get`/etc. — those report failure through their own return
+     *  value or promise, and `lastError` is never touched by a background
+     *  failure, which is why this listener exists. */
+    onL3Error?: (error: unknown, op: { kind: 'get' | 'set' | 'delete' | 'clear' | 'has' | 'close'; key?: string }) => void;
+    /** How long `close()` waits for the L3 queue to drain before closing the
+     *  adapter anyway. A `clear` retries indefinitely and ignores
+     *  `l3RetryMs`, so an unreachable L3 would otherwise hang `close()`
+     *  forever. Default 5000ms; 0 waits without a bound. */
+    l3CloseTimeoutMs?: number;
 }
 
 export interface PrimaryOptions<T = unknown> extends CacheOptions<T> {
@@ -163,12 +295,171 @@ export interface CacheStats {
     invalidated: number; expired: number;
     /** Writes accepted locally that never reached L2 (ring or channel full). */
     writesShed?: number;
-    sent?: number; flushes?: number; flushDropped?: number; congested?: number;
+    /** Operations handed to the primary: ring records plus every entry in an
+     *  IPC batch. Batch entries include the keyless clear ops and, with an
+     *  `l3` adapter, an `l3FailTtlMs` re-time request — deliberately, since
+     *  each of those is a message this worker sent and the primary must
+     *  process. It is a transport counter, not a count of data writes; use
+     *  `sets`/`deletes` for those. */
+    sent?: number;
+    flushes?: number;
+    /** IPC batches this worker could not hand to the primary: the channel was
+     *  gone, the send threw, or the send's callback reported an error. THE
+     *  WHOLE BATCH IS LOST, not one entry -- `process.send` serialises the
+     *  message as a unit, so a single value the serialiser refuses (a
+     *  `bigint` under the default JSON serialization) drops every other key's
+     *  write in the same batch, all of which already returned `true` from
+     *  `set()`. The values stay in this worker's L1, so its own reads are
+     *  unaffected; other processes see a miss for those keys. A worker that
+     *  writes `bigint` values should be forked with
+     *  `serialization: 'advanced'`, or use the default `shm` transport, where
+     *  values never pass through the channel. Marks taken by the operations
+     *  in a dropped batch are released with it, so a delete in one does not
+     *  leave its key unreadable. */
+    flushDropped?: number;
+    congested?: number;
     rejectedKey?: number; rejectedType?: number; rejectedSize?: number;
     heapShed?: number;
     /** Times this worker re-attached after losing its primary. */
     recoveries?: number;
     lastRecovery?: { sameArena: boolean; at: number } | null;
+
+    // The L3 counters are declared EXPLICITLY, not left to the index signature
+    // below: an index signature of `unknown` types every one of them as
+    // `unknown`, so `stats.l3Hits > 0` does not compile and the only way to
+    // read a counter this library maintains is to cast it.
+    /** Reads answered by L3 after an L1 and L2 miss. */
+    l3Hits?: number;
+    /** Reads L3 did not answer: absent, failed, or refused by a pending clear. */
+    l3Misses?: number;
+    /** Also counted in `l3Misses`: an L3 `get` returned a value this cache's
+     *  `storage` mode cannot represent (e.g. a Buffer where the codec expects
+     *  its own encoding). Reported through `onL3Error`; nothing is written to
+     *  L1 or L2, so the bad value cannot poison the key for anyone else. */
+    l3BadValues?: number;
+    /** Writes handed to the L3 queue. */
+    l3Sets?: number;
+    /** L3 writes abandoned past `l3RetryMs`. Does NOT cover a write shed on
+     *  the spot past `l3QueueMaxBytes` -- see `l3Shed`, which is the number
+     *  that moves when this one does not: a shed write never reaches the
+     *  adapter, so it is never "abandoned" and never reported through
+     *  `onL3Error` either. */
+    l3SetFailed?: number;
+    /** L3 deletes abandoned past `l3RetryMs`. Same `l3Shed` carve-out as
+     *  `l3SetFailed`. */
+    l3DeleteFailed?: number;
+    /** Writes and deletes refused before ever reaching the L3 queue, because
+     *  the queue was already at `l3QueueMaxBytes`. The local write still
+     *  stands (`l3FailTtlMs` caps how long it may disagree with L3, same as
+     *  an abandoned write); this counter is what tells "L3 is refusing my
+     *  writes" (`l3SetFailed`/`l3DeleteFailed`) apart from "I am shedding
+     *  them before they are even sent" (`l3Shed`) -- different causes,
+     *  different fixes. A `clear` is never shed and never counted here. */
+    l3Shed?: number;
+    /** Bytes currently outstanding in the per-process L3 queue -- queued plus
+     *  in flight, the same quantity `l3QueueMaxBytes` bounds. A live gauge,
+     *  not a cumulative counter: it goes up and down as writes and deletes
+     *  are sent and settle. */
+    l3QueueBytes?: number;
+    /** Failed L3 writes whose local copy was re-timed to `l3FailTtlMs`. The
+     *  cap only ever SHORTENS: an entry whose own TTL already expires sooner
+     *  keeps it, and a key the arena no longer holds is left alone rather
+     *  than resurrected. On a worker the L2 half is a request the primary
+     *  applies conditionally -- a worker never writes L2 itself.
+     *
+     *  **This moving does NOT mean L2 was capped.** On a worker it moves for
+     *  the L1 half alone, which always succeeds. Read it together with
+     *  `l3FailTtlUnapplied`, which is the other side of the same event. */
+    l3FailTtlApplied?: number;
+    /** The L2 half of a cap that was PROVEN not to land, counted once each.
+     *  Either nothing was ever handed over — no arena to write (a degraded
+     *  worker), the batch shed by a congested IPC channel, the channel gone
+     *  or refusing it — or it was handed over and, when the read guard's
+     *  window closed, the arena still held exactly the capped bytes with no
+     *  expiry *and* the invalidation ring showed that nobody else had written
+     *  the key since. That last case is what a primary which never calls
+     *  {@link TurboKV.applyBatch} produces.
+     *
+     *  NOT a cap the primary REFUSED: one for a value something newer
+     *  superseded, or whose entry already expires sooner, has nothing left to
+     *  bound. NOT a cap whose outcome is merely unknown either — that is
+     *  `l3FailTtlUnconfirmed`, and keeping the two apart is the point.
+     *
+     *  So every count here means **the cap did not land** — not, in general,
+     *  that anything is resident: on a degraded worker, or when the batch
+     *  that was shed carried the write itself beside the cap, there may be
+     *  nothing in the arena at all, or no arena. What it always means is that
+     *  `l3FailTtlMs` did not bound this key, so if L2 does hold the value L3
+     *  rejected, nothing is going to expire it.
+     *
+     *  A LOWER bound, never an inflated one: where the answer cannot be
+     *  established the count goes to `l3FailTtlUnconfirmed` instead — and on
+     *  a busy box that is most of them, because the invalidation ring laps
+     *  far faster than a cap's window. Watch both. */
+    l3FailTtlUnapplied?: number;
+    /** Caps that were handed to the primary and whose outcome this process
+     *  can no longer establish, counted once each. Four ways: the worker
+     *  degraded or closed before the read guard's window ran out; the
+     *  invalidation ring had lapped past the cap's mark, or the walk over it
+     *  could not be completed, so it cannot say whether anybody rewrote the
+     *  key; the only record for the key inside
+     *  the window carried this handle's own writer id, which a shared-memory
+     *  submission and an `'ipc'` worker's batch can both produce (ring slot
+     *  plus one, and the sender's id, are not separate spaces); or no guard
+     *  entry could be kept at all, because more than 4096 caps were
+     *  outstanding.
+     *
+     *  Each of these may have landed perfectly. It is counted because "this
+     *  process stopped being able to tell" is itself worth seeing.
+     *
+     *  **On a busy box this is the normal bucket**, not the exception: the
+     *  invalidation ring holds at most 65536 records — on the order of 100ms
+     *  of primary writes under load — against roughly 7s from a cap's mark to
+     *  its retirement at the default `l3FailTtlMs`. A rising number here
+     *  during an L3 outage means `l3FailTtlUnapplied` is under-reporting, not
+     *  that the box is healthy. */
+    l3FailTtlUnconfirmed?: number;
+    /** L3 hits returned to the caller but not promoted, because SOMEONE ELSE
+     *  changed the key while the read was in flight, or the ring could not
+     *  rule out that they did. Ordinary contention, not an error. Does NOT
+     *  cover this process's own outstanding write for the key -- see
+     *  `l3PromotionsBlockedSelf`, split out so self-inflicted traffic does
+     *  not show up in the number an operator watches for contention from
+     *  elsewhere. */
+    l3PromotionsBlocked?: number;
+    /** L3 hits returned to the caller but not promoted, because THIS process
+     *  itself still had a write for the key queued or in flight to L3 when
+     *  the read completed -- L3 was still serving the value that write
+     *  supersedes -- or, on a worker, because the key holds a write of this
+     *  worker's own that the primary has not applied yet -- whether it is in
+     *  that worker's L1 (`minLevel: 1`) or only in the submission it has not
+     *  seen land (`minLevel: 2`). That second case covers a write L3 has
+     *  already ACKNOWLEDGED: the queue has let go of it and the invalidation
+     *  ring has no record for it, so without the mark an overlapping read
+     *  answered from the pre-write value put the old value back over a write
+     *  the caller had been told succeeded. This is why `get()` and `getAsync()` can disagree about a
+     *  key: while a `minLevel: L3` write for it is outstanding, `get()`
+     *  returns `undefined` (nothing is stored locally) while `getAsync()`
+     *  returns whatever L3 still holds. Deliberate; see the `LevelOption`
+     *  and decision 69's "one exception" in DESIGN.md. */
+    l3PromotionsBlockedSelf?: number;
+    /** L3 hits not promoted because the key cannot live in L1 or L2 at all
+     *  (an unpaired surrogate the arena cannot hash). */
+    l3UnhashableKeys?: number;
+    /** L3 hits discarded because this process REMOVED the key while the read
+     *  was in flight -- a `delete`, or the L2 eviction a `minLevel: L3` write
+     *  performs. Removals only: a worker's `minLevel: 2` write used to be
+     *  counted here too, and answered the caller `undefined` for a key it had
+     *  just successfully written. It blocks the placement instead, as
+     *  `l3PromotionsBlockedSelf`. */
+    l3DeletedWhileReading?: number;
+    /** L3 hits discarded because a `clearAll()` -- issued by ANY process
+     *  sharing this arena, not necessarily this one -- was handed to L3 while
+     *  this read was in flight and had not landed there yet. Serving that
+     *  value, or promoting it, would put back exactly what the clear is
+     *  removing. A count of blocked reads, not a measure of how many clears
+     *  are outstanding. */
+    l3ClearedWhileReading?: number;
     [k: string]: unknown;
 }
 
@@ -236,13 +527,55 @@ export declare class TurboKV<T = unknown> {
      *  handling. If your application already routes cluster messages itself,
      *  use this to pick turbokv's out of your own handler and pass them to
      *  {@link applyBatch}. The two are a pair: identifying a message is only
-     *  useful if you can also apply it. */
+     *  useful if you can also apply it.
+     *
+     *  Needed whatever `transport` the workers negotiated — see
+     *  {@link applyBatch} for what a `'shm'` worker still sends this way, and
+     *  what is silently lost if you do not. */
     static isCacheMessage(m: unknown): boolean;
 
     /** Apply a worker's batch to L2, from your own `message` handler.
      *  Only call this for messages {@link isCacheMessage} accepted, and only on
-     *  the primary. `install()` does exactly this for you. */
+     *  the primary. `install()` does exactly this for you.
+     *
+     *  **Required on BOTH transports, not only `'ipc'`.** A `'shm'` worker
+     *  sends its writes through shared memory, but three kinds of message
+     *  still travel in this batch and are applied nowhere else: a
+     *  `clearAll()`'s wipe, the two halves of its cluster-wide L3 clear
+     *  generation, and — with an `l3` adapter attached — the conditional
+     *  re-time a worker asks for when an L3 write fails (`l3FailTtlMs`). A
+     *  primary that routes the ring doorbell but never calls this leaves the
+     *  value L3 refused resident in the **shared arena with no expiry, for
+     *  every process on the box, forever**. Since v0.1 that silence is at
+     *  least counted, as `l3FailTtlUnapplied`; it is still a divergence.
+     *
+     *  This call also drains every submission ring to empty before it applies
+     *  anything, which is what orders a worker's own writes ahead of the
+     *  clear or re-time that refers to them. */
     static applyBatch(m: unknown): void;
+
+    /** Tell the primary that a worker is gone, so any L3 `clear` it had in
+     *  flight is settled rather than left blocking L3 reads in every process
+     *  for the life of the arena. Returns how many were settled, and is
+     *  idempotent.
+     *
+     *  Pass a cache message from that worker -- any one of them, so keep the
+     *  last one you routed. A worker is identified by its ATTACHMENT, not by
+     *  its writer id: ids are yours to choose and are normally reused across
+     *  restarts, so releasing by one would settle whatever worker holds that
+     *  slot now, which may be a live successor with a clear of its own in
+     *  flight.
+     *
+     *  Passing a writer id **throws**, and the parameter type rejects one at
+     *  compile time: it used to be the whole signature, it would now settle
+     *  nothing, and a leaked generation blocks L3 reads in every process until
+     *  the arena is recreated. Failing loudly is the only safe way to change
+     *  this call.
+     *
+     *  `install()` calls this on a worker's `'exit'` and `'disconnect'`. Call
+     *  it yourself only if you route cluster messages yourself, the way
+     *  {@link applyBatch} is called -- the two are a pair. */
+    static releaseWorker(who: object): number;
 
     /** Undefined when no arena is attached (before open, or after close). */
     static arenaStats(): ArenaStats | undefined;
@@ -268,28 +601,86 @@ export declare class TurboKV<T = unknown> {
     static heapGuardPace(): { evaluations: number; debounced: number; minIntervalMs: number };
 
     get(key: string, options?: LevelOption): T | undefined;
+    /** `get`, then L3 on a local miss (if an adapter is attached), filling
+     *  L1/L2 back down to `options.minLevel`. Identical effects to `get`; the
+     *  only difference is that this one can wait for L3. Concurrent misses on
+     *  one key inside this process share a single L3 request. */
+    getAsync(key: string, options?: LevelOption): Promise<T | undefined>;
     set(key: string, value: T, options?: SetOptions): boolean;
+    /** `set`, then L3 (if an adapter is attached), resolving on the L3
+     *  outcome. Identical effects to `set`; the only difference is what the
+     *  caller can wait for — the value is in the local tiers before this
+     *  promise even settles. Resolves `false` when the L3 write failed (the
+     *  local write still stands), never throws. */
+    setAsync(key: string, value: T, options?: SetOptions): Promise<boolean>;
     has(key: string): boolean;
+    /** `has`, then L3 on a local miss (if an adapter is attached). Uses the
+     *  adapter's `has` when present, otherwise falls back to `get` and
+     *  discards the value. */
+    hasAsync(key: string): Promise<boolean>;
     /** Returns whether the key was present at call time. */
     delete(key: string): boolean;
+    /** `delete`, then L3 (if an adapter is attached). Identical effects to
+     *  `delete`; the only difference is what the caller can wait for.
+     *
+     *  Resolves the **L3 outcome** — whether the remote delete landed — not
+     *  whether the key happened to be present locally, which `delete` already
+     *  returned synchronously. If L3 is unreachable the local delete still
+     *  stands for the whole outage, and there is no local tombstone to inspect
+     *  afterwards the way a failed `setAsync` has a short-TTL revert, so this
+     *  promise is the only signal that the remote half failed.
+     *
+     *  With no adapter attached there is no remote half, and this resolves
+     *  whether the key was present, exactly as `delete` reports. */
+    deleteAsync(key: string): Promise<boolean>;
     /** Drop this process's L1. The arena is untouched. */
     clearLocal(): void;
-    /** Clear the whole arena and every process's L1. */
+    /** Clear the whole arena and every process's L1. With an adapter
+     *  attached this also clears L3 — the tiers are one cache, so clearing
+     *  only the local ones would be undone by the next read. Until the L3
+     *  clear lands, L3 reads in this process serve misses rather than the
+     *  values the clear was meant to remove.
+     *
+     *  **On a WORKER only this handle's own L1 is emptied synchronously.**
+     *  A worker cannot write L2, so the wipe travels to the primary as an
+     *  op in the IPC batch and the arena — and every other process's L1,
+     *  and any sibling instance's L1 in this one — is emptied when the
+     *  primary applies it, typically the next event-loop turn. Between the
+     *  call and that moment a sibling handle can still serve a value this
+     *  clear is removing. On the primary the wipe is synchronous. */
     clearAll(): void;
+    /** `clearAll`, then L3 (if an adapter is attached), resolving once the L3
+     *  clear has landed. A clear is never shed by the L3 queue and retries
+     *  indefinitely, so absent a `close()` this promise always eventually
+     *  resolves `true`. `close()` can cut that short: it ends the retry loop
+     *  at the clear's next failed attempt rather than retrying forever
+     *  against a cache that no longer exists, so a clear still outstanding
+     *  when `close()` is called can resolve `false` instead. */
+    clearAsync(): Promise<boolean>;
+
+    /** Wait for every operation currently queued for L3 (of any kind, for
+     *  any key) to settle. No-op, resolving immediately, when no adapter is
+     *  attached. */
+    drainL3(): Promise<void>;
 
     /** Lazily enumerate keys. Not a snapshot: the arena may change mid-scan. */
     keys(options?: KeysOptions): Generator<string, void, unknown>;
     /** Live entries in the arena, from the arena-wide counter. */
     get size(): number;
 
-    /** Which write path this handle negotiated. */
+    /** Which write path this handle negotiated. `'shm'` means ordinary writes
+     *  go through shared memory — it does NOT mean this handle sends nothing
+     *  over the cluster channel. See {@link TurboKV.applyBatch}. */
     get transport(): Transport;
 
     /** Push any buffered worker writes now. */
     flush(): void;
-    /** Release the ring slot, stop the heap guard, deregister, and on the
-     *  primary destroy the arena. */
-    close(): void;
+    /** Drains the L3 queue (bounded by `l3CloseTimeoutMs`), closes the L3
+     *  adapter if one is attached, then releases the ring slot, stops the
+     *  heap guard, deregisters, and on the primary destroys the arena. An
+     *  open L3 connection keeps the event loop alive, which is why this
+     *  returns a promise; a caller that ignores it is unaffected. */
+    close(): Promise<void>;
 
     /** Entries currently held in this process's L1. `size` counts what the
      *  cache can serve; this counts only what is resident locally. */

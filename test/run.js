@@ -18,8 +18,11 @@ const SUITE = [
     'v8codec_test.js', 'storage_modes_test.js', 'cluster_api_test.js',
     'review_regression_test.js', 'gaps_test.js', 'typeflow_test.js', 'typematrix_test.js',
     'perf_regression_test.js', 'guard_test.js', 'recovery_test.js',
-    'review2_regression_test.js', 'entrypoints_test.js',
+    'review2_regression_test.js', 'review3_regression_test.js', 'review4_regression_test.js',
+    'review5_regression_test.js',
+    'entrypoints_test.js', 'write_sites_test.js',
     'backpressure_test.js', 'worker_ops_test.js', 'shm_leak_test.js', 'doorbell_loss_test.js', 'minlevel_test.js',
+    'l3_adapter_test.js', 'l3_queue_test.js', 'l3_api_test.js', 'l3_guard_test.js', 'l3_removal_test.js', 'l3_value_test.js', 'l3_joiner_test.js', 'l3_cap_test.js', 'l3_clear_test.js', 'l3_clear_leak_test.js', 'install_retain_test.js', 'l3_exit_test.js',
 ];
 // Same file, both transports: the shared-memory path is the default and the IPC
 // path is the fallback, and a regression in either is a regression.
