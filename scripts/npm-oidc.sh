@@ -165,10 +165,27 @@ if step 3; then
         if [ "$CHECK_ONLY" = 1 ]; then
             warn "--check: would assemble prebuilds from CI and publish from here"
         else
-            RUN_ID="$(gh run list --repo "$GH_REPO" --workflow "$WORKFLOW_FILE" \
-                --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
-            [ -n "$RUN_ID" ] || die "no successful $WORKFLOW_FILE run to take prebuilds from -- run it first (publish=false builds them without publishing)"
-            info "taking prebuilds from run $RUN_ID"
+            # THE BINARIES MUST COME FROM THE COMMIT BEING PUBLISHED, so the run
+            # is chosen by head SHA and not by recency or by conclusion. Picking
+            # "the newest successful run" would be wrong twice over: a release
+            # run legitimately concludes FAILURE whenever its publish step has
+            # nothing to do, and the newest run that did succeed could be from
+            # any commit at all -- which is how a tarball ends up carrying
+            # binaries that no longer match the source beside them.
+            HEAD_SHA="$(git rev-parse HEAD)"
+            RUN_ID="$(gh run list --repo "$GH_REPO" --workflow "$WORKFLOW_FILE" --limit 30 \
+                --json databaseId,headSha --jq "[.[] | select(.headSha == \"$HEAD_SHA\")][0].databaseId // empty")"
+            [ -n "$RUN_ID" ] || die "no $WORKFLOW_FILE run for $(git rev-parse --short HEAD), the commit being published.
+Build one first:  gh workflow run $WORKFLOW_FILE --ref \$(git rev-parse --abbrev-ref HEAD)
+With publish left off it builds and verifies every prebuild without publishing."
+
+            # The tarball takes its JavaScript from this working tree and its
+            # binaries from that run. If the tree has moved, they are not the
+            # same package.
+            git diff --quiet && git diff --cached --quiet \
+                || die "the working tree has uncommitted changes -- the tarball would mix them with binaries built from $(git rev-parse --short HEAD)"
+
+            info "taking prebuilds from run $RUN_ID, built at $(git rev-parse --short HEAD)"
 
             ART_DIR="$(mktemp -d)"
             gh run download "$RUN_ID" --repo "$GH_REPO" --dir "$ART_DIR" --pattern 'prebuild-*' \
