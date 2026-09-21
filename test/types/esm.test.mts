@@ -10,8 +10,8 @@
 //
 // because index.d.ts describes a CommonJS module, so `default` modelled the
 // whole namespace object. The runtime was fine; only the types were wrong.
-import TurboKV, { Cache, MSG } from 'turbokv';
-import type { CacheOptions, CacheStats, StorageMode } from 'turbokv';
+import TurboKV, { Cache, MSG } from '@krassx/turbokv';
+import type { CacheOptions, CacheStats, StorageMode } from '@krassx/turbokv';
 
 // The default export must BE the class, not the module namespace.
 const c = TurboKV.createPrimary<{ a: number }>('/t', 1, 1, { storage: 'bytes' });
